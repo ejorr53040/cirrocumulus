@@ -1,10 +1,12 @@
-// M2 slice 2 test fixture: the app guest-init forks+execs. Just proves the
-// exec happened -- prints its own marker, then parks so it doesn't exit
-// before the boot harness can read the console (guest-init's reap/shutdown
-// behavior on child exit is a later slice, not this one).
+// M2 test fixture: the app guest-init forks+execs. Prints its own marker
+// then exits promptly (slice 3 needs a real exit to react to -- guest-init
+// shuts the VM down when this process ends). Flushed explicitly: this
+// isn't PID 1, so its own exit can't panic the kernel, but an unflushed
+// write racing process teardown can still be dropped, same lesson slice 1
+// learned the hard way.
+use std::io::Write;
+
 fn main() {
     println!("CHILD_APP_RAN");
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(3600));
-    }
+    std::io::stdout().flush().expect("flush marker");
 }

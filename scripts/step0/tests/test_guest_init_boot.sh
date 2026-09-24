@@ -19,3 +19,17 @@ test_guest_init_boot_console_shows_marker() {
 test_guest_init_boot_execs_configured_app() {
     assert_output_contains "CHILD_APP_RAN" "$STEP0_ROOT/run_guest_init.sh"
 }
+
+# M2 slice 3: once the configured app exits, guest-init must shut the VM
+# down itself, not park forever waiting for the test harness to kill -9 it.
+test_guest_init_boot_shuts_down_when_app_exits() {
+    assert_output_contains "FIRECRACKER_EXITED_CLEANLY: PASS" "$STEP0_ROOT/run_guest_init.sh"
+}
+
+# "Firecracker's process exited" alone isn't proof of a *clean* shutdown --
+# slice 1 found a kernel panic + reboot=k also exits Firecracker with
+# exit_code=0. This is what actually distinguishes reboot(RB_POWER_OFF)
+# from another panic-triggered auto-reboot.
+test_guest_init_boot_shuts_down_without_kernel_panic() {
+    assert_output_contains "NO_KERNEL_PANIC: PASS" "$STEP0_ROOT/run_guest_init.sh"
+}

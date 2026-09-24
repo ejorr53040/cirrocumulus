@@ -4,6 +4,16 @@
 # Step 0 rootfs. Waits for guest-init's own boot marker on the serial
 # console. Prints the console log and exits 0 iff the marker appeared
 # before the timeout.
+#
+# Also checks (slice 3) that the guest shuts itself down once the
+# configured app exits, rather than needing this script's own cleanup trap
+# to kill it: prints synthetic FIRECRACKER_EXITED_CLEANLY / NO_KERNEL_PANIC
+# status lines onto its own stdout (alongside the guest's console, which it
+# cats below), the same trick run_jailer.sh uses for its own uid check.
+# "Firecracker's process exited" alone isn't enough evidence of a *clean*
+# shutdown -- slice 1 found that a kernel panic + `reboot=k` also makes
+# Firecracker exit with exit_code=0, so NO_KERNEL_PANIC is what actually
+# tells clean poweroff apart from panic-triggered auto-reboot.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -66,6 +76,40 @@ for _ in $(seq 1 $((BOOT_TIMEOUT_S * 10))); do
     fi
     sleep 0.1
 done
+
+# Give the app its own bounded window to appear, then watch what the guest
+# does once it exits: FC_PID disappearing on its own (not by our kill -9)
+# is the observable signal that guest-init reacted to the app's exit,
+# rather than the park-forever fallback from earlier slices.
+app_seen=1
+for _ in $(seq 1 $((BOOT_TIMEOUT_S * 10))); do
+    if grep -q "CHILD_APP_RAN" "$CONSOLE_LOG" 2>/dev/null; then
+        app_seen=0
+        break
+    fi
+    sleep 0.1
+done
+
+if [ "$app_seen" -eq 0 ]; then
+    exited_cleanly=1
+    for _ in $(seq 1 50); do
+        if ! kill -0 "$FC_PID" >/dev/null 2>&1; then
+            exited_cleanly=0
+            break
+        fi
+        sleep 0.1
+    done
+    if [ "$exited_cleanly" -eq 0 ]; then
+        echo "FIRECRACKER_EXITED_CLEANLY: PASS"
+    else
+        echo "FIRECRACKER_EXITED_CLEANLY: FAIL (still running, needed kill -9)"
+    fi
+    if grep -q "Kernel panic" "$CONSOLE_LOG" 2>/dev/null; then
+        echo "NO_KERNEL_PANIC: FAIL (kernel panicked -- exit_code=0 alone doesn't mean a clean poweroff)"
+    else
+        echo "NO_KERNEL_PANIC: PASS"
+    fi
+fi
 
 cat "$CONSOLE_LOG"
 

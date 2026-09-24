@@ -1,21 +1,22 @@
 //! `guest-init`: PID 1 inside the Firecracker guest. See RESEARCH.md M2.
 //!
-//! Slice 1: mount the pseudo-filesystems the guest needs and print a boot
-//! marker. Slice 2 (current): read the configured app from a fixed path,
-//! fork, and exec it in the child, with the parent (still PID 1) waiting
-//! on it. Reaping other zombies, signal forwarding, shutdown-on-exit and
-//! vsock config follow in later slices.
+//! Slice 1: mount the pseudo-filesystems and print a boot marker. Slice 2:
+//! read the configured app from a fixed path, fork, and exec it in the
+//! child, with the parent (still PID 1) waiting on it. Slice 3 (current):
+//! power off cleanly once that app exits. Reaping other (orphaned) zombies
+//! and signal forwarding are still later slices -- this one only tracks
+//! the one app child.
 
 mod config;
 
 use config::Config;
 use nix::mount::{mount, MsFlags};
+use nix::sys::reboot::{reboot, RebootMode};
 use nix::sys::wait::waitpid;
 use nix::unistd::{execv, fork, ForkResult};
 use std::ffi::CString;
 use std::io::Write;
 use std::path::Path;
-use std::time::Duration;
 
 /// Fixed path guest-init reads its config from. Stands in for the vsock
 /// config channel (RESEARCH.md M2) until that slice lands; same JSON shape
@@ -91,6 +92,28 @@ fn exec_configured_app(config: &Config) {
     }
 }
 
+/// Shuts the VM down. `reboot(2)` doesn't return on success -- the kernel
+/// tears the machine down mid-syscall -- which is exactly what PID 1
+/// needs: slice 1 already found that *returning* from this point (letting
+/// `main` end, or looping and getting killed) panics the guest kernel
+/// ("Attempted to kill init!") instead of shutting down cleanly.
+///
+/// `RB_POWER_OFF` (what RESEARCH.md's M2 method names) turned out not to
+/// work here: Firecracker's minimal device model has no ACPI power button,
+/// so the kernel finds no `pm_power_off` handler and just halts
+/// ("Power off not available: System halted instead") -- the CPU stops but
+/// the Firecracker process stays alive, doing nothing, forever. slice 1's
+/// panic trace already showed the mechanism Firecracker actually reacts
+/// to: a reboot (the same x86 reset path a kernel panic + `reboot=k`
+/// takes), which Firecracker traps and exits the VMM on. `RB_AUTOBOOT`
+/// takes that same path deliberately instead of via a panic.
+fn shutdown() -> ! {
+    match reboot(RebootMode::RB_AUTOBOOT) {
+        Ok(never) => match never {},
+        Err(e) => panic!("reboot RB_AUTOBOOT failed: {e}"),
+    }
+}
+
 fn main() {
     mount_pseudo_filesystems();
 
@@ -110,7 +133,5 @@ fn main() {
     let config = config::parse_config(&config_json).expect("parse config");
     exec_configured_app(&config);
 
-    loop {
-        std::thread::sleep(Duration::from_secs(3600));
-    }
+    shutdown();
 }
