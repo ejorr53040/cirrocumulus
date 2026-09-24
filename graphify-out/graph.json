@@ -1,0 +1,3054 @@
+{
+  "directed": false,
+  "multigraph": false,
+  "graph": {
+    "hyperedges": [
+      {
+        "id": "jailer_chroot_lifecycle",
+        "label": "jailer chroot setup, caveats, and cleanup lifecycle",
+        "nodes": [
+          "scripts_step0_readme_jailer",
+          "scripts_step0_readme_nodev_chroot_caveat",
+          "scripts_step0_readme_jailer_chown_leaf_only",
+          "scripts_step0_run_jailer",
+          "scripts_step0_clean"
+        ],
+        "relation": "form",
+        "confidence": "EXTRACTED",
+        "confidence_score": 1.0,
+        "source_file": "scripts/step0/README.md"
+      },
+      {
+        "id": "guest_init_boot_measurement_flow",
+        "label": "Guest-init boot and speed-measurement pipeline",
+        "nodes": [
+          "m2s2_speed_test_guest_init",
+          "scripts_step0_run_guest_init",
+          "scripts_step0_build_rootfs_guest_init",
+          "scripts_step0_speed_test_guest_init",
+          "scripts_step0_fixtures_child_app"
+        ],
+        "relation": "participate_in",
+        "confidence": "INFERRED",
+        "confidence_score": 0.85,
+        "source_file": "m2s2_speed_test.md"
+      }
+    ]
+  },
+  "nodes": [
+    {
+      "id": "crates_cirro_src_main_cli",
+      "label": "Cli",
+      "_origin": "ast",
+      "_rust_declaration_count": 1,
+      "community": 1,
+      "community_name": "CLI Subcommand Tree",
+      "file_type": "code",
+      "norm_label": "cli",
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L8"
+    },
+    {
+      "id": "crates_cirro_src_main_command",
+      "label": "Command",
+      "_origin": "ast",
+      "_rust_declaration_count": 1,
+      "community": 1,
+      "community_name": "CLI Subcommand Tree",
+      "file_type": "code",
+      "norm_label": "command",
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L14"
+    },
+    {
+      "id": "crates_cirro_src_main_dbcommand",
+      "label": "DbCommand",
+      "_origin": "ast",
+      "_rust_declaration_count": 1,
+      "community": 1,
+      "community_name": "CLI Subcommand Tree",
+      "file_type": "code",
+      "norm_label": "dbcommand",
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L59"
+    },
+    {
+      "id": "crates_cirro_src_main_nodecommand",
+      "label": "NodeCommand",
+      "_origin": "ast",
+      "_rust_declaration_count": 1,
+      "community": 1,
+      "community_name": "CLI Subcommand Tree",
+      "file_type": "code",
+      "norm_label": "nodecommand",
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L45"
+    },
+    {
+      "id": "crates_cirro_src_main_servercommand",
+      "label": "ServerCommand",
+      "_origin": "ast",
+      "_rust_declaration_count": 1,
+      "community": 1,
+      "community_name": "CLI Subcommand Tree",
+      "file_type": "code",
+      "norm_label": "servercommand",
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L53"
+    },
+    {
+      "id": "crates_guest_init_src_config_config",
+      "label": "Config",
+      "_origin": "ast",
+      "_rust_declaration_count": 1,
+      "community": 3,
+      "community_name": "Guest-Init Config Parsing",
+      "file_type": "code",
+      "norm_label": "config",
+      "source_file": "crates/guest-init/src/config.rs",
+      "source_location": "L9"
+    },
+    {
+      "id": "scripts_step0_build_rootfs",
+      "label": "build_rootfs.sh",
+      "_origin": "ast",
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "file"
+      },
+      "norm_label": "build_rootfs.sh",
+      "source_file": "scripts/step0/build_rootfs.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_build_rootfs_sh__entry",
+      "label": "build_rootfs.sh script",
+      "_origin": "ast",
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_entrypoint"
+      },
+      "norm_label": "build_rootfs.sh script",
+      "source_file": "scripts/step0/build_rootfs.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_clean",
+      "label": "clean.sh",
+      "_origin": "ast",
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "file"
+      },
+      "norm_label": "clean.sh",
+      "source_file": "scripts/step0/clean.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_clean_sh__entry",
+      "label": "clean.sh script",
+      "_origin": "ast",
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_entrypoint"
+      },
+      "norm_label": "clean.sh script",
+      "source_file": "scripts/step0/clean.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_fetch_kernel",
+      "label": "fetch_kernel.sh",
+      "_origin": "ast",
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "file"
+      },
+      "norm_label": "fetch_kernel.sh",
+      "source_file": "scripts/step0/fetch_kernel.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_fetch_kernel_sh__entry",
+      "label": "fetch_kernel.sh script",
+      "_origin": "ast",
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_entrypoint"
+      },
+      "norm_label": "fetch_kernel.sh script",
+      "source_file": "scripts/step0/fetch_kernel.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_prereqs",
+      "label": "prereqs.sh",
+      "_origin": "ast",
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "file"
+      },
+      "norm_label": "prereqs.sh",
+      "source_file": "scripts/step0/prereqs.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_prereqs_check",
+      "label": "check()",
+      "_origin": "ast",
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_function"
+      },
+      "norm_label": "check()",
+      "source_file": "scripts/step0/prereqs.sh",
+      "source_location": "L12"
+    },
+    {
+      "id": "scripts_step0_prereqs_sh__entry",
+      "label": "prereqs.sh script",
+      "_origin": "ast",
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_entrypoint"
+      },
+      "norm_label": "prereqs.sh script",
+      "source_file": "scripts/step0/prereqs.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_run_jailer",
+      "label": "run_jailer.sh",
+      "_origin": "ast",
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "file"
+      },
+      "norm_label": "run_jailer.sh",
+      "source_file": "scripts/step0/run_jailer.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_run_jailer_api",
+      "label": "api()",
+      "_origin": "ast",
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_function"
+      },
+      "norm_label": "api()",
+      "source_file": "scripts/step0/run_jailer.sh",
+      "source_location": "L115"
+    },
+    {
+      "id": "scripts_step0_run_jailer_cleanup",
+      "label": "cleanup()",
+      "_origin": "ast",
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_function"
+      },
+      "norm_label": "cleanup()",
+      "source_file": "scripts/step0/run_jailer.sh",
+      "source_location": "L65"
+    },
+    {
+      "id": "scripts_step0_run_jailer_sh__entry",
+      "label": "run_jailer.sh script",
+      "_origin": "ast",
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_entrypoint"
+      },
+      "norm_label": "run_jailer.sh script",
+      "source_file": "scripts/step0/run_jailer.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_run_plain",
+      "label": "run_plain.sh",
+      "_origin": "ast",
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "file"
+      },
+      "norm_label": "run_plain.sh",
+      "source_file": "scripts/step0/run_plain.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_run_plain_api",
+      "label": "api()",
+      "_origin": "ast",
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_function"
+      },
+      "norm_label": "api()",
+      "source_file": "scripts/step0/run_plain.sh",
+      "source_location": "L51"
+    },
+    {
+      "id": "scripts_step0_run_plain_cleanup",
+      "label": "cleanup()",
+      "_origin": "ast",
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_function"
+      },
+      "norm_label": "cleanup()",
+      "source_file": "scripts/step0/run_plain.sh",
+      "source_location": "L35"
+    },
+    {
+      "id": "scripts_step0_run_plain_sh__entry",
+      "label": "run_plain.sh script",
+      "_origin": "ast",
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_entrypoint"
+      },
+      "norm_label": "run_plain.sh script",
+      "source_file": "scripts/step0/run_plain.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "crates_cirro_src_main",
+      "label": "cirro/src/main.rs",
+      "_origin": "ast",
+      "community": 1,
+      "community_name": "CLI Subcommand Tree",
+      "file_type": "code",
+      "norm_label": "cirro/src/main.rs",
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L1"
+    },
+    {
+      "id": "crates_cirro_src_main_main",
+      "label": "main()",
+      "_origin": "ast",
+      "community": 1,
+      "community_name": "CLI Subcommand Tree",
+      "file_type": "code",
+      "norm_label": "main()",
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L68"
+    },
+    {
+      "id": "crates_cirro_src_main_rs_string",
+      "label": "String",
+      "_origin": "ast",
+      "community": 1,
+      "community_name": "CLI Subcommand Tree",
+      "file_type": "code",
+      "norm_label": "string",
+      "source_file": "",
+      "source_location": ""
+    },
+    {
+      "id": "crates_cirro_tests_cli",
+      "label": "cli.rs",
+      "_origin": "ast",
+      "community": 1,
+      "community_name": "CLI Subcommand Tree",
+      "file_type": "code",
+      "norm_label": "cli.rs",
+      "source_file": "crates/cirro/tests/cli.rs",
+      "source_location": "L1"
+    },
+    {
+      "id": "crates_cirro_tests_cli_cirro",
+      "label": "cirro()",
+      "_origin": "ast",
+      "community": 1,
+      "community_name": "CLI Subcommand Tree",
+      "file_type": "code",
+      "norm_label": "cirro()",
+      "source_file": "crates/cirro/tests/cli.rs",
+      "source_location": "L4"
+    },
+    {
+      "id": "crates_cirro_tests_cli_help_lists_every_subcommand",
+      "label": "help_lists_every_subcommand()",
+      "_origin": "ast",
+      "community": 1,
+      "community_name": "CLI Subcommand Tree",
+      "file_type": "code",
+      "norm_label": "help_lists_every_subcommand()",
+      "source_file": "crates/cirro/tests/cli.rs",
+      "source_location": "L9"
+    },
+    {
+      "id": "crates_cirro_tests_cli_unimplemented_subcommand_says_not_yet_and_fails",
+      "label": "unimplemented_subcommand_says_not_yet_and_fails()",
+      "_origin": "ast",
+      "community": 1,
+      "community_name": "CLI Subcommand Tree",
+      "file_type": "code",
+      "norm_label": "unimplemented_subcommand_says_not_yet_and_fails()",
+      "source_file": "crates/cirro/tests/cli.rs",
+      "source_location": "L19"
+    },
+    {
+      "id": "exitcode",
+      "label": "ExitCode",
+      "_origin": "ast",
+      "community": 1,
+      "community_name": "CLI Subcommand Tree",
+      "file_type": "code",
+      "norm_label": "exitcode",
+      "source_file": "",
+      "source_location": ""
+    },
+    {
+      "id": "crates_cirro_edge_src_lib",
+      "label": "cirro-edge/src/lib.rs",
+      "_origin": "ast",
+      "community": 10,
+      "community_name": "cirro-edge (empty stub lib)",
+      "file_type": "code",
+      "norm_label": "cirro-edge/src/lib.rs",
+      "source_file": "crates/cirro-edge/src/lib.rs",
+      "source_location": "L1"
+    },
+    {
+      "id": "crates_cirro_image_src_lib",
+      "label": "cirro-image/src/lib.rs",
+      "_origin": "ast",
+      "community": 11,
+      "community_name": "cirro-image (empty stub lib)",
+      "file_type": "code",
+      "norm_label": "cirro-image/src/lib.rs",
+      "source_file": "crates/cirro-image/src/lib.rs",
+      "source_location": "L1"
+    },
+    {
+      "id": "crates_cirro_node_src_lib",
+      "label": "cirro-node/src/lib.rs",
+      "_origin": "ast",
+      "community": 12,
+      "community_name": "cirro-node (empty stub lib)",
+      "file_type": "code",
+      "norm_label": "cirro-node/src/lib.rs",
+      "source_file": "crates/cirro-node/src/lib.rs",
+      "source_location": "L1"
+    },
+    {
+      "id": "crates_cirro_proto_src_lib",
+      "label": "cirro-proto/src/lib.rs",
+      "_origin": "ast",
+      "community": 13,
+      "community_name": "cirro-proto (empty stub lib)",
+      "file_type": "code",
+      "norm_label": "cirro-proto/src/lib.rs",
+      "source_file": "crates/cirro-proto/src/lib.rs",
+      "source_location": "L1"
+    },
+    {
+      "id": "crates_cirro_server_src_lib",
+      "label": "cirro-server/src/lib.rs",
+      "_origin": "ast",
+      "community": 14,
+      "community_name": "cirro-server (empty stub lib)",
+      "file_type": "code",
+      "norm_label": "cirro-server/src/lib.rs",
+      "source_file": "crates/cirro-server/src/lib.rs",
+      "source_location": "L1"
+    },
+    {
+      "id": "crates_cirro_tui_src_lib",
+      "label": "cirro-tui/src/lib.rs",
+      "_origin": "ast",
+      "community": 15,
+      "community_name": "cirro-tui (empty stub lib)",
+      "file_type": "code",
+      "norm_label": "cirro-tui/src/lib.rs",
+      "source_file": "crates/cirro-tui/src/lib.rs",
+      "source_location": "L1"
+    },
+    {
+      "id": "pkg_cirro_edge",
+      "label": "cirro-edge",
+      "_origin": "ast",
+      "community": 16,
+      "community_name": "cirro-edge package",
+      "ecosystem": "cargo",
+      "file_type": "code",
+      "norm_label": "cirro-edge",
+      "source_file": "crates/cirro-edge/Cargo.toml",
+      "source_location": "L1",
+      "type": "package"
+    },
+    {
+      "id": "pkg_cirro_image",
+      "label": "cirro-image",
+      "_origin": "ast",
+      "community": 17,
+      "community_name": "cirro-image package",
+      "ecosystem": "cargo",
+      "file_type": "code",
+      "norm_label": "cirro-image",
+      "source_file": "crates/cirro-image/Cargo.toml",
+      "source_location": "L1",
+      "type": "package"
+    },
+    {
+      "id": "pkg_cirro_node",
+      "label": "cirro-node",
+      "_origin": "ast",
+      "community": 18,
+      "community_name": "cirro-node package",
+      "ecosystem": "cargo",
+      "file_type": "code",
+      "norm_label": "cirro-node",
+      "source_file": "crates/cirro-node/Cargo.toml",
+      "source_location": "L1",
+      "type": "package"
+    },
+    {
+      "id": "pkg_cirro_proto",
+      "label": "cirro-proto",
+      "_origin": "ast",
+      "community": 19,
+      "community_name": "cirro-proto package",
+      "ecosystem": "cargo",
+      "file_type": "code",
+      "norm_label": "cirro-proto",
+      "source_file": "crates/cirro-proto/Cargo.toml",
+      "source_location": "L1",
+      "type": "package"
+    },
+    {
+      "id": "crates_guest_init_src_main",
+      "label": "guest-init/src/main.rs",
+      "_origin": "ast",
+      "community": 2,
+      "community_name": "Guest-Init PID 1 Core",
+      "file_type": "code",
+      "norm_label": "guest-init/src/main.rs",
+      "source_file": "crates/guest-init/src/main.rs",
+      "source_location": "L1"
+    },
+    {
+      "id": "crates_guest_init_src_main_boot_marker",
+      "label": "BOOT_MARKER",
+      "_origin": "ast",
+      "community": 2,
+      "community_name": "Guest-Init PID 1 Core",
+      "file_type": "code",
+      "norm_label": "boot_marker",
+      "source_file": "crates/guest-init/src/main.rs",
+      "source_location": "L27"
+    },
+    {
+      "id": "crates_guest_init_src_main_config_path",
+      "label": "CONFIG_PATH",
+      "_origin": "ast",
+      "community": 2,
+      "community_name": "Guest-Init PID 1 Core",
+      "file_type": "code",
+      "norm_label": "config_path",
+      "source_file": "crates/guest-init/src/main.rs",
+      "source_location": "L23"
+    },
+    {
+      "id": "crates_guest_init_src_main_exec_configured_app",
+      "label": "exec_configured_app()",
+      "_origin": "ast",
+      "community": 2,
+      "community_name": "Guest-Init PID 1 Core",
+      "file_type": "code",
+      "norm_label": "exec_configured_app()",
+      "source_file": "crates/guest-init/src/main.rs",
+      "source_location": "L70"
+    },
+    {
+      "id": "crates_guest_init_src_main_main",
+      "label": "main()",
+      "_origin": "ast",
+      "community": 2,
+      "community_name": "Guest-Init PID 1 Core",
+      "file_type": "code",
+      "norm_label": "main()",
+      "source_file": "crates/guest-init/src/main.rs",
+      "source_location": "L94"
+    },
+    {
+      "id": "crates_guest_init_src_main_mount_pseudo_filesystems",
+      "label": "mount_pseudo_filesystems()",
+      "_origin": "ast",
+      "community": 2,
+      "community_name": "Guest-Init PID 1 Core",
+      "file_type": "code",
+      "norm_label": "mount_pseudo_filesystems()",
+      "source_file": "crates/guest-init/src/main.rs",
+      "source_location": "L34"
+    },
+    {
+      "id": "pkg_cirro_server",
+      "label": "cirro-server",
+      "_origin": "ast",
+      "community": 20,
+      "community_name": "cirro-server package",
+      "ecosystem": "cargo",
+      "file_type": "code",
+      "norm_label": "cirro-server",
+      "source_file": "crates/cirro-server/Cargo.toml",
+      "source_location": "L1",
+      "type": "package"
+    },
+    {
+      "id": "pkg_cirro_tui",
+      "label": "cirro-tui",
+      "_origin": "ast",
+      "community": 21,
+      "community_name": "cirro-tui package",
+      "ecosystem": "cargo",
+      "file_type": "code",
+      "norm_label": "cirro-tui",
+      "source_file": "crates/cirro-tui/Cargo.toml",
+      "source_location": "L1",
+      "type": "package"
+    },
+    {
+      "id": "pkg_cirrocumulus",
+      "label": "cirrocumulus",
+      "_origin": "ast",
+      "community": 22,
+      "community_name": "cirrocumulus (cirro bin) package",
+      "ecosystem": "cargo",
+      "file_type": "code",
+      "norm_label": "cirrocumulus",
+      "source_file": "crates/cirro/Cargo.toml",
+      "source_location": "L1",
+      "type": "package"
+    },
+    {
+      "id": "pkg_guest_init",
+      "label": "guest-init",
+      "_origin": "ast",
+      "community": 23,
+      "community_name": "guest-init package",
+      "ecosystem": "cargo",
+      "file_type": "code",
+      "norm_label": "guest-init",
+      "source_file": "crates/guest-init/Cargo.toml",
+      "source_location": "L1",
+      "type": "package"
+    },
+    {
+      "id": "crates_guest_init_src_config",
+      "label": "config.rs",
+      "_origin": "ast",
+      "community": 3,
+      "community_name": "Guest-Init Config Parsing",
+      "file_type": "code",
+      "norm_label": "config.rs",
+      "source_file": "crates/guest-init/src/config.rs",
+      "source_location": "L1"
+    },
+    {
+      "id": "crates_guest_init_src_config_defaults_args_to_empty_when_omitted",
+      "label": "defaults_args_to_empty_when_omitted()",
+      "_origin": "ast",
+      "community": 3,
+      "community_name": "Guest-Init Config Parsing",
+      "file_type": "code",
+      "norm_label": "defaults_args_to_empty_when_omitted()",
+      "source_file": "crates/guest-init/src/config.rs",
+      "source_location": "L32"
+    },
+    {
+      "id": "crates_guest_init_src_config_parse_config",
+      "label": "parse_config()",
+      "_origin": "ast",
+      "community": 3,
+      "community_name": "Guest-Init Config Parsing",
+      "file_type": "code",
+      "norm_label": "parse_config()",
+      "source_file": "crates/guest-init/src/config.rs",
+      "source_location": "L15"
+    },
+    {
+      "id": "crates_guest_init_src_config_parses_exec_path_and_args",
+      "label": "parses_exec_path_and_args()",
+      "_origin": "ast",
+      "community": 3,
+      "community_name": "Guest-Init Config Parsing",
+      "file_type": "code",
+      "norm_label": "parses_exec_path_and_args()",
+      "source_file": "crates/guest-init/src/config.rs",
+      "source_location": "L24"
+    },
+    {
+      "id": "crates_guest_init_src_config_rejects_config_missing_exec",
+      "label": "rejects_config_missing_exec()",
+      "_origin": "ast",
+      "community": 3,
+      "community_name": "Guest-Init Config Parsing",
+      "file_type": "code",
+      "norm_label": "rejects_config_missing_exec()",
+      "source_file": "crates/guest-init/src/config.rs",
+      "source_location": "L39"
+    },
+    {
+      "id": "crates_guest_init_src_config_rs_string",
+      "label": "String",
+      "_origin": "ast",
+      "community": 3,
+      "community_name": "Guest-Init Config Parsing",
+      "file_type": "code",
+      "norm_label": "string",
+      "source_file": "",
+      "source_location": ""
+    },
+    {
+      "id": "error",
+      "label": "Error",
+      "_origin": "ast",
+      "community": 3,
+      "community_name": "Guest-Init Config Parsing",
+      "file_type": "code",
+      "norm_label": "error",
+      "source_file": "",
+      "source_location": ""
+    },
+    {
+      "id": "result",
+      "label": "Result",
+      "_origin": "ast",
+      "community": 3,
+      "community_name": "Guest-Init Config Parsing",
+      "file_type": "code",
+      "norm_label": "result",
+      "source_file": "",
+      "source_location": ""
+    },
+    {
+      "id": "vec",
+      "label": "Vec",
+      "_origin": "ast",
+      "community": 3,
+      "community_name": "Guest-Init Config Parsing",
+      "file_type": "code",
+      "norm_label": "vec",
+      "source_file": "",
+      "source_location": ""
+    },
+    {
+      "id": "scripts_step0_build_rootfs_guest_init",
+      "label": "build_rootfs_guest_init.sh",
+      "_origin": "ast",
+      "community": 4,
+      "community_name": "M2 Speed Test & Rootfs Build",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "file"
+      },
+      "norm_label": "build_rootfs_guest_init.sh",
+      "source_file": "scripts/step0/build_rootfs_guest_init.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_build_rootfs_guest_init_sh__entry",
+      "label": "build_rootfs_guest_init.sh script",
+      "_origin": "ast",
+      "community": 4,
+      "community_name": "M2 Speed Test & Rootfs Build",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_entrypoint"
+      },
+      "norm_label": "build_rootfs_guest_init.sh script",
+      "source_file": "scripts/step0/build_rootfs_guest_init.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_fixtures_child_app",
+      "label": "child_app.rs",
+      "_origin": "ast",
+      "community": 4,
+      "community_name": "M2 Speed Test & Rootfs Build",
+      "file_type": "code",
+      "norm_label": "child_app.rs",
+      "source_file": "scripts/step0/fixtures/child_app.rs",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_fixtures_child_app_main",
+      "label": "main()",
+      "_origin": "ast",
+      "community": 4,
+      "community_name": "M2 Speed Test & Rootfs Build",
+      "file_type": "code",
+      "norm_label": "main()",
+      "source_file": "scripts/step0/fixtures/child_app.rs",
+      "source_location": "L5"
+    },
+    {
+      "id": "scripts_step0_speed_test_guest_init",
+      "label": "speed_test_guest_init.sh",
+      "_origin": "ast",
+      "community": 4,
+      "community_name": "M2 Speed Test & Rootfs Build",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "file"
+      },
+      "norm_label": "speed_test_guest_init.sh",
+      "source_file": "scripts/step0/speed_test_guest_init.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_speed_test_guest_init_api",
+      "label": "api()",
+      "_origin": "ast",
+      "community": 4,
+      "community_name": "M2 Speed Test & Rootfs Build",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_function"
+      },
+      "norm_label": "api()",
+      "source_file": "scripts/step0/speed_test_guest_init.sh",
+      "source_location": "L36"
+    },
+    {
+      "id": "scripts_step0_speed_test_guest_init_sh__entry",
+      "label": "speed_test_guest_init.sh script",
+      "_origin": "ast",
+      "community": 4,
+      "community_name": "M2 Speed Test & Rootfs Build",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_entrypoint"
+      },
+      "norm_label": "speed_test_guest_init.sh script",
+      "source_file": "scripts/step0/speed_test_guest_init.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_speed_test_guest_init_times_ms",
+      "label": "TIMES_MS",
+      "_origin": "ast",
+      "community": 4,
+      "community_name": "M2 Speed Test & Rootfs Build",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "code"
+      },
+      "norm_label": "times_ms",
+      "source_file": "scripts/step0/speed_test_guest_init.sh",
+      "source_location": "L41"
+    },
+    {
+      "id": "scripts_step0_run_guest_init",
+      "label": "run_guest_init.sh",
+      "_origin": "ast",
+      "community": 5,
+      "community_name": "Guest-Init Boot Test Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "file"
+      },
+      "norm_label": "run_guest_init.sh",
+      "source_file": "scripts/step0/run_guest_init.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_run_guest_init_api",
+      "label": "api()",
+      "_origin": "ast",
+      "community": 5,
+      "community_name": "Guest-Init Boot Test Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_function"
+      },
+      "norm_label": "api()",
+      "source_file": "scripts/step0/run_guest_init.sh",
+      "source_location": "L51"
+    },
+    {
+      "id": "scripts_step0_run_guest_init_cleanup",
+      "label": "cleanup()",
+      "_origin": "ast",
+      "community": 5,
+      "community_name": "Guest-Init Boot Test Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_function"
+      },
+      "norm_label": "cleanup()",
+      "source_file": "scripts/step0/run_guest_init.sh",
+      "source_location": "L35"
+    },
+    {
+      "id": "scripts_step0_run_guest_init_sh__entry",
+      "label": "run_guest_init.sh script",
+      "_origin": "ast",
+      "community": 5,
+      "community_name": "Guest-Init Boot Test Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_entrypoint"
+      },
+      "norm_label": "run_guest_init.sh script",
+      "source_file": "scripts/step0/run_guest_init.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_tests_test_guest_init_boot",
+      "label": "test_guest_init_boot.sh",
+      "_origin": "ast",
+      "community": 5,
+      "community_name": "Guest-Init Boot Test Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "file"
+      },
+      "norm_label": "test_guest_init_boot.sh",
+      "source_file": "scripts/step0/tests/test_guest_init_boot.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_tests_test_guest_init_boot_sh__entry",
+      "label": "test_guest_init_boot.sh script",
+      "_origin": "ast",
+      "community": 5,
+      "community_name": "Guest-Init Boot Test Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_entrypoint"
+      },
+      "norm_label": "test_guest_init_boot.sh script",
+      "source_file": "scripts/step0/tests/test_guest_init_boot.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_tests_test_guest_init_boot_test_guest_init_boot_console_shows_marker",
+      "label": "test_guest_init_boot_console_shows_marker()",
+      "_origin": "ast",
+      "community": 5,
+      "community_name": "Guest-Init Boot Test Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_function"
+      },
+      "norm_label": "test_guest_init_boot_console_shows_marker()",
+      "source_file": "scripts/step0/tests/test_guest_init_boot.sh",
+      "source_location": "L11"
+    },
+    {
+      "id": "scripts_step0_tests_test_guest_init_boot_test_guest_init_boot_execs_configured_app",
+      "label": "test_guest_init_boot_execs_configured_app()",
+      "_origin": "ast",
+      "community": 5,
+      "community_name": "Guest-Init Boot Test Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_function"
+      },
+      "norm_label": "test_guest_init_boot_execs_configured_app()",
+      "source_file": "scripts/step0/tests/test_guest_init_boot.sh",
+      "source_location": "L19"
+    },
+    {
+      "id": "scripts_step0_tests_test_guest_init_boot_test_guest_init_boot_reaches_userspace",
+      "label": "test_guest_init_boot_reaches_userspace()",
+      "_origin": "ast",
+      "community": 5,
+      "community_name": "Guest-Init Boot Test Harness",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_function"
+      },
+      "norm_label": "test_guest_init_boot_reaches_userspace()",
+      "source_file": "scripts/step0/tests/test_guest_init_boot.sh",
+      "source_location": "L7"
+    },
+    {
+      "id": "scripts_step0_tests_lib_assert",
+      "label": "assert.sh",
+      "_origin": "ast",
+      "community": 6,
+      "community_name": "Test Assertion Library",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "file"
+      },
+      "norm_label": "assert.sh",
+      "source_file": "scripts/step0/tests/lib/assert.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_tests_lib_assert_assert_exit_code",
+      "label": "assert_exit_code()",
+      "_origin": "ast",
+      "community": 6,
+      "community_name": "Test Assertion Library",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_function"
+      },
+      "norm_label": "assert_exit_code()",
+      "source_file": "scripts/step0/tests/lib/assert.sh",
+      "source_location": "L6"
+    },
+    {
+      "id": "scripts_step0_tests_lib_assert_assert_output_contains",
+      "label": "assert_output_contains()",
+      "_origin": "ast",
+      "community": 6,
+      "community_name": "Test Assertion Library",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_function"
+      },
+      "norm_label": "assert_output_contains()",
+      "source_file": "scripts/step0/tests/lib/assert.sh",
+      "source_location": "L20"
+    },
+    {
+      "id": "scripts_step0_tests_lib_assert_sh__entry",
+      "label": "assert.sh script",
+      "_origin": "ast",
+      "community": 6,
+      "community_name": "Test Assertion Library",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_entrypoint"
+      },
+      "norm_label": "assert.sh script",
+      "source_file": "scripts/step0/tests/lib/assert.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_tests_run",
+      "label": "run.sh",
+      "_origin": "ast",
+      "community": 6,
+      "community_name": "Test Assertion Library",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "file"
+      },
+      "norm_label": "run.sh",
+      "source_file": "scripts/step0/tests/run.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_tests_run_sh__entry",
+      "label": "run.sh script",
+      "_origin": "ast",
+      "community": 6,
+      "community_name": "Test Assertion Library",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_entrypoint"
+      },
+      "norm_label": "run.sh script",
+      "source_file": "scripts/step0/tests/run.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_tests_test_jailer_boot",
+      "label": "test_jailer_boot.sh",
+      "_origin": "ast",
+      "community": 7,
+      "community_name": "Jailer Boot Test",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "file"
+      },
+      "norm_label": "test_jailer_boot.sh",
+      "source_file": "scripts/step0/tests/test_jailer_boot.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_tests_test_jailer_boot_sh__entry",
+      "label": "test_jailer_boot.sh script",
+      "_origin": "ast",
+      "community": 7,
+      "community_name": "Jailer Boot Test",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_entrypoint"
+      },
+      "norm_label": "test_jailer_boot.sh script",
+      "source_file": "scripts/step0/tests/test_jailer_boot.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_tests_test_jailer_boot_test_jailer_boot_console_shows_marker",
+      "label": "test_jailer_boot_console_shows_marker()",
+      "_origin": "ast",
+      "community": 7,
+      "community_name": "Jailer Boot Test",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_function"
+      },
+      "norm_label": "test_jailer_boot_console_shows_marker()",
+      "source_file": "scripts/step0/tests/test_jailer_boot.sh",
+      "source_location": "L12"
+    },
+    {
+      "id": "scripts_step0_tests_test_jailer_boot_test_jailer_boot_reaches_userspace",
+      "label": "test_jailer_boot_reaches_userspace()",
+      "_origin": "ast",
+      "community": 7,
+      "community_name": "Jailer Boot Test",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_function"
+      },
+      "norm_label": "test_jailer_boot_reaches_userspace()",
+      "source_file": "scripts/step0/tests/test_jailer_boot.sh",
+      "source_location": "L8"
+    },
+    {
+      "id": "scripts_step0_tests_test_jailer_boot_test_jailer_boot_runs_as_unprivileged_uid",
+      "label": "test_jailer_boot_runs_as_unprivileged_uid()",
+      "_origin": "ast",
+      "community": 7,
+      "community_name": "Jailer Boot Test",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_function"
+      },
+      "norm_label": "test_jailer_boot_runs_as_unprivileged_uid()",
+      "source_file": "scripts/step0/tests/test_jailer_boot.sh",
+      "source_location": "L16"
+    },
+    {
+      "id": "scripts_step0_tests_test_plain_boot",
+      "label": "test_plain_boot.sh",
+      "_origin": "ast",
+      "community": 8,
+      "community_name": "Plain Boot Test",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "file"
+      },
+      "norm_label": "test_plain_boot.sh",
+      "source_file": "scripts/step0/tests/test_plain_boot.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_tests_test_plain_boot_sh__entry",
+      "label": "test_plain_boot.sh script",
+      "_origin": "ast",
+      "community": 8,
+      "community_name": "Plain Boot Test",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_entrypoint"
+      },
+      "norm_label": "test_plain_boot.sh script",
+      "source_file": "scripts/step0/tests/test_plain_boot.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_tests_test_plain_boot_test_plain_boot_console_shows_marker",
+      "label": "test_plain_boot_console_shows_marker()",
+      "_origin": "ast",
+      "community": 8,
+      "community_name": "Plain Boot Test",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_function"
+      },
+      "norm_label": "test_plain_boot_console_shows_marker()",
+      "source_file": "scripts/step0/tests/test_plain_boot.sh",
+      "source_location": "L11"
+    },
+    {
+      "id": "scripts_step0_tests_test_plain_boot_test_plain_boot_reaches_userspace",
+      "label": "test_plain_boot_reaches_userspace()",
+      "_origin": "ast",
+      "community": 8,
+      "community_name": "Plain Boot Test",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_function"
+      },
+      "norm_label": "test_plain_boot_reaches_userspace()",
+      "source_file": "scripts/step0/tests/test_plain_boot.sh",
+      "source_location": "L7"
+    },
+    {
+      "id": "scripts_step0_tests_test_prereqs",
+      "label": "test_prereqs.sh",
+      "_origin": "ast",
+      "community": 9,
+      "community_name": "Prereqs Test",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "file"
+      },
+      "norm_label": "test_prereqs.sh",
+      "source_file": "scripts/step0/tests/test_prereqs.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_tests_test_prereqs_sh__entry",
+      "label": "test_prereqs.sh script",
+      "_origin": "ast",
+      "community": 9,
+      "community_name": "Prereqs Test",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_entrypoint"
+      },
+      "norm_label": "test_prereqs.sh script",
+      "source_file": "scripts/step0/tests/test_prereqs.sh",
+      "source_location": "L1"
+    },
+    {
+      "id": "scripts_step0_tests_test_prereqs_test_prereqs_passes_on_a_ready_machine",
+      "label": "test_prereqs_passes_on_a_ready_machine()",
+      "_origin": "ast",
+      "community": 9,
+      "community_name": "Prereqs Test",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_function"
+      },
+      "norm_label": "test_prereqs_passes_on_a_ready_machine()",
+      "source_file": "scripts/step0/tests/test_prereqs.sh",
+      "source_location": "L5"
+    },
+    {
+      "id": "scripts_step0_tests_test_prereqs_test_prereqs_reports_each_check",
+      "label": "test_prereqs_reports_each_check()",
+      "_origin": "ast",
+      "community": 9,
+      "community_name": "Prereqs Test",
+      "file_type": "code",
+      "metadata": {
+        "language": "bash",
+        "kind": "bash_function"
+      },
+      "norm_label": "test_prereqs_reports_each_check()",
+      "source_file": "scripts/step0/tests/test_prereqs.sh",
+      "source_location": "L9"
+    },
+    {
+      "id": "readme_firecracker_microvm",
+      "label": "Firecracker microVM",
+      "author": null,
+      "captured_at": null,
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "contributor": null,
+      "file_type": "concept",
+      "norm_label": "firecracker microvm",
+      "source_file": "README.md",
+      "source_location": null,
+      "source_url": null
+    },
+    {
+      "id": "scripts_step0_readme_jailer",
+      "label": "jailer",
+      "author": null,
+      "captured_at": null,
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "contributor": null,
+      "file_type": "concept",
+      "norm_label": "jailer",
+      "source_file": "scripts/step0/README.md",
+      "source_location": null,
+      "source_url": null
+    },
+    {
+      "id": "readme_cirrocumulus",
+      "label": "Cirrocumulus",
+      "author": null,
+      "captured_at": null,
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "contributor": null,
+      "file_type": "document",
+      "norm_label": "cirrocumulus",
+      "source_file": "README.md",
+      "source_location": null,
+      "source_url": null
+    },
+    {
+      "id": "scripts_step0_build_pathway",
+      "label": "BUILD_PATHWAY.md",
+      "author": null,
+      "captured_at": null,
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "contributor": null,
+      "file_type": "document",
+      "norm_label": "build_pathway.md",
+      "source_file": "scripts/step0/README.md",
+      "source_location": null,
+      "source_url": null
+    },
+    {
+      "id": "scripts_step0_readme_step_0_verification",
+      "label": "Step 0 Verification (scripts/step0/README.md)",
+      "author": null,
+      "captured_at": null,
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "contributor": null,
+      "file_type": "document",
+      "norm_label": "step 0 verification (scripts/step0/readme.md)",
+      "source_file": "scripts/step0/README.md",
+      "source_location": null,
+      "source_url": null
+    },
+    {
+      "id": "scripts_step0_readme_jailer_chown_leaf_only",
+      "label": "jailer only chowns the leaf chroot directory",
+      "author": null,
+      "captured_at": null,
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "contributor": null,
+      "file_type": "rationale",
+      "norm_label": "jailer only chowns the leaf chroot directory",
+      "source_file": "scripts/step0/README.md",
+      "source_location": null,
+      "source_url": null
+    },
+    {
+      "id": "scripts_step0_readme_nodev_chroot_caveat",
+      "label": "jailer chroot base must avoid nodev mounts",
+      "author": null,
+      "captured_at": null,
+      "community": 0,
+      "community_name": "Step 0 Boot Harness",
+      "contributor": null,
+      "file_type": "rationale",
+      "norm_label": "jailer chroot base must avoid nodev mounts",
+      "source_file": "scripts/step0/README.md",
+      "source_location": null,
+      "source_url": null
+    },
+    {
+      "id": "m2s2_speed_test_cirro_init_json",
+      "label": "/etc/cirro-init.json config",
+      "author": null,
+      "captured_at": null,
+      "community": 4,
+      "community_name": "M2 Speed Test & Rootfs Build",
+      "contributor": null,
+      "file_type": "concept",
+      "norm_label": "/etc/cirro-init.json config",
+      "source_file": "m2s2_speed_test.md",
+      "source_location": null,
+      "source_url": null
+    },
+    {
+      "id": "m2s2_speed_test_m6_milestone",
+      "label": "M6 — validates the core bet (snapshot-restore park/wake)",
+      "author": null,
+      "captured_at": null,
+      "community": 4,
+      "community_name": "M2 Speed Test & Rootfs Build",
+      "contributor": null,
+      "file_type": "concept",
+      "norm_label": "m6 — validates the core bet (snapshot-restore park/wake)",
+      "source_file": "m2s2_speed_test.md",
+      "source_location": null,
+      "source_url": null
+    },
+    {
+      "id": "m2s2_speed_test_report",
+      "label": "M2 Slice 2 Time-to-Start Speed Test",
+      "author": null,
+      "captured_at": null,
+      "community": 4,
+      "community_name": "M2 Speed Test & Rootfs Build",
+      "contributor": null,
+      "file_type": "document",
+      "norm_label": "m2 slice 2 time-to-start speed test",
+      "source_file": "m2s2_speed_test.md",
+      "source_location": null,
+      "source_url": null
+    },
+    {
+      "id": "m2s2_speed_test_guest_init",
+      "label": "guest-init (M2)",
+      "author": null,
+      "captured_at": null,
+      "community": 5,
+      "community_name": "Guest-Init Boot Test Harness",
+      "contributor": null,
+      "file_type": "concept",
+      "norm_label": "guest-init (m2)",
+      "source_file": "m2s2_speed_test.md",
+      "source_location": null,
+      "source_url": null
+    },
+    {
+      "id": "m2s2_speed_test_slice_1_panic_on_return_bug",
+      "label": "Slice 1 panic-on-return bug",
+      "author": null,
+      "captured_at": null,
+      "community": 5,
+      "community_name": "Guest-Init Boot Test Harness",
+      "contributor": null,
+      "file_type": "rationale",
+      "norm_label": "slice 1 panic-on-return bug",
+      "source_file": "m2s2_speed_test.md",
+      "source_location": null,
+      "source_url": null
+    },
+    {
+      "id": "clap",
+      "label": "clap",
+      "community": 1,
+      "community_name": "CLI Subcommand Tree",
+      "external": true,
+      "file_type": "concept",
+      "norm_label": "clap",
+      "source_file": "",
+      "type": "external"
+    },
+    {
+      "id": "prelude",
+      "label": "prelude",
+      "community": 1,
+      "community_name": "CLI Subcommand Tree",
+      "external": true,
+      "file_type": "concept",
+      "norm_label": "prelude",
+      "source_file": "",
+      "type": "external"
+    },
+    {
+      "id": "cstring",
+      "label": "cstring",
+      "community": 2,
+      "community_name": "Guest-Init PID 1 Core",
+      "external": true,
+      "file_type": "concept",
+      "norm_label": "cstring",
+      "source_file": "",
+      "type": "external"
+    },
+    {
+      "id": "duration",
+      "label": "duration",
+      "community": 2,
+      "community_name": "Guest-Init PID 1 Core",
+      "external": true,
+      "file_type": "concept",
+      "norm_label": "duration",
+      "source_file": "",
+      "type": "external"
+    },
+    {
+      "id": "mount",
+      "label": "mount",
+      "community": 2,
+      "community_name": "Guest-Init PID 1 Core",
+      "external": true,
+      "file_type": "concept",
+      "norm_label": "mount",
+      "source_file": "",
+      "type": "external"
+    },
+    {
+      "id": "path",
+      "label": "path",
+      "community": 2,
+      "community_name": "Guest-Init PID 1 Core",
+      "external": true,
+      "file_type": "concept",
+      "norm_label": "path",
+      "source_file": "",
+      "type": "external"
+    },
+    {
+      "id": "unistd",
+      "label": "unistd",
+      "community": 2,
+      "community_name": "Guest-Init PID 1 Core",
+      "external": true,
+      "file_type": "concept",
+      "norm_label": "unistd",
+      "source_file": "",
+      "type": "external"
+    },
+    {
+      "id": "waitpid",
+      "label": "waitpid",
+      "community": 2,
+      "community_name": "Guest-Init PID 1 Core",
+      "external": true,
+      "file_type": "concept",
+      "norm_label": "waitpid",
+      "source_file": "",
+      "type": "external"
+    },
+    {
+      "id": "write",
+      "label": "write",
+      "community": 2,
+      "community_name": "Guest-Init PID 1 Core",
+      "external": true,
+      "file_type": "concept",
+      "norm_label": "write",
+      "source_file": "",
+      "type": "external"
+    },
+    {
+      "id": "deserialize",
+      "label": "deserialize",
+      "community": 3,
+      "community_name": "Guest-Init Config Parsing",
+      "external": true,
+      "file_type": "concept",
+      "norm_label": "deserialize",
+      "source_file": "",
+      "type": "external"
+    },
+    {
+      "id": "super",
+      "label": "super",
+      "community": 3,
+      "community_name": "Guest-Init Config Parsing",
+      "external": true,
+      "file_type": "concept",
+      "norm_label": "super",
+      "source_file": "",
+      "type": "external"
+    }
+  ],
+  "links": [
+    {
+      "source": "crates_cirro_tests_cli_help_lists_every_subcommand",
+      "target": "crates_cirro_tests_cli_cirro",
+      "relation": "calls",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "call",
+      "source_file": "crates/cirro/tests/cli.rs",
+      "source_location": "L10",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_tests_cli_unimplemented_subcommand_says_not_yet_and_fails",
+      "target": "crates_cirro_tests_cli_cirro",
+      "relation": "calls",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "call",
+      "source_file": "crates/cirro/tests/cli.rs",
+      "source_location": "L20",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_config_defaults_args_to_empty_when_omitted",
+      "target": "crates_guest_init_src_config_parse_config",
+      "relation": "calls",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "call",
+      "source_file": "crates/guest-init/src/config.rs",
+      "source_location": "L33",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_config_parses_exec_path_and_args",
+      "target": "crates_guest_init_src_config_parse_config",
+      "relation": "calls",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "call",
+      "source_file": "crates/guest-init/src/config.rs",
+      "source_location": "L25",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_main_main",
+      "target": "crates_guest_init_src_main_exec_configured_app",
+      "relation": "calls",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "call",
+      "source_file": "crates/guest-init/src/main.rs",
+      "source_location": "L111",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_main_main",
+      "target": "crates_guest_init_src_main_mount_pseudo_filesystems",
+      "relation": "calls",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "call",
+      "source_file": "crates/guest-init/src/main.rs",
+      "source_location": "L95",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_prereqs_sh__entry",
+      "target": "scripts_step0_prereqs_check",
+      "relation": "calls",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "call",
+      "source_file": "scripts/step0/prereqs.sh",
+      "source_location": "L24",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_run_guest_init_sh__entry",
+      "target": "scripts_step0_run_guest_init_api",
+      "relation": "calls",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "call",
+      "source_file": "scripts/step0/run_guest_init.sh",
+      "source_location": "L56",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_run_jailer_sh__entry",
+      "target": "scripts_step0_run_jailer_api",
+      "relation": "calls",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "call",
+      "source_file": "scripts/step0/run_jailer.sh",
+      "source_location": "L120",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_run_plain_sh__entry",
+      "target": "scripts_step0_run_plain_api",
+      "relation": "calls",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "call",
+      "source_file": "scripts/step0/run_plain.sh",
+      "source_location": "L56",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_speed_test_guest_init_sh__entry",
+      "target": "scripts_step0_speed_test_guest_init_api",
+      "relation": "calls",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "call",
+      "source_file": "scripts/step0/speed_test_guest_init.sh",
+      "source_location": "L62",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_src_main_cli",
+      "target": "crates_cirro_src_main_command",
+      "relation": "references",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "field",
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L10",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_src_main_command",
+      "target": "crates_cirro_src_main_nodecommand",
+      "relation": "references",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "field",
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L17",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_src_main_command",
+      "target": "crates_cirro_src_main_servercommand",
+      "relation": "references",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "field",
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L20",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_src_main_command",
+      "target": "crates_cirro_src_main_rs_string",
+      "relation": "references",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "field",
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L34",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_src_main_command",
+      "target": "crates_cirro_src_main_dbcommand",
+      "relation": "references",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "field",
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L41",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_src_main_dbcommand",
+      "target": "crates_cirro_src_main_rs_string",
+      "relation": "references",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "field",
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L64",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_src_main_nodecommand",
+      "target": "crates_cirro_src_main_rs_string",
+      "relation": "references",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "field",
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L49",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_config_config",
+      "target": "vec",
+      "relation": "references",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "field",
+      "source_file": "crates/guest-init/src/config.rs",
+      "source_location": "L12",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_config_config",
+      "target": "crates_guest_init_src_config_rs_string",
+      "relation": "references",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "generic_arg",
+      "source_file": "crates/guest-init/src/config.rs",
+      "source_location": "L12",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_config_parse_config",
+      "target": "crates_guest_init_src_config_config",
+      "relation": "references",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "generic_arg",
+      "source_file": "crates/guest-init/src/config.rs",
+      "source_location": "L15",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_config_parse_config",
+      "target": "error",
+      "relation": "references",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "generic_arg",
+      "source_file": "crates/guest-init/src/config.rs",
+      "source_location": "L15",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_src_main",
+      "target": "exitcode",
+      "relation": "imports_from",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "import",
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L1",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_src_main",
+      "target": "clap",
+      "relation": "imports_from",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "import",
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L3",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_tests_cli",
+      "target": "crates_cirro_src_main_command",
+      "relation": "imports_from",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "import",
+      "source_file": "crates/cirro/tests/cli.rs",
+      "source_location": "L1",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_tests_cli",
+      "target": "prelude",
+      "relation": "imports_from",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "import",
+      "source_file": "crates/cirro/tests/cli.rs",
+      "source_location": "L2",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_config",
+      "target": "super",
+      "relation": "imports_from",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "import",
+      "source_file": "crates/guest-init/src/config.rs",
+      "source_location": "L21",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_config",
+      "target": "deserialize",
+      "relation": "imports_from",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "import",
+      "source_file": "crates/guest-init/src/config.rs",
+      "source_location": "L6",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_main",
+      "target": "crates_guest_init_src_config_config",
+      "relation": "imports_from",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "import",
+      "source_file": "crates/guest-init/src/main.rs",
+      "source_location": "L11",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_main",
+      "target": "mount",
+      "relation": "imports_from",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "import",
+      "source_file": "crates/guest-init/src/main.rs",
+      "source_location": "L12",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_main",
+      "target": "waitpid",
+      "relation": "imports_from",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "import",
+      "source_file": "crates/guest-init/src/main.rs",
+      "source_location": "L13",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_main",
+      "target": "unistd",
+      "relation": "imports_from",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "import",
+      "source_file": "crates/guest-init/src/main.rs",
+      "source_location": "L14",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_main",
+      "target": "cstring",
+      "relation": "imports_from",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "import",
+      "source_file": "crates/guest-init/src/main.rs",
+      "source_location": "L15",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_main",
+      "target": "write",
+      "relation": "imports_from",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "import",
+      "source_file": "crates/guest-init/src/main.rs",
+      "source_location": "L16",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_main",
+      "target": "path",
+      "relation": "imports_from",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "import",
+      "source_file": "crates/guest-init/src/main.rs",
+      "source_location": "L17",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_main",
+      "target": "duration",
+      "relation": "imports_from",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "import",
+      "source_file": "crates/guest-init/src/main.rs",
+      "source_location": "L18",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_main_exec_configured_app",
+      "target": "crates_guest_init_src_config_config",
+      "relation": "references",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "parameter_type",
+      "source_file": "crates/guest-init/src/main.rs",
+      "source_location": "L70",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_src_main_main",
+      "target": "exitcode",
+      "relation": "references",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "return_type",
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L68",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_tests_cli_cirro",
+      "target": "crates_cirro_src_main_command",
+      "relation": "references",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "return_type",
+      "source_file": "crates/cirro/tests/cli.rs",
+      "source_location": "L4",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_config_parse_config",
+      "target": "result",
+      "relation": "references",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "return_type",
+      "source_file": "crates/guest-init/src/config.rs",
+      "source_location": "L15",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_src_main",
+      "target": "crates_cirro_src_main_command",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L14",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_src_main",
+      "target": "crates_cirro_src_main_nodecommand",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L45",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_src_main",
+      "target": "crates_cirro_src_main_servercommand",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L53",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_src_main",
+      "target": "crates_cirro_src_main_dbcommand",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L59",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_src_main",
+      "target": "crates_cirro_src_main_main",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L68",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_src_main",
+      "target": "crates_cirro_src_main_cli",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "crates/cirro/src/main.rs",
+      "source_location": "L8",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_tests_cli",
+      "target": "crates_cirro_tests_cli_unimplemented_subcommand_says_not_yet_and_fails",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "crates/cirro/tests/cli.rs",
+      "source_location": "L19",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_tests_cli",
+      "target": "crates_cirro_tests_cli_cirro",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "crates/cirro/tests/cli.rs",
+      "source_location": "L4",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_cirro_tests_cli",
+      "target": "crates_cirro_tests_cli_help_lists_every_subcommand",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "crates/cirro/tests/cli.rs",
+      "source_location": "L9",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_config",
+      "target": "crates_guest_init_src_config_parse_config",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "crates/guest-init/src/config.rs",
+      "source_location": "L15",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_config",
+      "target": "crates_guest_init_src_config_parses_exec_path_and_args",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "crates/guest-init/src/config.rs",
+      "source_location": "L24",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_config",
+      "target": "crates_guest_init_src_config_defaults_args_to_empty_when_omitted",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "crates/guest-init/src/config.rs",
+      "source_location": "L32",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_config",
+      "target": "crates_guest_init_src_config_rejects_config_missing_exec",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "crates/guest-init/src/config.rs",
+      "source_location": "L39",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_config",
+      "target": "crates_guest_init_src_config_config",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "crates/guest-init/src/config.rs",
+      "source_location": "L9",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_main",
+      "target": "crates_guest_init_src_main_config_path",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "crates/guest-init/src/main.rs",
+      "source_location": "L23",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_main",
+      "target": "crates_guest_init_src_main_boot_marker",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "crates/guest-init/src/main.rs",
+      "source_location": "L27",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_main",
+      "target": "crates_guest_init_src_main_mount_pseudo_filesystems",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "crates/guest-init/src/main.rs",
+      "source_location": "L34",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_main",
+      "target": "crates_guest_init_src_main_exec_configured_app",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "crates/guest-init/src/main.rs",
+      "source_location": "L70",
+      "weight": 1.0
+    },
+    {
+      "source": "crates_guest_init_src_main",
+      "target": "crates_guest_init_src_main_main",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "crates/guest-init/src/main.rs",
+      "source_location": "L94",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_build_rootfs",
+      "target": "scripts_step0_build_rootfs_sh__entry",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/build_rootfs.sh",
+      "source_location": "L1",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_build_rootfs_guest_init",
+      "target": "scripts_step0_build_rootfs_guest_init_sh__entry",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/build_rootfs_guest_init.sh",
+      "source_location": "L1",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_clean",
+      "target": "scripts_step0_clean_sh__entry",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/clean.sh",
+      "source_location": "L1",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_fetch_kernel",
+      "target": "scripts_step0_fetch_kernel_sh__entry",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/fetch_kernel.sh",
+      "source_location": "L1",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_fixtures_child_app",
+      "target": "scripts_step0_fixtures_child_app_main",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/fixtures/child_app.rs",
+      "source_location": "L5",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_prereqs",
+      "target": "scripts_step0_prereqs_sh__entry",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/prereqs.sh",
+      "source_location": "L1",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_run_guest_init",
+      "target": "scripts_step0_run_guest_init_sh__entry",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/run_guest_init.sh",
+      "source_location": "L1",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_run_jailer",
+      "target": "scripts_step0_run_jailer_sh__entry",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/run_jailer.sh",
+      "source_location": "L1",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_run_plain",
+      "target": "scripts_step0_run_plain_sh__entry",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/run_plain.sh",
+      "source_location": "L1",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_speed_test_guest_init",
+      "target": "scripts_step0_speed_test_guest_init_sh__entry",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/speed_test_guest_init.sh",
+      "source_location": "L1",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_tests_lib_assert",
+      "target": "scripts_step0_tests_lib_assert_sh__entry",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/tests/lib/assert.sh",
+      "source_location": "L1",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_tests_run",
+      "target": "scripts_step0_tests_run_sh__entry",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/tests/run.sh",
+      "source_location": "L1",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_tests_test_guest_init_boot",
+      "target": "scripts_step0_tests_test_guest_init_boot_sh__entry",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/tests/test_guest_init_boot.sh",
+      "source_location": "L1",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_tests_test_jailer_boot",
+      "target": "scripts_step0_tests_test_jailer_boot_sh__entry",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/tests/test_jailer_boot.sh",
+      "source_location": "L1",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_tests_test_plain_boot",
+      "target": "scripts_step0_tests_test_plain_boot_sh__entry",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/tests/test_plain_boot.sh",
+      "source_location": "L1",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_tests_test_prereqs",
+      "target": "scripts_step0_tests_test_prereqs_sh__entry",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/tests/test_prereqs.sh",
+      "source_location": "L1",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_prereqs",
+      "target": "scripts_step0_prereqs_check",
+      "relation": "defines",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/prereqs.sh",
+      "source_location": "L12",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_run_guest_init",
+      "target": "scripts_step0_run_guest_init_cleanup",
+      "relation": "defines",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/run_guest_init.sh",
+      "source_location": "L35",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_run_guest_init",
+      "target": "scripts_step0_run_guest_init_api",
+      "relation": "defines",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/run_guest_init.sh",
+      "source_location": "L51",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_run_jailer",
+      "target": "scripts_step0_run_jailer_api",
+      "relation": "defines",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/run_jailer.sh",
+      "source_location": "L115",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_run_jailer",
+      "target": "scripts_step0_run_jailer_cleanup",
+      "relation": "defines",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/run_jailer.sh",
+      "source_location": "L65",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_run_plain",
+      "target": "scripts_step0_run_plain_cleanup",
+      "relation": "defines",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/run_plain.sh",
+      "source_location": "L35",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_run_plain",
+      "target": "scripts_step0_run_plain_api",
+      "relation": "defines",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/run_plain.sh",
+      "source_location": "L51",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_speed_test_guest_init",
+      "target": "scripts_step0_speed_test_guest_init_api",
+      "relation": "defines",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/speed_test_guest_init.sh",
+      "source_location": "L36",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_speed_test_guest_init",
+      "target": "scripts_step0_speed_test_guest_init_times_ms",
+      "relation": "defines",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/speed_test_guest_init.sh",
+      "source_location": "L41",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_tests_lib_assert",
+      "target": "scripts_step0_tests_lib_assert_assert_output_contains",
+      "relation": "defines",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/tests/lib/assert.sh",
+      "source_location": "L20",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_tests_lib_assert",
+      "target": "scripts_step0_tests_lib_assert_assert_exit_code",
+      "relation": "defines",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/tests/lib/assert.sh",
+      "source_location": "L6",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_tests_test_guest_init_boot",
+      "target": "scripts_step0_tests_test_guest_init_boot_test_guest_init_boot_console_shows_marker",
+      "relation": "defines",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/tests/test_guest_init_boot.sh",
+      "source_location": "L11",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_tests_test_guest_init_boot",
+      "target": "scripts_step0_tests_test_guest_init_boot_test_guest_init_boot_execs_configured_app",
+      "relation": "defines",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/tests/test_guest_init_boot.sh",
+      "source_location": "L19",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_tests_test_guest_init_boot",
+      "target": "scripts_step0_tests_test_guest_init_boot_test_guest_init_boot_reaches_userspace",
+      "relation": "defines",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/tests/test_guest_init_boot.sh",
+      "source_location": "L7",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_tests_test_jailer_boot",
+      "target": "scripts_step0_tests_test_jailer_boot_test_jailer_boot_console_shows_marker",
+      "relation": "defines",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/tests/test_jailer_boot.sh",
+      "source_location": "L12",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_tests_test_jailer_boot",
+      "target": "scripts_step0_tests_test_jailer_boot_test_jailer_boot_runs_as_unprivileged_uid",
+      "relation": "defines",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/tests/test_jailer_boot.sh",
+      "source_location": "L16",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_tests_test_jailer_boot",
+      "target": "scripts_step0_tests_test_jailer_boot_test_jailer_boot_reaches_userspace",
+      "relation": "defines",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/tests/test_jailer_boot.sh",
+      "source_location": "L8",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_tests_test_plain_boot",
+      "target": "scripts_step0_tests_test_plain_boot_test_plain_boot_console_shows_marker",
+      "relation": "defines",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/tests/test_plain_boot.sh",
+      "source_location": "L11",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_tests_test_plain_boot",
+      "target": "scripts_step0_tests_test_plain_boot_test_plain_boot_reaches_userspace",
+      "relation": "defines",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/tests/test_plain_boot.sh",
+      "source_location": "L7",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_tests_test_prereqs",
+      "target": "scripts_step0_tests_test_prereqs_test_prereqs_passes_on_a_ready_machine",
+      "relation": "defines",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/tests/test_prereqs.sh",
+      "source_location": "L5",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_tests_test_prereqs",
+      "target": "scripts_step0_tests_test_prereqs_test_prereqs_reports_each_check",
+      "relation": "defines",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/tests/test_prereqs.sh",
+      "source_location": "L9",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_tests_run",
+      "target": "scripts_step0_tests_lib_assert",
+      "relation": "imports_from",
+      "_origin": "ast",
+      "confidence": "INFERRED",
+      "confidence_score": 0.55,
+      "context": "import",
+      "source_file": "scripts/step0/tests/run.sh",
+      "source_location": "L12",
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_tests_test_guest_init_boot",
+      "target": "scripts_step0_run_guest_init",
+      "relation": "invokes",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "m2s2_speed_test.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_readme_jailer_chown_leaf_only",
+      "target": "scripts_step0_readme_jailer",
+      "relation": "conceptually_related_to",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_readme_nodev_chroot_caveat",
+      "target": "scripts_step0_readme_jailer",
+      "relation": "conceptually_related_to",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "m2s2_speed_test_slice_1_panic_on_return_bug",
+      "target": "m2s2_speed_test_guest_init",
+      "relation": "rationale_for",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "m2s2_speed_test.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_readme_jailer_chown_leaf_only",
+      "target": "scripts_step0_clean",
+      "relation": "rationale_for",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_readme_jailer_chown_leaf_only",
+      "target": "scripts_step0_run_jailer",
+      "relation": "rationale_for",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_readme_nodev_chroot_caveat",
+      "target": "scripts_step0_run_jailer",
+      "relation": "rationale_for",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "m2s2_speed_test_report",
+      "target": "m2s2_speed_test_cirro_init_json",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "m2s2_speed_test.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "m2s2_speed_test_report",
+      "target": "m2s2_speed_test_guest_init",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "m2s2_speed_test.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "m2s2_speed_test_report",
+      "target": "m2s2_speed_test_m6_milestone",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "m2s2_speed_test.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "m2s2_speed_test_report",
+      "target": "readme_firecracker_microvm",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "m2s2_speed_test.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "m2s2_speed_test_report",
+      "target": "scripts_step0_build_rootfs_guest_init",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "m2s2_speed_test.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "m2s2_speed_test_report",
+      "target": "scripts_step0_fixtures_child_app",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "m2s2_speed_test.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "m2s2_speed_test_report",
+      "target": "scripts_step0_speed_test_guest_init",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "m2s2_speed_test.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "m2s2_speed_test_report",
+      "target": "scripts_step0_tests_test_guest_init_boot",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "m2s2_speed_test.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "readme_cirrocumulus",
+      "target": "readme_firecracker_microvm",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_readme_step_0_verification",
+      "target": "readme_firecracker_microvm",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_readme_step_0_verification",
+      "target": "scripts_step0_build_pathway",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_readme_step_0_verification",
+      "target": "scripts_step0_build_rootfs",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_readme_step_0_verification",
+      "target": "scripts_step0_build_rootfs_guest_init",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_readme_step_0_verification",
+      "target": "scripts_step0_clean",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_readme_step_0_verification",
+      "target": "scripts_step0_fetch_kernel",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_readme_step_0_verification",
+      "target": "scripts_step0_prereqs",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_readme_step_0_verification",
+      "target": "scripts_step0_readme_jailer",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_readme_step_0_verification",
+      "target": "scripts_step0_run_guest_init",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_readme_step_0_verification",
+      "target": "scripts_step0_run_jailer",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_readme_step_0_verification",
+      "target": "scripts_step0_run_plain",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_readme_step_0_verification",
+      "target": "scripts_step0_tests_run",
+      "relation": "references",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "readme_cirrocumulus",
+      "target": "scripts_step0_readme_jailer",
+      "relation": "references",
+      "confidence": "INFERRED",
+      "confidence_score": 0.95,
+      "source_file": "README.md",
+      "source_location": null,
+      "weight": 1.0
+    },
+    {
+      "source": "scripts_step0_run_guest_init",
+      "target": "m2s2_speed_test_guest_init",
+      "relation": "shares_data_with",
+      "confidence": "INFERRED",
+      "confidence_score": 0.95,
+      "source_file": "m2s2_speed_test.md",
+      "source_location": null,
+      "weight": 1.0
+    }
+  ],
+  "hyperedges": [
+    {
+      "id": "jailer_chroot_lifecycle",
+      "label": "jailer chroot setup, caveats, and cleanup lifecycle",
+      "nodes": [
+        "scripts_step0_readme_jailer",
+        "scripts_step0_readme_nodev_chroot_caveat",
+        "scripts_step0_readme_jailer_chown_leaf_only",
+        "scripts_step0_run_jailer",
+        "scripts_step0_clean"
+      ],
+      "relation": "form",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "scripts/step0/README.md"
+    },
+    {
+      "id": "guest_init_boot_measurement_flow",
+      "label": "Guest-init boot and speed-measurement pipeline",
+      "nodes": [
+        "m2s2_speed_test_guest_init",
+        "scripts_step0_run_guest_init",
+        "scripts_step0_build_rootfs_guest_init",
+        "scripts_step0_speed_test_guest_init",
+        "scripts_step0_fixtures_child_app"
+      ],
+      "relation": "participate_in",
+      "confidence": "INFERRED",
+      "confidence_score": 0.85,
+      "source_file": "m2s2_speed_test.md"
+    }
+  ],
+  "built_at_commit": "3dd62ceaa99c2afd4e501f5b3f6b24a7933d72c9"
+}
