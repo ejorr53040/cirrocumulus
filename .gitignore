@@ -1,0 +1,48 @@
+# --- Rust / Cargo ---
+# Compiled output (this is a workspace of binaries, so Cargo.lock IS committed —
+# see https://doc.rust-lang.org/cargo/guide/cargo-toml-vs-cargo-lock.html)
+/target/
+debug/
+
+# rustfmt backup files
+**/*.rs.bk
+
+# MSVC debug symbols (if ever cross-built on Windows)
+*.pdb
+
+# --- Secrets / local config ---
+.env
+.env.*
+*.pem
+*.key
+secrets/
+
+# --- Firecracker / VM artifacts (local dev only, per design doc's Storage section) ---
+/data/
+*.snap
+*.ext4
+*.erofs
+*.rootfs
+vmlinux*
+firecracker
+jailer
+
+# --- Step 0 build artifacts (downloaded kernel, staged rootfs tree, sockets/logs) ---
+/scripts/step0/.build/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# --- Logs ---
+*.log
+
+# --- Internal planning docs (not for distribution) ---
+BUILD_PATHWAY.md
+RESEARCH.md
+
+
+# --- Reference docs (local copies, not project deliverables) ---
+/docs/rust-book/

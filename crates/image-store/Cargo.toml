@@ -1,0 +1,6 @@
+[package]
+name = "image-store"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
