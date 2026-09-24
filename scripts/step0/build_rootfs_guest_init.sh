@@ -8,13 +8,18 @@
 # libc dependency inside the guest -- see RESEARCH.md M2 and
 # crates/guest-init.
 #
-# Also stages the M2 slice 2 fixtures: a config file at the fixed path
-# guest-init reads until vsock config exists, and a tiny static "app"
-# binary for it to fork+exec (fixtures/child_app.rs -- not part of the
-# cargo workspace, since it's a boot-test fixture, not shipped code).
-# Slice 4 adds a second fixture, fixtures/grandchild.rs, which child_app
-# spawns and never waits on, so guest-init's reap loop has an orphan to
-# actually reap.
+# Also stages the M2 slice 2 fixture app guest-init forks+execs
+# (fixtures/child_app.rs -- not part of the cargo workspace, since it's a
+# boot-test fixture, not shipped code). Slice 4 adds a second fixture,
+# fixtures/grandchild.rs, which child_app spawns and never waits on, so
+# guest-init's reap loop has an orphan to actually reap.
+#
+# The app's config (which binary to exec) is no longer baked into the
+# image: since slice 6, guest-init reads it over vsock at boot instead of
+# from a fixed rootfs path, so it's the *runner*'s job (run_guest_init.sh,
+# via push_vsock_config.sh) to supply it, not this build step's. This
+# script still writes the JSON, just outside the rootfs tree, as the file
+# run_guest_init.sh pushes.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,7 +53,7 @@ chmod +x "$ROOTFS_TREE/app/child_app"
 cp "$GRANDCHILD_BIN" "$ROOTFS_TREE/app/grandchild"
 chmod +x "$ROOTFS_TREE/app/grandchild"
 
-cat > "$ROOTFS_TREE/etc/cirro-init.json" <<'EOF'
+cat > "$BUILD_DIR/cirro-init.json" <<'EOF'
 {"exec": "/app/child_app", "args": []}
 EOF
 

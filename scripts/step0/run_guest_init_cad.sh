@@ -6,6 +6,9 @@
 # waiting for the app to exit by itself like run_guest_init.sh's tests do.
 # Prints synthetic FIRECRACKER_EXITED_CLEANLY / NO_KERNEL_PANIC status lines
 # the same way run_guest_init.sh does, so its assertions are reusable.
+#
+# Slice 6: the app config travels over vsock port 52 (push_vsock_config.sh),
+# not baked into the rootfs -- see build_rootfs_guest_init.sh's note.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,6 +20,8 @@ KERNEL="$(ls "$BUILD_DIR"/vmlinux-* 2>/dev/null | tail -1)"
 ROOTFS="$BUILD_DIR/guest-init-rootfs-cad.ext4"
 API_SOCKET="$BUILD_DIR/guest-init-cad.socket"
 CONSOLE_LOG="$BUILD_DIR/guest-init-cad-console.log"
+VSOCK_UDS="$BUILD_DIR/guest-init-cad-vsock.sock"
+CONFIG_JSON="$BUILD_DIR/cirro-init-cad.json"
 BOOT_TIMEOUT_S=10
 
 if [ -z "$KERNEL" ] || [ ! -f "$KERNEL" ]; then
@@ -27,8 +32,12 @@ if [ ! -f "$ROOTFS" ]; then
     echo "no rootfs image found at $ROOTFS -- run build_rootfs_guest_init_cad.sh first" >&2
     exit 1
 fi
+if [ ! -f "$CONFIG_JSON" ]; then
+    echo "no config JSON at $CONFIG_JSON -- run build_rootfs_guest_init_cad.sh first" >&2
+    exit 1
+fi
 
-rm -f "$API_SOCKET" "$CONSOLE_LOG"
+rm -f "$API_SOCKET" "$CONSOLE_LOG" "$VSOCK_UDS"
 
 "$FC_BIN" --api-sock "$API_SOCKET" > "$CONSOLE_LOG" 2>&1 &
 FC_PID=$!
@@ -57,7 +66,10 @@ api() {
 api PUT /machine-config '{"vcpu_count": 1, "mem_size_mib": 128}' >/dev/null
 api PUT /boot-source "{\"kernel_image_path\": \"$KERNEL\", \"boot_args\": \"console=ttyS0 reboot=k panic=1 init=/init\"}" >/dev/null
 api PUT /drives/rootfs "{\"drive_id\": \"rootfs\", \"path_on_host\": \"$ROOTFS\", \"is_root_device\": true, \"is_read_only\": false}" >/dev/null
+api PUT /vsock "{\"guest_cid\": 3, \"uds_path\": \"$VSOCK_UDS\"}" >/dev/null
 api PUT /actions '{"action_type": "InstanceStart"}' >/dev/null
+
+"$HERE/push_vsock_config.sh" "$VSOCK_UDS" 52 "$CONFIG_JSON" "$BOOT_TIMEOUT_S"
 
 app_seen=1
 for _ in $(seq 1 $((BOOT_TIMEOUT_S * 10))); do

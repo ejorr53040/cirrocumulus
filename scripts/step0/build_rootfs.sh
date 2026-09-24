@@ -31,12 +31,18 @@ done
 
 # Booted directly via the kernel's init=/init arg, not busybox's own init
 # applet (which would expect /etc/inittab).
+#
+# The eth0 check (M3 slice 2) is a no-op when no network interface was
+# attached -- `ip link show eth0` just fails silently -- so it's harmless
+# to every other test using this same rootfs; only the tap-networking test
+# actually attaches a device and looks for its marker.
 cat > "$ROOTFS_TREE/init" <<EOF
 #!/bin/sh
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 echo "$BOOT_MARKER"
+ip link show eth0 >/dev/null 2>&1 && echo "STEP0_HAS_ETH0"
 poweroff -f
 EOF
 chmod +x "$ROOTFS_TREE/init"

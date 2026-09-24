@@ -2,6 +2,20 @@ use std::process::ExitCode;
 
 use clap::{CommandFactory, Parser, Subcommand};
 
+/// The compiled `guest-init` binary (musl static, RESEARCH.md M2), embedded
+/// so `cirro` ships as one self-contained binary -- rootfs building (M4)
+/// writes these bytes out as a new guest's `/init` rather than needing a
+/// separately-installed copy lying around. `build.rs` builds guest-init as
+/// part of building `cirro` itself, so this path always exists by the time
+/// this file is compiled.
+///
+/// Unused outside tests until M4 has a rootfs builder to write it out.
+#[allow(dead_code)]
+pub(crate) static GUEST_INIT_BINARY: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../target/guest-init-embed/x86_64-unknown-linux-musl/release/guest-init"
+));
+
 /// Cirrocumulus: a Firecracker mini cloud in Rust.
 #[derive(Parser)]
 #[command(name = "cirro", version)]
@@ -77,4 +91,19 @@ fn main() -> ExitCode {
     }
     eprintln!("{}: not yet implemented", path.join(" "));
     ExitCode::FAILURE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GUEST_INIT_BINARY;
+
+    #[test]
+    fn embeds_a_real_guest_init_elf_binary() {
+        assert!(
+            GUEST_INIT_BINARY.len() > 100_000,
+            "suspiciously small for a static Rust binary: {} bytes",
+            GUEST_INIT_BINARY.len()
+        );
+        assert_eq!(&GUEST_INIT_BINARY[..4], b"\x7fELF", "not an ELF binary");
+    }
 }

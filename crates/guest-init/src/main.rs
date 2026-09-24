@@ -3,11 +3,13 @@
 //! Slice 1: mount the pseudo-filesystems and print a boot marker. Slice 2:
 //! read the configured app from a fixed path, fork, and exec it in the
 //! child. Slice 3: power off cleanly once that app exits. Slice 4: reap
-//! every child, not just the tracked app. Slice 5 (current): translate a
+//! every child, not just the tracked app. Slice 5: translate a
 //! host-triggered shutdown (Firecracker's `SendCtrlAltDel` action) into a
 //! real `SIGTERM` for the app, instead of the kernel's default hard reset
 //! wiping out the guest before any userspace code -- including the app --
-//! gets to react. vsock config is still a later slice.
+//! gets to react. Slice 6 (current): read the config over vsock instead
+//! of a fixed rootfs path, so the host can supply it at boot rather than
+//! baking it into the image.
 
 mod config;
 
@@ -16,10 +18,12 @@ use nix::errno::Errno;
 use nix::mount::{mount, MsFlags};
 use nix::sys::reboot::{reboot, set_cad_enabled, RebootMode};
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
+use nix::sys::socket::{accept, bind, listen, socket, AddressFamily, Backlog, SockFlag, SockType, VsockAddr};
 use nix::sys::wait::waitpid;
 use nix::unistd::{execv, fork, ForkResult, Pid};
 use std::ffi::CString;
 use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -34,10 +38,11 @@ extern "C" fn handle_sigint(_signal: nix::libc::c_int) {
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
 }
 
-/// Fixed path guest-init reads its config from. Stands in for the vsock
-/// config channel (RESEARCH.md M2) until that slice lands; same JSON shape
-/// either way, so `config::parse_config` doesn't change when the source does.
-const CONFIG_PATH: &str = "/etc/cirro-init.json";
+/// Guest-side vsock port guest-init listens on for its config, per
+/// RESEARCH.md M2 slice 6. Arbitrary but fixed, matching the host side
+/// (`scripts/step0/push_vsock_config.sh`); same JSON shape slices 2-5's
+/// fixed-path file used, so `config::parse_config` doesn't change.
+const VSOCK_CONFIG_PORT: u32 = 52;
 
 /// Printed to the console (ttyS0) once the pseudo-filesystems are mounted,
 /// so the boot harness can confirm guest-init reached this point as PID 1.
@@ -74,6 +79,50 @@ fn mount_pseudo_filesystems() {
         MsFlags::empty(),
         None::<&str>,
     );
+}
+
+/// Reads the app config over vsock, per RESEARCH.md M2 slice 6. Firecracker
+/// exposes vsock to the host as a Unix socket at a configured path; a host
+/// that connects there and sends `CONNECT <port>\n` gets that connection
+/// relayed straight into whatever this guest has accepted on that port,
+/// once it has one -- so this binds to `VMADDR_CID_ANY` (accept a
+/// connection addressed to any local CID, since the host doesn't need to
+/// know or care what CID the guest was assigned) rather than a specific
+/// CID.
+///
+/// Reads until EOF: the host closes its end once the whole config has been
+/// written, the same "read to completion" contract the fixed-path file
+/// read (slices 2-5) had.
+fn read_config_from_vsock() -> Config {
+    let listen_fd = socket(
+        AddressFamily::Vsock,
+        SockType::Stream,
+        SockFlag::empty(),
+        None,
+    )
+    .expect("create vsock socket");
+
+    let addr = VsockAddr::new(nix::libc::VMADDR_CID_ANY, VSOCK_CONFIG_PORT);
+    bind(listen_fd.as_raw_fd(), &addr).expect("bind vsock config port");
+    listen(&listen_fd, Backlog::MAXCONN).expect("listen on vsock config port");
+
+    let conn_fd = accept(listen_fd.as_raw_fd()).expect("accept vsock config connection");
+    // SAFETY: `accept` returns a valid, newly owned fd on success.
+    let conn_fd = unsafe { OwnedFd::from_raw_fd(conn_fd) };
+
+    let mut config_json = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match nix::unistd::read(&conn_fd, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => config_json.extend_from_slice(&buf[..n]),
+            Err(Errno::EINTR) => continue,
+            Err(e) => panic!("read vsock config: {e}"),
+        }
+    }
+
+    let config_json = String::from_utf8(config_json).expect("vsock config is valid UTF-8");
+    config::parse_config(&config_json).expect("parse config")
 }
 
 /// Forks and execs the configured app in the child, per RESEARCH.md M2.
@@ -211,9 +260,7 @@ fn main() {
     // allowed to exit at all.
     std::io::stdout().flush().expect("flush boot marker");
 
-    let config_json = std::fs::read_to_string(CONFIG_PATH)
-        .unwrap_or_else(|e| panic!("read config at {CONFIG_PATH}: {e}"));
-    let config = config::parse_config(&config_json).expect("parse config");
+    let config = read_config_from_vsock();
     let app_pid = spawn_configured_app(&config);
     reap_until_no_children(app_pid);
 

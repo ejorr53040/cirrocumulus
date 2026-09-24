@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # M2 slice 5 seam: a second guest-init rootfs, separate from
 # guest-init-rootfs.ext4, whose configured app (fixtures/long_running_app.rs)
-# never exits on its own. build_rootfs_guest_init.sh's shared image can't
-# double for this: every M2 slice 2-4 test relies on its /etc/cirro-init.json
-# pointing at child_app, which exits promptly, so a park-forever app needs
-# its own image with its own config instead of overloading that one.
+# never exits on its own -- every M2 slice 2-4 test needs child_app, which
+# exits promptly, so a park-forever app needs its own image with its own
+# app binary staged at a different path, rather than overloading that one.
+#
+# The config JSON itself (which binary to exec) travels over vsock at
+# boot (slice 6), not baked into this image -- see
+# build_rootfs_guest_init.sh's own note on why.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,7 +35,7 @@ chmod +x "$ROOTFS_TREE/init"
 cp "$APP_BIN" "$ROOTFS_TREE/app/long_running_app"
 chmod +x "$ROOTFS_TREE/app/long_running_app"
 
-cat > "$ROOTFS_TREE/etc/cirro-init.json" <<'EOF'
+cat > "$BUILD_DIR/cirro-init-cad.json" <<'EOF'
 {"exec": "/app/long_running_app", "args": []}
 EOF
 

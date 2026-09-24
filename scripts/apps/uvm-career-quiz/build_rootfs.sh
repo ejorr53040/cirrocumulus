@@ -79,7 +79,10 @@ cp "$HERE/run_server.py" "$ROOTFS_TREE/app/run_server.py"
 cp "$HERE/start.sh" "$ROOTFS_TREE/app/start.sh"
 chmod +x "$ROOTFS_TREE/app/start.sh"
 
-cat > "$ROOTFS_TREE/etc/cirro-init.json" <<'EOF'
+# Config (which binary to exec) travels over vsock port 52 at boot
+# (RESEARCH.md M2 slice 6), not baked into the image -- demo.sh pushes
+# this same JSON via push_vsock_config.sh after InstanceStart.
+cat > "$BUILD_DIR/cirro-init.json" <<'EOF'
 {"exec": "/app/start.sh", "args": []}
 EOF
 
