@@ -1,0 +1,20 @@
+[package]
+name = "cirrocumulus"
+description = "Cirrocumulus: a Firecracker mini cloud in Rust. Each workload runs in a jailed microVM, managed from the `cirro` CLI and terminal dashboard."
+keywords = ["firecracker", "microvm", "self-hosted", "cloud", "tui"]
+categories = ["command-line-utilities", "os::linux-apis", "network-programming"]
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "cirro"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+predicates.workspace = true

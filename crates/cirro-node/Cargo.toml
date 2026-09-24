@@ -1,5 +1,5 @@
 [package]
-name = "guest-init"
+name = "cirro-node"
 edition.workspace = true
 version.workspace = true
 license.workspace = true

@@ -5,3 +5,10 @@ members = ["crates/*"]
 [workspace.package]
 edition = "2024"
 version = "0.1.0"
+license = "Apache-2.0"
+repository = "https://github.com/ejorr53040/cirrocumulus"
+
+[workspace.dependencies]
+clap = { version = "4", features = ["derive"] }
+assert_cmd = "2"
+predicates = "3"
