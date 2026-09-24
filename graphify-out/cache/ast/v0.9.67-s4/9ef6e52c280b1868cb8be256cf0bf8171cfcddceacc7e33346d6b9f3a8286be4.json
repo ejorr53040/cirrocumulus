@@ -1,1 +1,0 @@
-{"nodes": [{"id": "pkg_cirro_server", "label": "cirro-server", "file_type": "code", "type": "package", "ecosystem": "cargo", "source_file": "crates/cirro-server/Cargo.toml", "source_location": "L1"}], "edges": []}
