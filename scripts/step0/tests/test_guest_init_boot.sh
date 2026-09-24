@@ -33,3 +33,15 @@ test_guest_init_boot_shuts_down_when_app_exits() {
 test_guest_init_boot_shuts_down_without_kernel_panic() {
     assert_output_contains "NO_KERNEL_PANIC: PASS" "$STEP0_ROOT/run_guest_init.sh"
 }
+
+# M2 slice 4: child_app (fixtures/child_app.rs) forks a grandchild
+# (fixtures/grandchild.rs) and exits without waiting on it, so the
+# still-running grandchild is reparented to guest-init (PID 1) -- the
+# orphan path a `waitpid` scoped to only the one tracked app pid never
+# reaps. If guest-init shuts the VM down the moment the tracked app exits
+# (slices 2-3's behavior), the reboot races the grandchild's own exit and
+# GRANDCHILD_RAN is typically never seen; guest-init must keep reaping
+# until no children remain before shutting down.
+test_guest_init_boot_reaps_orphaned_grandchild() {
+    assert_output_contains "GRANDCHILD_RAN" "$STEP0_ROOT/run_guest_init.sh"
+}

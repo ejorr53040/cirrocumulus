@@ -12,6 +12,9 @@
 # guest-init reads until vsock config exists, and a tiny static "app"
 # binary for it to fork+exec (fixtures/child_app.rs -- not part of the
 # cargo workspace, since it's a boot-test fixture, not shipped code).
+# Slice 4 adds a second fixture, fixtures/grandchild.rs, which child_app
+# spawns and never waits on, so guest-init's reap loop has an orphan to
+# actually reap.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,6 +25,8 @@ ROOTFS_IMG="$BUILD_DIR/guest-init-rootfs.ext4"
 TARGET="x86_64-unknown-linux-musl"
 CHILD_APP_SRC="$HERE/fixtures/child_app.rs"
 CHILD_APP_BIN="$BUILD_DIR/child_app"
+GRANDCHILD_SRC="$HERE/fixtures/grandchild.rs"
+GRANDCHILD_BIN="$BUILD_DIR/grandchild"
 
 cargo build --release --target "$TARGET" -p guest-init \
     --manifest-path "$REPO_ROOT/Cargo.toml"
@@ -29,6 +34,7 @@ cargo build --release --target "$TARGET" -p guest-init \
 GUEST_INIT_BIN="$REPO_ROOT/target/$TARGET/release/guest-init"
 
 rustc --target "$TARGET" -O -o "$CHILD_APP_BIN" "$CHILD_APP_SRC"
+rustc --target "$TARGET" -O -o "$GRANDCHILD_BIN" "$GRANDCHILD_SRC"
 
 rm -rf "$ROOTFS_TREE"
 mkdir -p "$ROOTFS_TREE"/{proc,sys,dev,etc,app}
@@ -38,6 +44,9 @@ chmod +x "$ROOTFS_TREE/init"
 
 cp "$CHILD_APP_BIN" "$ROOTFS_TREE/app/child_app"
 chmod +x "$ROOTFS_TREE/app/child_app"
+
+cp "$GRANDCHILD_BIN" "$ROOTFS_TREE/app/grandchild"
+chmod +x "$ROOTFS_TREE/app/grandchild"
 
 cat > "$ROOTFS_TREE/etc/cirro-init.json" <<'EOF'
 {"exec": "/app/child_app", "args": []}
