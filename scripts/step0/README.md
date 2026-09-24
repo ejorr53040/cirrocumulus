@@ -20,10 +20,11 @@ rather not leave it in place.
 ```sh
 ./fetch_kernel.sh    # downloads a CI-built vmlinux (once; skips if present)
 ./build_rootfs.sh     # builds a minimal busybox rootfs (rerun after editing it)
+./build_rootfs_guest_init.sh  # cross-compiles guest-init (M2) and rootfs's it
 ./tests/run.sh
 ```
 
-Three seams are tested, each through the real Firecracker API socket (no
+Four seams are tested, each through the real Firecracker API socket (no
 mocks):
 
 - `prereqs.sh` — KVM device, virtualization extension, cgroup version,
@@ -32,9 +33,15 @@ mocks):
   to userspace.
 - `run_jailer.sh` — the same boot, wrapped in `jailer`: chrooted, running as
   an unprivileged uid, still reaching userspace.
+- `run_guest_init.sh` — the same kernel, but `/init` is the real
+  `crates/guest-init` binary (M2), cross-compiled static for
+  `x86_64-unknown-linux-musl`, not busybox. Proves guest-init mounts
+  `/proc`/`/sys`/`/dev` and holds PID 1 open as a real microVM's init would;
+  exec/reap/shutdown/vsock land in later M2 slices with their own tests.
 
-Both boot scripts print the guest's serial console and exit 0 iff they see
-the guest's own `STEP0_BOOT_OK` marker before a 10s timeout.
+Boot scripts print the guest's serial console and exit 0 iff they see the
+expected marker before a 10s timeout (`STEP0_BOOT_OK` for the busybox
+scripts, `GUEST_INIT_MOUNTS_OK` for `run_guest_init.sh`).
 
 ## Cleanup
 
