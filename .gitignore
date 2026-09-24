@@ -41,6 +41,8 @@ jailer
 
 # --- Internal planning docs (not for distribution) ---
 BUILD_PATHWAY.md
+RESEARCH.md
+
 
 # --- Reference docs (local copies, not project deliverables) ---
 /docs/rust-book/
