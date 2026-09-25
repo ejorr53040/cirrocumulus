@@ -16,6 +16,7 @@ use rtnetlink::{Handle, LinkUnspec};
 use std::io;
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
+use std::process::Command;
 
 const IFNAMSIZ: usize = 16;
 const IFF_TAP: i16 = 0x0002;
@@ -76,6 +77,79 @@ pub fn create_persistent_tap(name: &str) -> io::Result<()> {
     // into memory we need to keep alive or sized correctly.
     unsafe { tunsetpersist(fd.as_raw_fd(), 1) }?;
 
+    Ok(())
+}
+
+/// Creates a persistent tap device owned by `uid`, via `sudo ip tuntap
+/// add ... user <uid>`, per RESEARCH.md M3's jailer+networking slice.
+///
+/// `create_persistent_tap` above needs `CAP_NET_ADMIN` in the *caller's*
+/// netns (fine under `unshare --net --user --map-root-user`, but that
+/// creates an isolated netns a `jailer`-spawned VM never sees, since
+/// `Jail::spawn` doesn't pass `--netns` and so shares whichever netns
+/// `sudo jailer` itself ran in -- the host's default one). This goes
+/// through a narrowly `sudo`-scoped `ip` invocation instead, so an
+/// unprivileged caller can create a tap directly in the host's default
+/// netns and hand it off, pre-owned, to the uid `jailer` drops the VM's
+/// Firecracker process to -- letting that already-privilege-dropped
+/// process open and attach the tap without needing `CAP_NET_ADMIN`
+/// itself.
+pub fn create_persistent_tap_owned_by(name: &str, uid: u32) -> io::Result<()> {
+    run_sudo_ip(&[
+        "tuntap",
+        "add",
+        "dev",
+        name,
+        "mode",
+        "tap",
+        "user",
+        &uid.to_string(),
+    ])
+}
+
+/// Deletes a tap device created by `create_persistent_tap_owned_by`, via
+/// the matching `sudo`-scoped `ip tuntap del`. Best-effort: callers
+/// should ignore the error on cleanup, same tolerance this project
+/// already gives stale `jailer` jail dirs (see `jailer.rs`) -- a leftover
+/// tap is harmless and the next run picks a fresh name. In particular,
+/// deleting while the VM that was attached to it is still running fails
+/// with `EBUSY` (the kernel won't drop a tap out from under an open fd) --
+/// expected and fine to ignore, not a sign anything upstream went wrong.
+pub fn delete_persistent_tap(name: &str) -> io::Result<()> {
+    run_sudo_ip(&["tuntap", "del", "dev", name, "mode", "tap"])
+}
+
+/// Same job as `configure_link` below (assign an address, bring the link
+/// up), but via the same narrowly `sudo`-scoped `ip` invocations as
+/// `create_persistent_tap_owned_by`, for the same reason: assigning an
+/// address (`RTM_NEWADDR`) and bringing a link up (`RTM_SETLINK`) need
+/// `CAP_NET_ADMIN` in the caller's netns regardless of who owns the
+/// underlying tap device, and an unprivileged caller sharing the host's
+/// default netns with a `jailer`-spawned VM doesn't have it.
+pub fn configure_link_via_sudo(name: &str, address: Ipv4Addr, prefix_len: u8) -> io::Result<()> {
+    run_sudo_ip(&["addr", "add", &format!("{address}/{prefix_len}"), "dev", name])?;
+    run_sudo_ip(&["link", "set", name, "up"])
+}
+
+/// Runs `sudo -n /usr/bin/ip <args>`, matching the `/etc/sudoers.d/cirro-tap`
+/// NOPASSWD scoping this project's networking tests document. Captures
+/// (rather than inherits) the child's stdout/stderr, folding stderr into
+/// the returned error on failure -- so a caller that only cares whether it
+/// worked (e.g. best-effort cleanup) doesn't leak raw `ip` CLI noise into
+/// its own output, while one that does care still gets the real reason.
+fn run_sudo_ip(args: &[&str]) -> io::Result<()> {
+    let output = Command::new("sudo")
+        .args(["-n", "/usr/bin/ip"])
+        .args(args)
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "sudo ip {} failed: {}: {}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
     Ok(())
 }
 

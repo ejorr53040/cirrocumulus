@@ -86,7 +86,7 @@ impl Client {
             .inner
             .request(request)
             .await
-            .map_err(|e| Error::Connect(e.to_string()))?;
+            .map_err(|e| Error::Connect(format!("{e:?}")))?;
 
         let status = response.status();
         if status.is_success() {
