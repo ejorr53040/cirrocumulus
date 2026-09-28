@@ -35,6 +35,47 @@ defaults:
     shell: bash
 
 jobs:
+  changes:
+    # Which gates this change needs (scripts/ci/changes.sh has the rules):
+    # a docs- or shell-only push skips the Rust and supply-chain jobs, and a
+    # Rust push only tests the crates it touched plus their dependents.
+    # Scheduled and manual runs, and pushes with no usable "before" commit,
+    # run everything.
+    name: Detect relevant changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.detect.outputs.rust }}
+      supply_chain: ${{ steps.detect.outputs.supply_chain }}
+      crates: ${{ steps.detect.outputs.crates }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: detect
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          case "$EVENT" in
+            pull_request)
+              # Three dots: diff against the merge base, so commits that
+              # landed on main after this branch forked don't count.
+              args=("$PR_BASE...$PR_HEAD") ;;
+            push)
+              if [ -n "$PUSH_BEFORE" ] && git cat-file -e "$PUSH_BEFORE^{commit}" 2> /dev/null; then
+                args=("$PUSH_BEFORE..$GITHUB_SHA")
+              else
+                args=(--all) # new branch / force push: nothing reliable to diff against
+              fi ;;
+            *)
+              args=(--all) ;;
+          esac
+          scripts/ci/changes.sh "${args[@]}" | tee -a "$GITHUB_OUTPUT"
+
   git:
     name: Git history & repo hygiene
     runs-on: ubuntu-24.04
@@ -105,7 +146,9 @@ jobs:
       - name: shellcheck
         run: scripts/ci/check-shell.sh
       - name: CI script tests
-        run: scripts/ci/tests/check-commits.test.sh
+        run: |
+          scripts/ci/tests/check-commits.test.sh
+          scripts/ci/tests/changes.test.sh
       - name: typos
         run: typos
       - name: actionlint
@@ -113,6 +156,8 @@ jobs:
 
   rust:
     name: Rust (fmt, clippy, docs, tests)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -130,11 +175,17 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --no-deps --all-features --locked
-      - name: tests
-        run: scripts/ci/test.sh
+      - name: tests (changed crates and their dependents)
+        env:
+          CRATES: ${{ needs.changes.outputs.crates }}
+        run: |
+          read -ra crates <<< "$CRATES"
+          scripts/ci/test.sh "${crates[@]}"
 
   supply-chain:
     name: Supply chain (cargo-deny, unused deps)
+    needs: changes
+    if: needs.changes.outputs.supply_chain == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -153,7 +204,8 @@ jobs:
     # Keeps history bisectable: each commit in a PR must pass clippy on its
     # own, not just the tip. The `rust` job already covers the tip itself.
     name: Every commit builds
-    if: github.event_name == 'pull_request'
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -187,10 +239,12 @@ jobs:
 
   ci-ok:
     # The one check to require in branch protection. Fails if any gate
-    # failed or was cancelled; `every-commit-builds` is skipped on pushes.
+    # failed or was cancelled; `every-commit-builds` is skipped on pushes,
+    # and gates `changes` found irrelevant are skipped too. If `changes`
+    # itself fails, its dependents skip but its own failure still fails this.
     name: CI OK
     if: always()
-    needs: [git, lint, rust, supply-chain, every-commit-builds]
+    needs: [changes, git, lint, rust, supply-chain, every-commit-builds]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
