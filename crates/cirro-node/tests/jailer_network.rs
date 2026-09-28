@@ -175,8 +175,7 @@ async fn jailed_boot_attaches_tap_and_guest_sees_eth0() {
     );
 
     let console_log_path = build_dir.join("cirro-node-jailer-network-test-console.log");
-    let console_log =
-        std::fs::File::create(&console_log_path).expect("create console log file");
+    let console_log = std::fs::File::create(&console_log_path).expect("create console log file");
 
     let chroot_base_dir =
         PathBuf::from(std::env::var("HOME").expect("HOME set")).join(".cirrocumulus-step0-jail");
@@ -358,7 +357,7 @@ async fn jailed_boot_with_nat_reaches_the_internet() {
     }
 
     let host_ip: std::net::Ipv4Addr = "172.16.61.1".parse().unwrap();
-    configure_link_via_sudo(&tap_name, host_ip, 30).expect("configure host side of the tap device");
+    configure_link_via_sudo(tap_name, host_ip, 30).expect("configure host side of the tap device");
 
     if let Err(e) = enable_nat(host_ip, 30, &egress_iface) {
         eprintln!(
@@ -435,7 +434,7 @@ async fn jailed_boot_with_nat_reaches_the_internet() {
 
     let client = Client::new(&api_socket);
     client
-        .attach_tap("eth0", &tap_name)
+        .attach_tap("eth0", tap_name)
         .await
         .expect("attach tap device");
     client

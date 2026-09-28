@@ -20,5 +20,5 @@
 /bin/busybox ip addr add 172.16.0.2/30 dev eth0
 /bin/busybox ip link set eth0 up
 
-cd /app
+cd /app || exit 1
 exec /usr/bin/python3 run_server.py

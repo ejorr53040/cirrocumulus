@@ -90,8 +90,7 @@ async fn boots_the_step0_plain_rootfs_inside_a_jail() {
     );
 
     let console_log_path = build_dir.join("cirro-node-jailer-test-console.log");
-    let console_log =
-        std::fs::File::create(&console_log_path).expect("create console log file");
+    let console_log = std::fs::File::create(&console_log_path).expect("create console log file");
 
     // Same short, non-`nodev` chroot base Step 0's own jailer proof uses
     // (see run_jailer.sh) -- the API socket path inside it has to fit in a
@@ -114,7 +113,9 @@ async fn boots_the_step0_plain_rootfs_inside_a_jail() {
 
     // Resources referenced over the API must already be inside the jail
     // root, per docs/jailer.md -- same as run_jailer.sh's own `cp` calls.
-    let kernel_in_jail = jail.root().join(kernel.file_name().expect("kernel has a filename"));
+    let kernel_in_jail = jail
+        .root()
+        .join(kernel.file_name().expect("kernel has a filename"));
     std::fs::copy(&kernel, &kernel_in_jail).expect("copy kernel into jail root");
     std::fs::copy(&rootfs, jail.root().join("rootfs.ext4")).expect("copy rootfs into jail root");
 
@@ -133,7 +134,8 @@ async fn boots_the_step0_plain_rootfs_inside_a_jail() {
         .expect("stat API socket")
         .uid();
     assert_ne!(
-        socket_uid, 0,
+        socket_uid,
+        0,
         "firecracker API socket at {} is owned by root -- jailer didn't drop privileges",
         api_socket.display()
     );

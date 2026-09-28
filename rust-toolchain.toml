@@ -1,0 +1,9 @@
+# Pins the compiler so local builds and CI run the same rustc, rustfmt and
+# clippy -- a new stable release adding a clippy lint can't break `main`
+# overnight. Bump deliberately (and fix whatever new lints fire) in one commit.
+[toolchain]
+channel = "1.98"
+components = ["rustfmt", "clippy"]
+# crates/cirro/build.rs builds guest-init as a static musl binary to embed.
+targets = ["x86_64-unknown-linux-musl"]
+profile = "minimal"

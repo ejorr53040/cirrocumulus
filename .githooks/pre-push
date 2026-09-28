@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Run the commit-history check on what's being pushed, then the fast CI
+# gates, before a push leaves this machine. Installed by
+# scripts/ci/install-hooks.sh. Bypass in an emergency with --no-verify;
+# CI still catches it.
+set -euo pipefail
+root=$(git rev-parse --show-toplevel)
+remote=$1
+zero=0000000000000000000000000000000000000000
+
+# stdin: <local ref> <local sha> <remote ref> <remote sha>, one line per ref
+while read -r _ local_sha remote_ref remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue # deleting a ref
+    if [ "$remote_sha" = "$zero" ]; then
+        # New branch: check only what isn't already on the remote's main.
+        base=$(git merge-base "$local_sha" "refs/remotes/$remote/main" 2> /dev/null || true)
+        [ -n "$base" ] || continue
+    else
+        base=$remote_sha
+    fi
+    echo "pre-push: checking commits for $remote_ref"
+    "$root/scripts/ci/check-commits.sh" "$base..$local_sha"
+done
+
+"$root/scripts/ci/local.sh" --quick

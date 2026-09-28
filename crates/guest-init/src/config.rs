@@ -6,13 +6,13 @@
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
-pub struct Config {
-    pub exec: String,
+pub(crate) struct Config {
+    pub(crate) exec: String,
     #[serde(default)]
-    pub args: Vec<String>,
+    pub(crate) args: Vec<String>,
 }
 
-pub fn parse_config(json: &str) -> Result<Config, serde_json::Error> {
+pub(crate) fn parse_config(json: &str) -> Result<Config, serde_json::Error> {
     serde_json::from_str(json)
 }
 

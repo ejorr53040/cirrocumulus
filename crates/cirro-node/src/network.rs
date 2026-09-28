@@ -42,7 +42,9 @@ const _: () = assert!(std::mem::size_of::<IfReq>() == 40);
 // `_IOW('T', 202, int)` / `_IOW('T', 237, int)` in `linux/if_tun.h`) don't
 // match what's actually passed (a `struct ifreq*` for the first; a plain
 // `int` is right for the second, so `ioctl_write_int_bad!` fits it exactly).
-nix::ioctl_write_ptr_bad!(tunsetiff, 0x4004_54ca, IfReq);
+// TUNSETIFF is `readwrite`, not `write_ptr`: the kernel writes the final
+// interface name back into `ifr_name`, so it needs a `*mut`, not a `*const`.
+nix::ioctl_readwrite_bad!(tunsetiff, 0x4004_54ca, IfReq);
 nix::ioctl_write_int_bad!(tunsetpersist, 0x4004_54cb);
 
 /// Creates a persistent tap device with the given name. Persistent means
@@ -127,7 +129,13 @@ pub fn delete_persistent_tap(name: &str) -> io::Result<()> {
 /// underlying tap device, and an unprivileged caller sharing the host's
 /// default netns with a `jailer`-spawned VM doesn't have it.
 pub fn configure_link_via_sudo(name: &str, address: Ipv4Addr, prefix_len: u8) -> io::Result<()> {
-    run_sudo_ip(&["addr", "add", &format!("{address}/{prefix_len}"), "dev", name])?;
+    run_sudo_ip(&[
+        "addr",
+        "add",
+        &format!("{address}/{prefix_len}"),
+        "dev",
+        name,
+    ])?;
     run_sudo_ip(&["link", "set", name, "up"])
 }
 
@@ -226,11 +234,27 @@ pub fn enable_nat(subnet: Ipv4Addr, prefix_len: u8, egress_iface: &str) -> io::R
         "}",
     ])?;
     run_sudo(&[
-        "/usr/bin/nft", "add", "rule", "ip", "cirro-nat", "forward", "ip", "saddr", &cidr,
+        "/usr/bin/nft",
+        "add",
+        "rule",
+        "ip",
+        "cirro-nat",
+        "forward",
+        "ip",
+        "saddr",
+        &cidr,
         "accept",
     ])?;
     run_sudo(&[
-        "/usr/bin/nft", "add", "rule", "ip", "cirro-nat", "forward", "ip", "daddr", &cidr,
+        "/usr/bin/nft",
+        "add",
+        "rule",
+        "ip",
+        "cirro-nat",
+        "forward",
+        "ip",
+        "daddr",
+        &cidr,
         "accept",
     ])
 }
@@ -271,7 +295,11 @@ pub fn disable_nat() -> io::Result<()> {
 /// returned error on failure, same as `run_sudo_ip` below.
 fn run_sudo(argv: &[&str]) -> io::Result<()> {
     let (bin, args) = argv.split_first().expect("argv must be non-empty");
-    let output = Command::new("sudo").arg("-n").arg(bin).args(args).output()?;
+    let output = Command::new("sudo")
+        .arg("-n")
+        .arg(bin)
+        .args(args)
+        .output()?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "sudo {} failed: {}: {}",
