@@ -1,0 +1,3 @@
+# Every guest uses the same Guest address; the VM's namespace NATs it to a unique VM address
+
+Inside each VM's network namespace (ADR 0001) the guest always has the same Guest address, and the namespace does 1:1 NAT between it and that VM's unique VM address from the Node subnet. We chose this, Firecracker's "network for clones" pattern, over configuring each guest with its real unique address, because a snapshot captures the guest's network configuration: with a fixed Guest address a parked App can wake into a new VM with a different VM address — or on another Node later — without the guest re-addressing itself.
