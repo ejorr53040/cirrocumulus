@@ -52,6 +52,9 @@ JAIL_ROOT="$CHROOT_BASE/$(basename "$FC_BIN")/$JAIL_ID/root"
 rm -f "$CONSOLE_LOG"
 mkdir -p "$CHROOT_BASE"
 
+# The redirect runs as us, not root, on purpose: the console log stays
+# user-owned so the test harness and cleanup can read and delete it.
+# shellcheck disable=SC2024
 sudo "$JAILER_BIN" \
     --id "$JAIL_ID" \
     --exec-file "$FC_BIN" \

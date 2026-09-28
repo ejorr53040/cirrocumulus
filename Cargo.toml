@@ -23,3 +23,17 @@ serde_json = "1"
 nix = "0.31.3"
 rtnetlink = "0.23"
 futures-util = "0.3"
+
+# Lints every crate opts into with `[lints] workspace = true`. CI runs
+# clippy with `-D warnings`, so "warn" here still fails the build.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+# Every `unsafe` block needs a `// SAFETY:` comment saying why it's sound.
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"

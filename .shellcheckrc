@@ -1,0 +1,19 @@
+# ShellCheck config for scripts/ci/check-shell.sh (run at --severity=style,
+# i.e. every check on). Each disable below is repo-wide and justified;
+# anything else gets an inline `# shellcheck disable=` with a reason.
+
+# Resolve `source` / `# shellcheck source=` paths relative to the script.
+source-path=SCRIPTDIR
+
+# SC2012 (use find, not ls): `ls .build/vmlinux-* | tail -1` picks the
+# newest kernel this repo's own fetch_kernel.sh downloaded; the names are
+# ours and never contain whitespace or newlines.
+disable=SC2012
+
+# SC2329 (function never invoked): false positive on `cleanup` functions
+# that are only ever called via `trap cleanup EXIT`.
+disable=SC2329
+
+# SC2001 (use ${var//} instead of sed): `sed 's/^/    /'` to indent
+# multi-line output is clearer than the parameter-expansion equivalent.
+disable=SC2001

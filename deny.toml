@@ -1,0 +1,49 @@
+# cargo-deny: supply-chain gate run in CI (`cargo deny --locked check`).
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Cirrocumulus only ships on Linux (Firecracker + KVM); don't let
+# Windows/macOS-only transitive deps drive license or advisory failures.
+targets = ["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
+all-features = true
+
+[advisories]
+# Any RustSec advisory (vulnerable, unmaintained, unsound, yanked) fails CI.
+# To accept one deliberately, add it here with a reason:
+#   ignore = [{ id = "RUSTSEC-YYYY-NNNN", reason = "..." }]
+yanked = "deny"
+unmaintained = "all"
+unsound = "all"
+ignore = []
+
+[licenses]
+# Every license must be on this list and compatible with Apache-2.0
+# (this repo's own license). Additions need a reason in the commit message.
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.93
+unused-allowed-license = "allow"
+
+[licenses.private]
+# Workspace crates aren't published; they're covered by the root LICENSE.
+ignore = true
+
+[bans]
+# Duplicate versions come from upstream (e.g. rtnetlink pinning an older
+# nix); warn so they're visible in CI logs without blocking on others' releases.
+multiple-versions = "warn"
+# No `version = "*"` deps; path deps between workspace crates are fine.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+# Only crates.io. A git or alternate-registry dep has to be added here on purpose.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

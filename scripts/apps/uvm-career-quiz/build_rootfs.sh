@@ -24,7 +24,7 @@ ROOTFS_IMG="$BUILD_DIR/uvm-career-quiz.ext4"
 APP_SRC="$BUILD_DIR/app-src"
 TARGET="x86_64-unknown-linux-musl"
 
-ALPINE_VERSION="3.20.3"
+# Alpine 3.20.3 (the point release APK_TOOLS_STATIC_PKG below comes from).
 ALPINE_BRANCH="v3.20"
 APK_TOOLS_STATIC_PKG="apk-tools-static-2.14.4-r1.apk"
 
