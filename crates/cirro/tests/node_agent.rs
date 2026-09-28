@@ -158,12 +158,15 @@ fn make_image(tree: &Path, image: &Path) -> PathBuf {
     image.to_path_buf()
 }
 
-/// A throwaway Node agent on Node subnet `10.77.<octet>.0/24`. Dropping it
-/// stops the agent and removes its state dir, so a failed assertion doesn't
-/// strand anything.
+/// A throwaway Node agent on Node subnet `10.77.<octet>.0/24`. It can be
+/// stopped and restarted on the same state dir, like the real one. Dropping
+/// it ends every VM the test left running, stops the agent and removes its
+/// state dir, so a failed assertion doesn't strand anything.
 struct Agent {
-    sudo: Child,
+    /// The `sudo` running the agent; `None` while the agent is stopped.
+    sudo: Option<Child>,
     octet: u8,
+    socket_group: String,
     state_dir: PathBuf,
     socket: PathBuf,
 }
@@ -180,14 +183,14 @@ impl Agent {
             eprintln!("skipping: /dev/kvm not present");
             return None;
         }
-        let Some(agent_bin) = test_agent() else {
+        if test_agent().is_none() {
             eprintln!(
                 "skipping: `sudo -n {} --version` failed -- add the NOPASSWD sudoers rule \
                  in this test's module doc first",
                 test_agent_path().display()
             );
             return None;
-        };
+        }
 
         // Under $HOME, not /tmp: jailer mknods /dev/kvm in the jail, and /tmp
         // is usually a nodev tmpfs. Kept short so jail socket paths fit in a
@@ -195,40 +198,86 @@ impl Agent {
         let state_dir = home().join(format!(".cache/cirro-t{}-{octet}", std::process::id()));
         std::fs::create_dir_all(&state_dir).expect("create state dir");
         let socket = state_dir.join("agent.sock");
+        let mut agent = Agent {
+            sudo: None,
+            octet,
+            socket_group: socket_group.to_string(),
+            state_dir,
+            socket,
+        };
+        agent.spawn().expect("start the Node agent");
+        Some(agent)
+    }
+
+    /// Starts the agent process on this agent's state dir and waits for its
+    /// socket, which the agent only opens once it is ready for requests.
+    fn spawn(&mut self) -> Result<(), String> {
+        // A crashed agent leaves its socket file behind, and it would look
+        // like the new agent's.
+        let _ = std::fs::remove_file(&self.socket);
+        let sudo = self
+            .agent_command(self.octet)
+            .spawn()
+            .map_err(|e| format!("spawn sudo: {e}"))?;
+        self.sudo = Some(sudo);
+        let deadline = Instant::now() + TIMEOUT;
+        while !self.socket.exists() {
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "the Node agent never created its socket at {}",
+                    self.socket.display()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Ok(())
+    }
+
+    /// The command that starts an agent on this state dir, for Node subnet
+    /// `10.77.<octet>.0/24`.
+    fn agent_command(&self, octet: u8) -> std::process::Command {
+        let agent_bin = test_agent().expect("the harness checked for the test agent at start");
         let repo = repo_root();
-        let sudo = std::process::Command::new("sudo")
-            .arg("-n")
+        let mut cmd = std::process::Command::new("sudo");
+        cmd.arg("-n")
             .arg(agent_bin)
             .args(["node", "agent", "--state-dir"])
-            .arg(&state_dir)
+            .arg(&self.state_dir)
             .arg("--socket")
-            .arg(&socket)
-            .args(["--socket-group", socket_group])
+            .arg(&self.socket)
+            .args(["--socket-group", &self.socket_group])
             .args(["--subnet", &format!("10.77.{octet}.0/24")])
             .arg("--firecracker")
             .arg(repo.join("firecracker"))
             .arg("--jailer")
             .arg(repo.join("jailer"))
             .arg("--kernel")
-            .arg(latest_kernel())
-            .spawn()
-            .expect("start the Node agent");
-        let agent = Agent {
-            sudo,
-            octet,
-            state_dir,
-            socket,
-        };
-        let deadline = Instant::now() + TIMEOUT;
-        while !agent.socket.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "the Node agent never created its socket at {}",
-                agent.socket.display()
-            );
-            std::thread::sleep(Duration::from_millis(50));
+            .arg(latest_kernel());
+        cmd
+    }
+
+    /// Stops the agent the way systemd does (SIGTERM, which `sudo` relays)
+    /// and waits for it to exit. VMs are not the agent's to stop.
+    fn stop_agent(&mut self) {
+        if let Some(mut sudo) = self.sudo.take() {
+            let _ = kill(Pid::from_raw(sudo.id() as i32), Signal::SIGTERM);
+            let _ = sudo.wait();
         }
-        Some(agent)
+    }
+
+    /// Kills the agent the way a crash does: SIGUSR1, which `sudo` relays and
+    /// the agent doesn't handle, ends it at once without its shutdown path.
+    fn crash_agent(&mut self) {
+        if let Some(mut sudo) = self.sudo.take() {
+            let _ = kill(Pid::from_raw(sudo.id() as i32), Signal::SIGUSR1);
+            let _ = sudo.wait();
+        }
+    }
+
+    /// Stops the agent if it is running, then starts it on the same state dir.
+    fn restart(&mut self) {
+        self.stop_agent();
+        self.spawn().expect("restart the Node agent");
     }
 
     fn cirro(&self) -> Command {
@@ -294,9 +343,26 @@ impl Agent {
 
 impl Drop for Agent {
     fn drop(&mut self) {
-        // sudo relays SIGTERM to the agent it started.
-        let _ = kill(Pid::from_raw(self.sudo.id() as i32), Signal::SIGTERM);
-        let _ = self.sudo.wait();
+        // VMs outlive the agent, so a test that failed part-way has to have
+        // its VMs ended, and their records and logs removed, through an agent.
+        if self.sudo.is_none() {
+            let _ = self.spawn();
+        }
+        if self.sudo.is_some() {
+            let listing = self.cirro().args(["ps", "-a"]).output();
+            let listing = listing.map_or(String::new(), |o| {
+                String::from_utf8_lossy(&o.stdout).into_owned()
+            });
+            for name in listing
+                .lines()
+                .skip(1)
+                .filter_map(|l| l.split_whitespace().next())
+            {
+                let _ = self.cirro().args(["stop", "--force", name]).output();
+                let _ = self.cirro().args(["rm", name]).output();
+            }
+        }
+        self.stop_agent();
         let _ = std::fs::remove_dir_all(&self.state_dir);
     }
 }
@@ -391,6 +457,355 @@ fn run_serves_http_at_the_vm_address_and_stop_force_leaves_nothing() {
         row(&ps, "web").is_none(),
         "web is still listed after stop --force:\n{ps}"
     );
+    agent.assert_no_cirro_state();
+}
+
+#[test]
+fn a_vm_outlives_a_restarted_agent_and_is_still_the_agents_to_stop() {
+    let Some(mut agent) = Agent::start(244) else {
+        return;
+    };
+    let address = stdout(
+        agent
+            .run("web", &rootfs().guest_init, &["/app/http_app"])
+            .success(),
+    )
+    .trim()
+    .to_string();
+    wait_for_http(&address, HTTP_PORT);
+
+    agent.restart();
+
+    let ps = agent.ps(false);
+    let web = row(&ps, "web")
+        .unwrap_or_else(|| panic!("web isn't listed after the agent restarted:\n{ps}"));
+    assert!(
+        web.contains(&address),
+        "the VM address changed across the restart: {web}"
+    );
+    let response = wait_for_http(&address, HTTP_PORT);
+    assert!(
+        response.contains("hello from cirro"),
+        "the VM stopped answering after the agent restarted: {response:?}"
+    );
+    wait_for_log(&agent, "web", "HTTP_FIXTURE_LISTENING");
+
+    // The re-adopted VM is stopped like any other, through its API socket.
+    agent.cirro().args(["stop", "web"]).assert().success();
+    let ps = agent.ps(true);
+    let ended = row(&ps, "web").unwrap_or_else(|| panic!("ps -a doesn't list web:\n{ps}"));
+    assert!(ended.contains("graceful"), "end reason missing: {ended}");
+    agent.assert_no_cirro_state();
+}
+
+/// Waits until nothing runs in the cgroup of the VM at `10.77.<octet>.<host>`,
+/// which is when its VMM has exited. The cgroup itself stays until an agent
+/// removes it.
+fn wait_for_vmm_exit(octet: u8, host: u8) {
+    let procs = format!("/sys/fs/cgroup/cirro/cirro-{octet:02x}{host:02x}/cgroup.procs");
+    let deadline = Instant::now() + TIMEOUT;
+    while !std::fs::read_to_string(&procs).is_ok_and(|p| p.trim().is_empty()) {
+        assert!(Instant::now() < deadline, "the VMM in {procs} never exited");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn a_vm_that_died_while_the_agent_was_down_is_ended_and_its_host_state_removed() {
+    let Some(mut agent) = Agent::start(243) else {
+        return;
+    };
+    agent
+        .run("brief", &rootfs().guest_init, &["/app/exit_later"])
+        .success();
+    wait_for_log(&agent, "brief", "EXIT_LATER_STARTED");
+
+    // Nobody is watching when the VM's command exits and its VMM with it.
+    agent.stop_agent();
+    wait_for_vmm_exit(243, 2);
+    agent.restart();
+
+    assert!(
+        row(&agent.ps(false), "brief").is_none(),
+        "a VM that died isn't running"
+    );
+    let ps = agent.ps(true);
+    let brief = row(&ps, "brief").unwrap_or_else(|| panic!("ps -a lacks brief:\n{ps}"));
+    assert!(
+        brief.contains("died while the agent was down"),
+        "wrong end reason: {brief}"
+    );
+    wait_for_log(&agent, "brief", "EXIT_LATER_DONE");
+    agent.assert_no_cirro_state();
+}
+
+#[test]
+fn an_agent_refuses_a_state_dir_that_belongs_to_another_node_subnet() {
+    let Some(mut agent) = Agent::start(238) else {
+        return;
+    };
+    agent
+        .run("web", &rootfs().guest_init, &["/app/http_app"])
+        .success();
+    agent.stop_agent();
+
+    let output = run_until_it_exits(agent.agent_command(237))
+        .expect("an agent with the wrong subnet should refuse to start, not run");
+    assert!(!output.status.success(), "it should fail: {output:?}");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("10.77.238.0/24") && err.contains("10.77.237.0/24"),
+        "the refusal should name both subnets, got: {err}"
+    );
+
+    // The refusal changed nothing: the right subnet still gets its VM back.
+    agent.restart();
+    let ps = agent.ps(false);
+    assert!(row(&ps, "web").is_some(), "web was lost:\n{ps}");
+    agent
+        .cirro()
+        .args(["stop", "--force", "web"])
+        .assert()
+        .success();
+    agent.assert_no_cirro_state();
+}
+
+#[test]
+fn an_agent_refuses_to_start_on_a_running_record_it_cannot_make_sense_of() {
+    let Some(mut agent) = Agent::start(236) else {
+        return;
+    };
+    agent
+        .run("web", &rootfs().guest_init, &["/app/http_app"])
+        .success();
+    agent.stop_agent();
+
+    // Damage the record of the running VM: the state dir is ours, so a
+    // replacement database can be moved over the agent's.
+    let db = agent.state_dir.join("state.db");
+    let original = agent.state_dir.join("state.db.original");
+    std::fs::copy(&db, &original).expect("keep the real database");
+    let damaged = agent.state_dir.join("state.db.damaged");
+    std::fs::copy(&db, &damaged).expect("copy the database");
+    rusqlite::Connection::open(&damaged)
+        .and_then(|conn| conn.execute("UPDATE vms SET pid = NULL, pid_start = NULL", []))
+        .expect("damage the record");
+    std::fs::rename(&damaged, &db).expect("install the damaged database");
+
+    let output = run_until_it_exits(agent.agent_command(236))
+        .expect("an agent that can't trust a record should refuse to start, not guess");
+    assert!(!output.status.success(), "it should fail: {output:?}");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("web"),
+        "the refusal should name the VM, got: {err}"
+    );
+
+    // Refusing left the VM alone, so with the record intact it is taken back.
+    std::fs::rename(&original, &db).expect("restore the real database");
+    agent.restart();
+    let ps = agent.ps(false);
+    assert!(row(&ps, "web").is_some(), "web was lost:\n{ps}");
+    agent
+        .cirro()
+        .args(["stop", "--force", "web"])
+        .assert()
+        .success();
+    agent.assert_no_cirro_state();
+}
+
+#[test]
+fn a_vm_taken_back_after_a_restart_can_be_force_stopped() {
+    let Some(mut agent) = Agent::start(239) else {
+        return;
+    };
+    // Ignores SIGTERM, so only a kill of the VMM itself can end it.
+    agent
+        .run("stubborn", &rootfs().guest_init, &["/app/ignore_term"])
+        .success();
+    agent.restart();
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "stubborn"])
+        .assert()
+        .success();
+    let ps = agent.ps(true);
+    let ended = row(&ps, "stubborn").unwrap_or_else(|| panic!("ps -a lacks stubborn:\n{ps}"));
+    assert!(ended.contains("forced"), "end reason missing: {ended}");
+    agent.assert_no_cirro_state();
+}
+
+#[test]
+fn an_ended_vm_its_logs_and_its_removal_survive_agent_restarts() {
+    let Some(mut agent) = Agent::start(242) else {
+        return;
+    };
+    agent
+        .run("web", &rootfs().guest_init, &["/app/http_app"])
+        .success();
+    wait_for_log(&agent, "web", "HTTP_FIXTURE_LISTENING");
+    agent.cirro().args(["stop", "web"]).assert().success();
+
+    agent.restart();
+
+    assert!(
+        row(&agent.ps(false), "web").is_none(),
+        "an Ended VM isn't running"
+    );
+    let ps = agent.ps(true);
+    let ended = row(&ps, "web").unwrap_or_else(|| panic!("ps -a lost web:\n{ps}"));
+    assert!(
+        ended.contains("graceful"),
+        "the end reason changed across the restart: {ended}"
+    );
+    wait_for_log(&agent, "web", "HTTP_FIXTURE_LISTENING");
+
+    agent.cirro().args(["rm", "web"]).assert().success();
+    agent.restart();
+    assert!(
+        row(&agent.ps(true), "web").is_none(),
+        "a removed VM came back after the restart"
+    );
+    agent.cirro().args(["logs", "web"]).assert().failure();
+    agent.assert_no_cirro_state();
+}
+
+#[test]
+fn a_failed_reuse_of_a_name_after_a_restart_leaves_the_ended_vms_log() {
+    let Some(mut agent) = Agent::start(241) else {
+        return;
+    };
+    agent
+        .run("web", &rootfs().guest_init, &["/app/http_app"])
+        .success();
+    wait_for_log(&agent, "web", "HTTP_FIXTURE_LISTENING");
+    agent.cirro().args(["stop", "web"]).assert().success();
+    agent.restart();
+
+    // A directory exists, so the CLI passes it on, but the agent can't copy it.
+    agent
+        .run("web", Path::new("/tmp"), &["/app/http_app"])
+        .failure();
+
+    let ps = agent.ps(true);
+    let ended = row(&ps, "web").unwrap_or_else(|| panic!("the failed reuse lost web:\n{ps}"));
+    assert!(ended.contains("graceful"), "web changed: {ended}");
+    wait_for_log(&agent, "web", "HTTP_FIXTURE_LISTENING");
+    agent.assert_no_cirro_state();
+}
+
+/// Runs an agent that is expected to refuse to start, and returns how it
+/// ended: `None` if it was still running after `TIMEOUT`, when it is stopped.
+fn run_until_it_exits(mut agent: std::process::Command) -> Option<std::process::Output> {
+    let mut child = agent
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the agent");
+    let deadline = Instant::now() + TIMEOUT;
+    while child.try_wait().expect("poll the agent").is_none() {
+        if Instant::now() >= deadline {
+            // sudo relays SIGTERM to the agent it started.
+            let _ = kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM);
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Some(
+        child
+            .wait_with_output()
+            .expect("collect the agent's output"),
+    )
+}
+
+/// Whatever host state the VM at `10.77.<octet>.<host>` has on the Node.
+fn host_state_of(octet: u8, host: u8) -> Vec<String> {
+    let id = format!("cirro-{octet:02x}{host:02x}");
+    let exists = |path: String| Path::new(&path).exists();
+    let mut found = Vec::new();
+    for path in [
+        format!("/run/netns/{id}"),
+        format!("/sys/class/net/{id}"),
+        format!("/sys/fs/cgroup/cirro/{id}"),
+    ] {
+        if exists(path.clone()) {
+            found.push(path);
+        }
+    }
+    found
+}
+
+#[test]
+fn a_crashed_agent_leaves_vms_running_and_a_restart_removes_what_a_start_left_behind() {
+    let Some(mut agent) = Agent::start(240) else {
+        return;
+    };
+    let address = stdout(
+        agent
+            .run("web", &rootfs().guest_init, &["/app/http_app"])
+            .success(),
+    )
+    .trim()
+    .to_string();
+    wait_for_http(&address, HTTP_PORT);
+
+    // A second `run` that never finishes starting: its guest never takes its
+    // config. Wait until its Firecracker is up, so the crash leaves a running
+    // process and host state that no record names.
+    let mut stuck = agent.cirro();
+    stuck.args(["run", "--name", "stuck"]);
+    stuck.arg(&rootfs().no_init).args(["--", "/app/http_app"]);
+    let stuck = std::thread::spawn(move || stuck.output());
+    let procs = "/sys/fs/cgroup/cirro/cirro-f003/cgroup.procs";
+    let deadline = Instant::now() + TIMEOUT;
+    while std::fs::read_to_string(procs).is_ok_and(|p| p.trim().is_empty())
+        || !Path::new(procs).exists()
+    {
+        assert!(Instant::now() < deadline, "stuck never got a Firecracker");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    agent.crash_agent();
+    assert!(
+        !stuck.join().unwrap().unwrap().status.success(),
+        "the client of a crashed agent should fail"
+    );
+    agent.restart();
+
+    let ps = agent.ps(false);
+    let web = row(&ps, "web")
+        .unwrap_or_else(|| panic!("web isn't listed after the agent crashed:\n{ps}"));
+    assert!(web.contains(&address), "web's address changed: {web}");
+    assert!(
+        row(&ps, "stuck").is_none(),
+        "a VM that never finished starting was adopted:\n{ps}"
+    );
+    assert_eq!(
+        host_state_of(240, 3),
+        Vec::<String>::new(),
+        "the restart left what the unfinished start made"
+    );
+    let logs: Vec<String> = std::fs::read_dir(agent.state_dir.join("logs"))
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .collect();
+    assert!(
+        logs.iter().all(|l| l.starts_with("web.")),
+        "the restart left a console log no record names: {logs:?}"
+    );
+    let response = wait_for_http(&address, HTTP_PORT);
+    assert!(
+        response.contains("hello from cirro"),
+        "web stopped answering after the crash: {response:?}"
+    );
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "web"])
+        .assert()
+        .success();
     agent.assert_no_cirro_state();
 }
 

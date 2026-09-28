@@ -7,12 +7,13 @@
 //! When the VM ends, for whatever reason, the task records it as an Ended VM
 //! whose console log stays in the state dir until `rm` or name reuse.
 //!
-//! State lives in memory (M3). Until persistence and restart reconcile land
-//! (#9), the agent tears down every VM it owns when it stops, so a stopped
-//! agent never strands VMs it can no longer find, and Ended VMs are
-//! forgotten along with their logs.
+//! VMs outlive the agent (ADR 0002). Each VM is recorded in the state
+//! database once it has started; the agent never stops VMs when it exits,
+//! and a starting agent takes back every VM whose record still matches a
+//! running process before it opens its socket.
 
 use crate::egress;
+use crate::state::{Record, Store};
 use crate::vm::{self, Stop, Vm, VmSpec};
 use bytes::Bytes;
 use cirro_proto::{EndReason, Ended, ErrorBody, RunRequest, StopRequest, VM_STATE_HEADER, VmInfo};
@@ -27,7 +28,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -77,6 +78,16 @@ impl std::fmt::Display for Subnet {
 impl Subnet {
     fn node_address(self) -> Ipv4Addr {
         Ipv4Addr::from(self.network + 1)
+    }
+
+    /// The VM address of this Node's subnet whose low 16 bits are `low`, the
+    /// part [`vm::host_id`] names host objects by.
+    fn vm_address_with_low16(self, low: u16) -> Option<Ipv4Addr> {
+        let address = self.network & 0xFFFF_0000 | u32::from(low);
+        let broadcast = self.network | (u32::MAX >> self.prefix_len);
+        (self.network + 2..broadcast)
+            .contains(&address)
+            .then(|| Ipv4Addr::from(address))
     }
 
     /// Every address a VM may hold, lowest first.
@@ -148,20 +159,27 @@ struct Agent {
     /// Console logs, one per name, kept with the Ended VM record.
     logs_dir: PathBuf,
     vms: Mutex<BTreeMap<String, Entry>>,
+    store: Mutex<Store>,
     /// Numbers each VM start's console log file.
     next_log: AtomicU64,
-    /// Set once shutdown begins, so no new VM starts after the agent has
-    /// begun tearing VMs down.
+    /// Set once shutdown begins, so no new VM starts while the agent waits for
+    /// the starts already under way to finish.
     shutting_down: AtomicBool,
 }
 
-/// Runs the agent until SIGTERM or SIGINT, then tears down every VM and
-/// removes the socket, console logs, and the jail tree and parent cgroup
-/// once empty. The Node's egress policy is ensured first, and outlives the
-/// agent.
+/// Runs the agent until SIGTERM or SIGINT, then removes the socket. VMs,
+/// their records and their console logs stay, and the jail tree and parent
+/// cgroup go only if no VM is left in them. The Node's egress policy is
+/// ensured first, and outlives the agent.
 pub async fn run(config: Config) -> io::Result<()> {
     let logs_dir = config.state_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
+    // First, so a state dir made for another subnet is refused before the
+    // agent changes anything on the Node.
+    let store = Store::open(
+        &config.state_dir.join("state.db"),
+        &config.subnet.to_string(),
+    )?;
 
     // Fail closed: no VM starts without the egress policy in place.
     let egress_iface = egress::default_route_iface();
@@ -180,11 +198,13 @@ pub async fn run(config: Config) -> io::Result<()> {
             node_address: config.subnet.node_address(),
         },
         subnet: config.subnet,
-        logs_dir,
+        logs_dir: logs_dir.clone(),
         vms: Mutex::new(BTreeMap::new()),
-        next_log: AtomicU64::new(0),
+        store: Mutex::new(store),
+        next_log: AtomicU64::new(next_log_number(&logs_dir)),
         shutting_down: AtomicBool::new(false),
     });
+    agent.reconcile().await?;
 
     let gid = resolve_group(&config.socket_group)?;
     if let Some(dir) = config.socket.parent() {
@@ -383,14 +403,7 @@ impl Agent {
         let vm = match Vm::start(&self.node, &spec).await {
             Ok(vm) => vm,
             Err(e) => {
-                {
-                    let mut vms = self.vms.lock().unwrap();
-                    vms.remove(&name);
-                    if let Some(Replaced { info, log }) = replaced {
-                        vms.insert(name.clone(), Entry::Ended { info, log });
-                    }
-                }
-                let _ = std::fs::remove_file(&spec.console_log);
+                self.forget_start(&name, replaced, &spec.console_log);
                 return Err(ApiError(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     format!("VM {name:?} failed to start: {e}"),
@@ -405,16 +418,38 @@ impl Agent {
             started_at: now(),
             ended: None,
         };
+        // A VM that isn't on record would be nobody's to stop after a restart.
+        let recorded =
+            self.store
+                .lock()
+                .unwrap()
+                .insert_running(&info, &spec.console_log, vm.process());
+        if let Err(e) = recorded {
+            vm.destroy().await;
+            self.forget_start(&name, replaced, &spec.console_log);
+            return Err(ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("VM {name:?} started, but recording it failed, so it was stopped: {e}"),
+            ));
+        }
         if let Some(old) = replaced {
             let _ = std::fs::remove_file(old.log);
         }
+        self.start_supervising(info.clone(), spec.console_log, vm);
+        Ok(json(StatusCode::CREATED, &info))
+    }
+
+    /// Records `vm` as running and spawns its supervisor task, which records
+    /// it as ended once its host state is gone.
+    fn start_supervising(self: &Arc<Self>, info: VmInfo, log: PathBuf, vm: Vm) {
+        let name = info.name.clone();
         let (stops_tx, stops_rx) = mpsc::channel(4);
         let (ended_tx, ended_rx) = watch::channel(false);
         self.vms.lock().unwrap().insert(
             name.clone(),
             Entry::Running {
-                info: info.clone(),
-                log: spec.console_log.clone(),
+                info,
+                log,
                 stops: stops_tx,
                 ended: ended_rx,
             },
@@ -425,16 +460,108 @@ impl Agent {
             agent.record_end(&name, reason);
             let _ = ended_tx.send(true);
         });
-        Ok(json(StatusCode::CREATED, &info))
+    }
+
+    /// Brings the Node back in line with the state database after the agent
+    /// was down. A VM recorded as running whose process is still there is
+    /// taken back. One whose process is gone becomes an Ended VM. Then all
+    /// host state in the Node subnet that no running VM holds is removed:
+    /// what the dead VMs left, and what a start that never got recorded left,
+    /// including its console log.
+    ///
+    /// Runs before the socket opens, so no request sees a half-restored Node.
+    async fn reconcile(self: &Arc<Self>) -> io::Result<()> {
+        let records = self.store.lock().unwrap().load()?;
+        self.remove_unrecorded_logs(&records)?;
+        for Record { info, log, process } in records {
+            let name = info.name.clone();
+            let entry = if info.ended.is_some() {
+                Entry::Ended { info, log }
+            } else {
+                // A running VM's record always names its VM address and
+                // process. One that doesn't can't be told apart from a live
+                // VM, and treating it as dead would have the sweep kill it.
+                let (Some(vm_address), Some(process)) = (info.vm_address, process) else {
+                    return Err(io::Error::other(format!(
+                        "the state database records VM {name:?} as running but doesn't name \
+                         its VM address and process; refusing to start rather than guess"
+                    )));
+                };
+                if process.is_running() {
+                    let vm = Vm::adopt(&self.node, vm_address, process, log.clone());
+                    self.start_supervising(info, log, vm);
+                    continue;
+                }
+                let ended = Ended {
+                    at: now(),
+                    reason: EndReason::AgentDown,
+                };
+                self.store.lock().unwrap().mark_ended(&name, &ended)?;
+                Entry::Ended {
+                    info: ended_info(info, ended),
+                    log,
+                }
+            };
+            self.vms.lock().unwrap().insert(name, entry);
+        }
+        self.sweep_host_state().await;
+        Ok(())
+    }
+
+    /// Removes the console logs no record names.
+    fn remove_unrecorded_logs(&self, records: &[Record]) -> io::Result<()> {
+        // By file name alone, so a state dir reached by another path can never
+        // make every log look unrecorded.
+        let recorded: Vec<_> = records.iter().filter_map(|r| r.log.file_name()).collect();
+        for entry in std::fs::read_dir(&self.logs_dir)?.flatten() {
+            if !recorded.contains(&entry.file_name().as_os_str()) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes the host state in the Node subnet that no VM in `vms` holds.
+    async fn sweep_host_state(&self) {
+        let held: Vec<Ipv4Addr> = self
+            .vms
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(Entry::vm_address)
+            .collect();
+        for owner in vm::host_state_owners(&self.node) {
+            if let Some(vm_address) = self.subnet.vm_address_with_low16(owner)
+                && !held.contains(&vm_address)
+            {
+                vm::clean_up(&self.node, vm_address).await;
+            }
+        }
+    }
+
+    /// Undoes the reservation of a start that failed: puts back the Ended VM
+    /// it would have replaced, and removes the log of its own.
+    fn forget_start(&self, name: &str, replaced: Option<Replaced>, log: &Path) {
+        {
+            let mut vms = self.vms.lock().unwrap();
+            vms.remove(name);
+            if let Some(Replaced { info, log }) = replaced {
+                vms.insert(name.to_string(), Entry::Ended { info, log });
+            }
+        }
+        let _ = std::fs::remove_file(log);
     }
 
     /// Turns a running VM's record into an Ended VM's, once its host state
     /// is gone.
     fn record_end(&self, name: &str, reason: EndReason) {
         let mut vms = self.vms.lock().unwrap();
-        if let Some(Entry::Running { mut info, log, .. }) = vms.remove(name) {
-            info.vm_address = None;
-            info.ended = Some(Ended { at: now(), reason });
+        if let Some(Entry::Running { info, log, .. }) = vms.remove(name) {
+            let ended = Ended { at: now(), reason };
+            if let Err(e) = self.store.lock().unwrap().mark_ended(name, &ended) {
+                eprintln!("cirro node: record the end of {name:?}: {e}");
+            }
+            let info = ended_info(info, ended);
             vms.insert(name.to_string(), Entry::Ended { info, log });
         }
     }
@@ -510,6 +637,12 @@ impl Agent {
         match vms.get(name) {
             None => Err(no_such_vm(name)),
             Some(Entry::Ended { log, .. }) => {
+                self.store.lock().unwrap().delete(name).map_err(|e| {
+                    ApiError(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("remove the record of {name:?}: {e}"),
+                    )
+                })?;
                 let _ = std::fs::remove_file(log);
                 vms.remove(name);
                 Ok(Response::builder()
@@ -524,42 +657,48 @@ impl Agent {
         }
     }
 
-    /// Tears down every VM, including ones still starting: each start
-    /// finishes (bounded by its own timeouts) as a running VM to stop, or
-    /// unwinds itself.
+    /// Waits for the VMs still starting to finish, so none is left without
+    /// a record. Running VMs are left running: they outlive the agent.
     async fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
-        loop {
-            let (running, any_starting) = {
-                let vms = self.vms.lock().unwrap();
-                let running: Vec<_> = vms
-                    .values()
-                    .filter_map(|entry| match entry {
-                        Entry::Running { stops, ended, .. } => Some((stops.clone(), ended.clone())),
-                        _ => None,
-                    })
-                    .collect();
-                let any_starting = vms.values().any(|e| matches!(e, Entry::Starting { .. }));
-                (running, any_starting)
-            };
-            if running.is_empty() && !any_starting {
-                break;
-            }
-            for (stops, mut ended) in running {
-                let _ = stops.send(Stop::Force).await;
-                let _ = ended.wait_for(|ended| *ended).await;
-            }
-            if any_starting {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+        while self
+            .vms
+            .lock()
+            .unwrap()
+            .values()
+            .any(|e| matches!(e, Entry::Starting { .. }))
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        // Ended VMs are only in memory, so their logs go with them.
-        let _ = std::fs::remove_dir_all(&self.logs_dir);
         // Only succeed once empty, so a jail still in use is never removed.
         let _ = std::fs::remove_dir(self.node.jail_base.join("firecracker"));
         let _ = std::fs::remove_dir(&self.node.jail_base);
         let _ = std::fs::remove_dir(vm::parent_cgroup());
     }
+}
+
+/// `info` as an Ended VM's: it holds no VM address any more.
+fn ended_info(info: VmInfo, ended: Ended) -> VmInfo {
+    VmInfo {
+        vm_address: None,
+        ended: Some(ended),
+        ..info
+    }
+}
+
+/// The number for the next console log: one past the highest that any log
+/// file in `logs_dir` carries, so no start reuses a log of an earlier agent's.
+fn next_log_number(logs_dir: &Path) -> u64 {
+    std::fs::read_dir(logs_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.ok()?.file_name().into_string().ok()?;
+            let (_, number) = name.strip_suffix(".log")?.rsplit_once('.')?;
+            number.parse::<u64>().ok()
+        })
+        .max()
+        .map_or(0, |highest| highest + 1)
 }
 
 /// VM names are 1-32 characters of lowercase letters, digits and hyphens,

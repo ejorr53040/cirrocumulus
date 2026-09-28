@@ -5,4 +5,5 @@ pub mod egress;
 pub mod firecracker;
 pub mod jailer;
 pub mod network;
+mod state;
 pub mod vm;
