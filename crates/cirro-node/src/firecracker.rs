@@ -70,7 +70,7 @@ impl Client {
     }
 
     /// Sends one `PUT` request with a JSON body to a path on the API, per
-    /// https://github.com/firecracker-microvm/firecracker/blob/main/docs/api_requests/actions.md.
+    /// <https://github.com/firecracker-microvm/firecracker/blob/main/docs/api_requests/actions.md>.
     pub async fn put(&self, path: &str, body: serde_json::Value) -> Result<(), Error> {
         let uri: hyper::Uri = UnixUri::new(&self.socket_path, path).into();
         let body_bytes = serde_json::to_vec(&body).expect("serialize request body");

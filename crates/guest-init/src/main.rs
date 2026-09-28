@@ -15,12 +15,14 @@ mod config;
 
 use config::Config;
 use nix::errno::Errno;
-use nix::mount::{mount, MsFlags};
-use nix::sys::reboot::{reboot, set_cad_enabled, RebootMode};
+use nix::mount::{MsFlags, mount};
+use nix::sys::reboot::{RebootMode, reboot, set_cad_enabled};
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
-use nix::sys::socket::{accept, bind, listen, socket, AddressFamily, Backlog, SockFlag, SockType, VsockAddr};
+use nix::sys::socket::{
+    AddressFamily, Backlog, SockFlag, SockType, VsockAddr, accept, bind, listen, socket,
+};
 use nix::sys::wait::waitpid;
-use nix::unistd::{execv, fork, ForkResult, Pid};
+use nix::unistd::{ForkResult, Pid, execv, fork};
 use std::ffi::CString;
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

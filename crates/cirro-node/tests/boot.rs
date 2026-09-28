@@ -83,7 +83,9 @@ async fn boots_the_step0_plain_rootfs_to_userspace() {
     let child = Command::new(&firecracker_bin)
         .arg("--api-sock")
         .arg(&api_socket)
-        .stdout(Stdio::from(console_log.try_clone().expect("clone console log fd")))
+        .stdout(Stdio::from(
+            console_log.try_clone().expect("clone console log fd"),
+        ))
         .stderr(Stdio::from(console_log))
         .spawn()
         .expect("spawn firecracker");

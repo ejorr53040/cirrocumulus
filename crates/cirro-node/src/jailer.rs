@@ -6,7 +6,7 @@
 //! sets up -- but the Firecracker process it `exec`s into drops to the
 //! given unprivileged uid/gid.
 
-use nix::sys::signal::{kill, Signal};
+use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -116,10 +116,10 @@ impl Drop for Jail {
         // trap kills. It's a different pid than `self.child` by this
         // point (that's `sudo`/`jailer`'s own pid, which normally exits on
         // its own once its child does).
-        if let Ok(pid_str) = std::fs::read_to_string(self.root.join("firecracker.pid")) {
-            if let Ok(raw_pid) = pid_str.trim().parse::<i32>() {
-                let _ = kill(Pid::from_raw(raw_pid), Signal::SIGKILL);
-            }
+        if let Ok(pid_str) = std::fs::read_to_string(self.root.join("firecracker.pid"))
+            && let Ok(raw_pid) = pid_str.trim().parse::<i32>()
+        {
+            let _ = kill(Pid::from_raw(raw_pid), Signal::SIGKILL);
         }
         let _ = self.child.wait();
     }
@@ -127,11 +127,7 @@ impl Drop for Jail {
 
 fn jail_root(chroot_base_dir: &Path, exec_file: &Path, id: &str) -> PathBuf {
     chroot_base_dir
-        .join(
-            exec_file
-                .file_name()
-                .expect("exec_file has a filename"),
-        )
+        .join(exec_file.file_name().expect("exec_file has a filename"))
         .join(id)
         .join("root")
 }
