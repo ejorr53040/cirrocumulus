@@ -136,6 +136,7 @@ name = "cirro-node"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "cirro-proto",
  "futures-util",
  "http-body-util",
  "hyper",
@@ -143,6 +144,7 @@ dependencies = [
  "hyperlocal",
  "nix 0.31.3",
  "rtnetlink",
+ "serde",
  "serde_json",
  "tokio",
 ]
@@ -150,6 +152,9 @@ dependencies = [
 [[package]]
 name = "cirro-proto"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "cirro-server"
@@ -164,8 +169,19 @@ name = "cirrocumulus"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "bytes",
+ "cirro-node",
+ "cirro-proto",
  "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "hyperlocal",
+ "nix 0.31.3",
  "predicates",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

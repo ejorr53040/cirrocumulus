@@ -122,6 +122,19 @@ impl Client {
         .await
     }
 
+    /// Adds a vsock device whose host end is a Unix socket at `uds_path`
+    /// (inside the jail, when jailed). Pre-boot only, like `attach_tap`.
+    pub async fn attach_vsock(&self, guest_cid: u32, uds_path: &str) -> Result<(), Error> {
+        self.put(
+            "/vsock",
+            serde_json::json!({
+                "guest_cid": guest_cid,
+                "uds_path": uds_path,
+            }),
+        )
+        .await
+    }
+
     /// Drives the boot sequence: machine config, boot source, root drive,
     /// then `InstanceStart`. Static device config (network, vsock, ...)
     /// has to happen between the root drive and `InstanceStart` too, once

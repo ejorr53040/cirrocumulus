@@ -9,11 +9,11 @@ license = "Apache-2.0"
 repository = "https://github.com/ejorr53040/cirrocumulus"
 
 [workspace.dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 assert_cmd = "2"
 predicates = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "time", "io-util"] }
-hyper = { version = "1", features = ["client", "http1"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "time", "io-util", "signal"] }
+hyper = { version = "1", features = ["client", "server", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 hyperlocal = "0.9"
 http-body-util = "0.1"
@@ -23,6 +23,8 @@ serde_json = "1"
 nix = "0.31.3"
 rtnetlink = "0.23"
 futures-util = "0.3"
+cirro-proto = { path = "crates/cirro-proto" }
+cirro-node = { path = "crates/cirro-node" }
 
 # Lints every crate opts into with `[lints] workspace = true`. CI runs
 # clippy with `-D warnings`, so "warn" here still fails the build.

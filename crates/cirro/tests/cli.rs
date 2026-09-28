@@ -18,8 +18,8 @@ fn help_lists_every_subcommand() {
 #[test]
 fn unimplemented_subcommand_says_not_yet_and_fails() {
     cirro()
-        .args(["run", "nginx:alpine"])
+        .args(["ssh", "web"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("cirro run: not yet implemented"));
+        .stderr(predicate::str::contains("cirro ssh: not yet implemented"));
 }
