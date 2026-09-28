@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The hermetic test suite CI runs. Everything is *compiled* (so the
-# real-Firecracker tests in crates/cirro-node/tests can't bit-rot), but only
-# tests that need no VM assets are *run*.
+# real-Firecracker tests in crates/cirro-node/tests and the Node agent test
+# in crates/cirro/tests/node_agent.rs can't bit-rot), but only tests that
+# need no VM assets are *run*.
 #
 # Why not just `cargo test --workspace`: GitHub's Linux runners expose
 # /dev/kvm and passwordless sudo, so the cirro-node VM tests would get past
