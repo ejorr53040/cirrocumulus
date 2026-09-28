@@ -8,7 +8,7 @@ use std::net::TcpListener;
 
 fn main() {
     let listener = TcpListener::bind("0.0.0.0:8080").expect("bind 0.0.0.0:8080");
-    println!("HTTP_APP_LISTENING");
+    println!("HTTP_FIXTURE_LISTENING");
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
         let mut request = [0u8; 1024];

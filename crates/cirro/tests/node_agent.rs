@@ -104,6 +104,8 @@ struct Rootfs {
     guest_init: PathBuf,
     /// No `/init` at all, so the guest never starts guest-init.
     no_init: PathBuf,
+    /// A `/init` that isn't guest-init and never takes a config.
+    wrong_init: PathBuf,
 }
 
 fn rootfs() -> &'static Rootfs {
@@ -115,7 +117,7 @@ fn rootfs() -> &'static Rootfs {
         for sub in ["proc", "sys", "dev", "app"] {
             std::fs::create_dir_all(tree.join(sub)).expect("create rootfs tree");
         }
-        for fixture in ["http_app", "ignore_term"] {
+        for fixture in ["http_app", "ignore_term", "exit_later"] {
             let status = std::process::Command::new("rustc")
                 .args(["--target", "x86_64-unknown-linux-musl", "-O", "-o"])
                 .arg(tree.join("app").join(fixture))
@@ -128,6 +130,9 @@ fn rootfs() -> &'static Rootfs {
             assert!(status.success(), "building the {fixture} fixture failed");
         }
         let no_init = make_image(&tree, &dir.join("no-init.ext4"));
+        std::fs::copy(tree.join("app/ignore_term"), tree.join("init"))
+            .expect("copy ignore_term in as /init");
+        let wrong_init = make_image(&tree, &dir.join("wrong-init.ext4"));
         let guest_init_bin = repo_root()
             .join("target/guest-init-embed/x86_64-unknown-linux-musl/release/guest-init");
         std::fs::copy(&guest_init_bin, tree.join("init")).expect("copy guest-init into tree");
@@ -135,6 +140,7 @@ fn rootfs() -> &'static Rootfs {
         Rootfs {
             guest_init,
             no_init,
+            wrong_init,
         }
     })
 }
@@ -459,7 +465,7 @@ fn graceful_stop_leaves_an_ended_vm_whose_logs_last_until_rm() {
     agent
         .run("web", &rootfs().guest_init, &["/app/http_app"])
         .success();
-    wait_for_log(&agent, "web", "HTTP_APP_LISTENING");
+    wait_for_log(&agent, "web", "HTTP_FIXTURE_LISTENING");
     let err = stderr(agent.cirro().args(["rm", "web"]).assert().failure());
     assert!(
         err.contains("running"),
@@ -474,7 +480,19 @@ fn graceful_stop_leaves_an_ended_vm_whose_logs_last_until_rm() {
     let ps = agent.ps(true);
     let ended = row(&ps, "web").unwrap_or_else(|| panic!("ps -a doesn't list web:\n{ps}"));
     assert!(ended.contains("graceful"), "end reason missing: {ended}");
-    wait_for_log(&agent, "web", "HTTP_APP_LISTENING");
+    wait_for_log(&agent, "web", "HTTP_FIXTURE_LISTENING");
+
+    // A reuse that fails to start replaces nothing.
+    agent
+        .run("web", &rootfs().no_init, &["/app/http_app"])
+        .failure();
+    let ps = agent.ps(true);
+    let ended = row(&ps, "web").unwrap_or_else(|| panic!("failed reuse lost web:\n{ps}"));
+    assert!(
+        ended.contains("graceful"),
+        "failed reuse changed web: {ended}"
+    );
+    wait_for_log(&agent, "web", "HTTP_FIXTURE_LISTENING");
 
     // Reusing the name replaces the Ended VM's record.
     agent
@@ -591,6 +609,7 @@ fn a_user_outside_the_socket_group_gets_a_clear_permission_error() {
         err.contains("permission denied") && err.contains("group"),
         "expected a permission error naming the group, got: {err}"
     );
+    agent.assert_no_cirro_state();
 }
 
 #[test]
@@ -608,7 +627,7 @@ fn logs_follow_streams_a_running_vm_until_it_ends() {
         .stdout(Stdio::piped())
         .spawn()
         .expect("start cirro logs -f");
-    wait_for_log(&agent, "web", "HTTP_APP_LISTENING");
+    wait_for_log(&agent, "web", "HTTP_FIXTURE_LISTENING");
     agent.cirro().args(["stop", "web"]).assert().success();
 
     let deadline = Instant::now() + TIMEOUT;
@@ -631,11 +650,57 @@ fn logs_follow_streams_a_running_vm_until_it_ends() {
         .read_to_string(&mut output)
         .unwrap();
     // Output from before and after the stop: it followed, not just dumped.
-    for marker in ["HTTP_APP_LISTENING", "GUEST_INIT_FORWARDING_SIGTERM"] {
+    for marker in ["HTTP_FIXTURE_LISTENING", "GUEST_INIT_FORWARDING_SIGTERM"] {
         assert!(
             output.contains(marker),
             "logs -f missed {marker}:\n{output}"
         );
     }
+    agent.assert_no_cirro_state();
+}
+
+#[test]
+fn a_vm_whose_command_exits_on_its_own_is_recorded_as_exited() {
+    let Some(agent) = Agent::start(247) else {
+        return;
+    };
+    agent
+        .run("brief", &rootfs().guest_init, &["/app/exit_later"])
+        .success();
+
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let ps = agent.ps(true);
+        let brief = row(&ps, "brief").unwrap_or_else(|| panic!("ps -a lacks brief:\n{ps}"));
+        if !brief.contains("running") {
+            assert!(brief.contains("exited"), "wrong end reason: {brief}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "brief never ended: {brief}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    wait_for_log(&agent, "brief", "EXIT_LATER_DONE");
+    agent.assert_no_cirro_state();
+}
+
+#[test]
+fn run_gives_up_on_a_vm_that_never_takes_its_config() {
+    let Some(agent) = Agent::start(246) else {
+        return;
+    };
+    // `/init` runs but isn't guest-init, so no config is ever taken.
+    let err = stderr(
+        agent
+            .run("deaf", &rootfs().wrong_init, &["/app/http_app"])
+            .failure(),
+    );
+    assert!(
+        err.contains("never accepted its config") && err.contains("IGNORE_TERM_STARTED"),
+        "run should report the config timeout with the console tail, got:\n{err}"
+    );
+    assert!(
+        row(&agent.ps(true), "deaf").is_none(),
+        "a failed run left a record"
+    );
     agent.assert_no_cirro_state();
 }

@@ -28,7 +28,7 @@ use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UnixListener;
@@ -92,29 +92,47 @@ pub struct Config {
     pub kernel: PathBuf,
 }
 
-/// One name's record in the registry.
+/// One name's record in the registry. Every VM start gets its own console
+/// log file (`log`), so a failed reuse of a name can't clobber the log of
+/// the Ended VM it would have replaced.
 enum Entry {
     /// `Vm::start` is running; the entry reserves the name and VM address.
-    Starting { vm_address: Ipv4Addr },
+    Starting { vm_address: Ipv4Addr, log: PathBuf },
     /// Owned by a supervisor task, which `stops` reaches. `ended` turns true
     /// once the task has recorded the VM as ended.
     Running {
         info: VmInfo,
+        log: PathBuf,
         stops: mpsc::Sender<Stop>,
         ended: watch::Receiver<bool>,
     },
     /// History only: holds no host state and no VM address.
-    Ended { info: VmInfo },
+    Ended { info: VmInfo, log: PathBuf },
 }
 
 impl Entry {
     fn vm_address(&self) -> Option<Ipv4Addr> {
         match self {
-            Entry::Starting { vm_address } => Some(*vm_address),
+            Entry::Starting { vm_address, .. } => Some(*vm_address),
             Entry::Running { info, .. } => info.vm_address,
             Entry::Ended { .. } => None,
         }
     }
+
+    fn log(&self) -> &PathBuf {
+        match self {
+            Entry::Starting { log, .. } | Entry::Running { log, .. } | Entry::Ended { log, .. } => {
+                log
+            }
+        }
+    }
+}
+
+/// An Ended VM set aside while a new VM with its name starts: dropped if the
+/// start succeeds, put back if it fails.
+struct Replaced {
+    info: VmInfo,
+    log: PathBuf,
 }
 
 struct Agent {
@@ -123,6 +141,8 @@ struct Agent {
     /// Console logs, one per name, kept with the Ended VM record.
     logs_dir: PathBuf,
     vms: Mutex<BTreeMap<String, Entry>>,
+    /// Numbers each VM start's console log file.
+    next_log: AtomicU64,
     /// Set once shutdown begins, so no new VM starts after the agent has
     /// begun tearing VMs down.
     shutting_down: AtomicBool,
@@ -145,6 +165,7 @@ pub async fn run(config: Config) -> io::Result<()> {
         subnet: config.subnet,
         logs_dir,
         vms: Mutex::new(BTreeMap::new()),
+        next_log: AtomicU64::new(0),
         shutting_down: AtomicBool::new(false),
     });
 
@@ -246,14 +267,16 @@ impl Agent {
         vms.values()
             .filter_map(|entry| match entry {
                 Entry::Running { info, .. } => Some(info.clone()),
-                Entry::Ended { info } if all => Some(info.clone()),
+                Entry::Ended { info, .. } if all => Some(info.clone()),
                 _ => None,
             })
             .collect()
     }
 
-    fn log_path(&self, name: &str) -> PathBuf {
-        self.logs_dir.join(format!("{name}.log"))
+    /// A fresh console log path for a new start of `name`.
+    fn new_log_path(&self, name: &str) -> PathBuf {
+        let n = self.next_log.fetch_add(1, Ordering::SeqCst);
+        self.logs_dir.join(format!("{name}.{n}.log"))
     }
 
     async fn run_vm(self: Arc<Self>, run: RunRequest) -> Result<ApiResponse, ApiError> {
@@ -264,7 +287,8 @@ impl Agent {
         if !run.rootfs.is_absolute() {
             return Err(bad_request("the rootfs path must be absolute"));
         }
-        let vm_address = {
+        let log = self.new_log_path(&run.name);
+        let (vm_address, replaced) = {
             let mut vms = self.vms.lock().unwrap();
             if self.shutting_down.load(Ordering::SeqCst) {
                 return Err(ApiError(
@@ -272,19 +296,14 @@ impl Agent {
                     "the Node agent is shutting down".into(),
                 ));
             }
-            match vms.get(&run.name) {
-                Some(Entry::Starting { .. } | Entry::Running { .. }) => {
-                    return Err(ApiError(
-                        StatusCode::CONFLICT,
-                        format!("a VM named {:?} already exists", run.name),
-                    ));
-                }
-                // Reusing an Ended VM's name replaces its record and log.
-                Some(Entry::Ended { .. }) => {
-                    vms.remove(&run.name);
-                    let _ = std::fs::remove_file(self.log_path(&run.name));
-                }
-                None => {}
+            if matches!(
+                vms.get(&run.name),
+                Some(Entry::Starting { .. } | Entry::Running { .. })
+            ) {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    format!("a VM named {:?} already exists", run.name),
+                ));
             }
             let held: Vec<Ipv4Addr> = vms.values().filter_map(Entry::vm_address).collect();
             let vm_address = self
@@ -297,8 +316,19 @@ impl Agent {
                         "the Node subnet has no free VM addresses".into(),
                     )
                 })?;
-            vms.insert(run.name.clone(), Entry::Starting { vm_address });
-            vm_address
+            // Reusing an Ended VM's name replaces its record once the new VM
+            // has started.
+            let replaced = match vms.insert(
+                run.name.clone(),
+                Entry::Starting {
+                    vm_address,
+                    log: log.clone(),
+                },
+            ) {
+                Some(Entry::Ended { info, log }) => Some(Replaced { info, log }),
+                _ => None,
+            };
+            (vm_address, replaced)
         };
 
         let spec = VmSpec {
@@ -307,13 +337,13 @@ impl Agent {
             mem_mib: run.mem_mib,
             vcpus: run.vcpus,
             command: run.command,
-            console_log: self.log_path(&run.name),
+            console_log: log,
         };
         // Started on its own task, so the start runs to completion (success,
         // or a full unwind) even if the client disconnects and hyper drops
         // this request's future.
         let name = run.name;
-        tokio::spawn(async move { self.start_vm(name, spec).await })
+        tokio::spawn(async move { self.start_vm(name, spec, replaced).await })
             .await
             .unwrap_or_else(|e| {
                 Err(ApiError(
@@ -325,16 +355,24 @@ impl Agent {
 
     /// Runs `Vm::start` for a name and VM address already reserved as
     /// `Entry::Starting`, then hands a started VM to its supervisor task.
-    /// A VM that fails to start leaves no record and no log.
+    /// A VM that fails to start leaves no record and no log of its own, and
+    /// puts back the Ended VM it would have replaced.
     async fn start_vm(
         self: Arc<Self>,
         name: String,
         spec: VmSpec,
+        replaced: Option<Replaced>,
     ) -> Result<ApiResponse, ApiError> {
         let vm = match Vm::start(&self.node, &spec).await {
             Ok(vm) => vm,
             Err(e) => {
-                self.vms.lock().unwrap().remove(&name);
+                {
+                    let mut vms = self.vms.lock().unwrap();
+                    vms.remove(&name);
+                    if let Some(Replaced { info, log }) = replaced {
+                        vms.insert(name.clone(), Entry::Ended { info, log });
+                    }
+                }
                 let _ = std::fs::remove_file(&spec.console_log);
                 return Err(ApiError(
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -350,12 +388,16 @@ impl Agent {
             started_at: now(),
             ended: None,
         };
+        if let Some(old) = replaced {
+            let _ = std::fs::remove_file(old.log);
+        }
         let (stops_tx, stops_rx) = mpsc::channel(4);
         let (ended_tx, ended_rx) = watch::channel(false);
         self.vms.lock().unwrap().insert(
             name.clone(),
             Entry::Running {
                 info: info.clone(),
+                log: spec.console_log.clone(),
                 stops: stops_tx,
                 ended: ended_rx,
             },
@@ -373,10 +415,10 @@ impl Agent {
     /// is gone.
     fn record_end(&self, name: &str, reason: EndReason) {
         let mut vms = self.vms.lock().unwrap();
-        if let Some(Entry::Running { mut info, .. }) = vms.remove(name) {
+        if let Some(Entry::Running { mut info, log, .. }) = vms.remove(name) {
             info.vm_address = None;
             info.ended = Some(Ended { at: now(), reason });
-            vms.insert(name.to_string(), Entry::Ended { info });
+            vms.insert(name.to_string(), Entry::Ended { info, log });
         }
     }
 
@@ -413,7 +455,7 @@ impl Agent {
         let _ = stops.send(request).await;
         let _ = ended.wait_for(|ended| *ended).await;
         match self.vms.lock().unwrap().get(name) {
-            Some(Entry::Ended { info }) => Ok(json(StatusCode::OK, info)),
+            Some(Entry::Ended { info, .. }) => Ok(json(StatusCode::OK, info)),
             _ => Err(ApiError(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("VM {name:?} ended, but its record is gone"),
@@ -422,13 +464,13 @@ impl Agent {
     }
 
     fn logs(&self, name: &str, offset: u64) -> Result<ApiResponse, ApiError> {
-        let state = match self.vms.lock().unwrap().get(name) {
+        let (state, log) = match self.vms.lock().unwrap().get(name) {
             None => return Err(no_such_vm(name)),
-            Some(Entry::Ended { .. }) => "ended",
-            Some(_) => "running",
+            Some(entry @ Entry::Ended { .. }) => ("ended", entry.log().clone()),
+            Some(entry) => ("running", entry.log().clone()),
         };
         let mut bytes = Vec::new();
-        if let Ok(mut file) = std::fs::File::open(self.log_path(name)) {
+        if let Ok(mut file) = std::fs::File::open(log) {
             file.seek(SeekFrom::Start(offset))
                 .and_then(|_| file.read_to_end(&mut bytes))
                 .map_err(|e| {
@@ -450,9 +492,9 @@ impl Agent {
         let mut vms = self.vms.lock().unwrap();
         match vms.get(name) {
             None => Err(no_such_vm(name)),
-            Some(Entry::Ended { .. }) => {
+            Some(Entry::Ended { log, .. }) => {
+                let _ = std::fs::remove_file(log);
                 vms.remove(name);
-                let _ = std::fs::remove_file(self.log_path(name));
                 Ok(Response::builder()
                     .status(StatusCode::NO_CONTENT)
                     .body(Full::new(Bytes::new()))

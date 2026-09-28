@@ -166,34 +166,43 @@ impl Vm {
         let client = Client::new(&self.api_socket);
         let console_log = self.console_log.clone();
         let vmm = self.vmm.as_mut().expect("a started VM has a VMM");
-        tokio::select! {
-            status = vmm.wait() => natural_end(status, &console_log),
-            stop = stops.recv() => match stop {
-                Some(Stop::Graceful { timeout }) => {
-                    if client.send_ctrl_alt_del().await.is_err() {
-                        kill(vmm).await;
-                        return EndReason::Forced;
-                    }
-                    let deadline = tokio::time::sleep(timeout);
-                    tokio::pin!(deadline);
-                    loop {
-                        tokio::select! {
-                            _ = vmm.wait() => return EndReason::Graceful,
-                            _ = &mut deadline => break,
-                            stop = stops.recv() => match stop {
-                                Some(Stop::Graceful { .. }) => continue,
-                                Some(Stop::Force) | None => break,
-                            },
-                        }
+        // `biased` so a VM that has already ended is recorded as such even
+        // when a stop arrives at the same moment.
+        let stop = tokio::select! {
+            biased;
+            status = vmm.wait() => return natural_end(status, &console_log),
+            stop = stops.recv() => stop,
+        };
+        match stop {
+            Some(Stop::Graceful { timeout }) => {
+                if client.send_ctrl_alt_del().await.is_err() {
+                    // Most likely the VM ended on its own just now.
+                    if let Ok(Some(status)) = vmm.try_wait() {
+                        return natural_end(Ok(status), &console_log);
                     }
                     kill(vmm).await;
-                    EndReason::Forced
+                    return EndReason::Forced;
                 }
-                Some(Stop::Force) | None => {
-                    kill(vmm).await;
-                    EndReason::Forced
+                let deadline = tokio::time::sleep(timeout);
+                tokio::pin!(deadline);
+                loop {
+                    tokio::select! {
+                        biased;
+                        status = vmm.wait() => return graceful_end(status, &console_log),
+                        _ = &mut deadline => break,
+                        stop = stops.recv() => match stop {
+                            Some(Stop::Graceful { .. }) => continue,
+                            Some(Stop::Force) | None => break,
+                        },
+                    }
                 }
-            },
+                kill(vmm).await;
+                EndReason::Forced
+            }
+            Some(Stop::Force) | None => {
+                kill(vmm).await;
+                EndReason::Forced
+            }
         }
     }
 
@@ -412,8 +421,10 @@ impl Vm {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         Err(Error(format!(
-            "guest-init never accepted its config within {CONFIG_TIMEOUT:?} ({last_error}); \
-             does the rootfs have guest-init as /init?"
+            "guest-init never accepted its config within {CONFIG_TIMEOUT:?} ({last_error}), \
+             so the VM was forced to stop; does the rootfs have guest-init as /init? \
+             Last console lines:\n{}",
+            console_tail(&self.console_log)
         )))
     }
 
@@ -439,6 +450,18 @@ impl Vm {
             "the VM {how} while starting{panic}; last console lines:\n{}",
             console_tail(&self.console_log)
         ))
+    }
+}
+
+/// Why a VM ended after being asked to stop gracefully: graceful, unless it
+/// crashed on the way down.
+fn graceful_end(
+    status: std::io::Result<std::process::ExitStatus>,
+    console_log: &Path,
+) -> EndReason {
+    match natural_end(status, console_log) {
+        EndReason::Crashed => EndReason::Crashed,
+        _ => EndReason::Graceful,
     }
 }
 
