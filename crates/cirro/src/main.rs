@@ -1,12 +1,13 @@
 mod client;
 
 use cirro_node::agent::{self, Subnet};
-use cirro_proto::{RunRequest, StopRequest, VmInfo};
+use cirro_proto::{RunRequest, StopRequest, VM_STATE_HEADER, VmInfo};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use hyper::Method;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The compiled `guest-init` binary (musl static, RESEARCH.md M2), embedded
 /// so `cirro` ships as one self-contained binary -- rootfs building (M4)
@@ -62,9 +63,18 @@ enum Command {
         command: Vec<String>,
     },
     /// List VMs
-    Ps,
-    /// Show a VM's console log
-    Logs { name: String },
+    Ps {
+        /// Also list Ended VMs, with when and why they ended
+        #[arg(short, long)]
+        all: bool,
+    },
+    /// Show a VM's console log, running or ended
+    Logs {
+        /// Keep printing new output until the VM ends
+        #[arg(short, long)]
+        follow: bool,
+        name: String,
+    },
     /// Open a shell in a VM
     Ssh { name: String },
     /// Stop a VM
@@ -72,8 +82,13 @@ enum Command {
         /// Kill the VM immediately
         #[arg(long)]
         force: bool,
+        /// Seconds to wait for the VM to end before killing it
+        #[arg(long, default_value_t = 10, conflicts_with = "force")]
+        timeout: u64,
         name: String,
     },
+    /// Delete an Ended VM's record and console log
+    Rm { name: String },
     /// Snapshot a VM to disk and free its RAM
     Park { name: String },
     /// Restore a parked VM
@@ -164,8 +179,14 @@ fn main() -> ExitCode {
                 rootfs,
                 command,
             } => run(&cli.socket, name, mem, vcpus, rootfs, command).await,
-            Command::Ps => ps(&cli.socket).await,
-            Command::Stop { force, name } => stop(&cli.socket, &name, force).await,
+            Command::Ps { all } => ps(&cli.socket, all).await,
+            Command::Logs { follow, name } => logs(&cli.socket, &name, follow).await,
+            Command::Stop {
+                force,
+                timeout,
+                name,
+            } => stop(&cli.socket, &name, force, timeout).await,
+            Command::Rm { name } => rm(&cli.socket, &name).await,
             _ => Err(format!("{}: not yet implemented", command_path(&matches))),
         }
     });
@@ -209,43 +230,106 @@ async fn run(
     let vm: VmInfo = client::call(socket, Method::POST, "/vms", Some(&request))
         .await?
         .ok_or("the Node agent returned no VM")?;
-    println!("{}", vm.vm_address);
+    let address = vm
+        .vm_address
+        .ok_or("the Node agent returned no VM address")?;
+    println!("{address}");
     Ok(())
 }
 
-async fn ps(socket: &Path) -> Result<(), String> {
-    let vms: Vec<VmInfo> = client::call(socket, Method::GET, "/vms", None::<&()>)
+async fn ps(socket: &Path, all: bool) -> Result<(), String> {
+    let path = if all { "/vms?all=true" } else { "/vms" };
+    let vms: Vec<VmInfo> = client::call(socket, Method::GET, path, None::<&()>)
         .await?
         .unwrap_or_default();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    println!(
+    let mut header = format!(
         "{:<32} {:<15} {:>7} {:>5} {:>7}",
         "NAME", "VM ADDRESS", "MEMORY", "VCPUS", "UPTIME"
     );
+    if all {
+        header.push_str("  STATUS");
+    }
+    println!("{header}");
     for vm in vms {
-        println!(
+        let address = vm
+            .vm_address
+            .map_or_else(|| "-".to_string(), |a| a.to_string());
+        let uptime = match vm.ended {
+            None => format_duration(now.saturating_sub(vm.started_at)),
+            Some(_) => "-".to_string(),
+        };
+        let mut row = format!(
             "{:<32} {:<15} {:>7} {:>5} {:>7}",
             vm.name,
-            vm.vm_address.to_string(),
+            address,
             format_mem(vm.mem_mib),
             vm.vcpus,
-            format_duration(now.saturating_sub(vm.started_at)),
+            uptime,
         );
+        if all {
+            match vm.ended {
+                None => row.push_str("  running"),
+                Some(ended) => row.push_str(&format!(
+                    "  {} {} ago",
+                    ended.reason.as_str(),
+                    format_duration(now.saturating_sub(ended.at))
+                )),
+            }
+        }
+        println!("{row}");
     }
     Ok(())
 }
 
-async fn stop(socket: &Path, name: &str, force: bool) -> Result<(), String> {
-    client::call::<()>(
+async fn logs(socket: &Path, name: &str, follow: bool) -> Result<(), String> {
+    let mut offset = 0u64;
+    let mut out = std::io::stdout();
+    loop {
+        let (headers, bytes) = client::send(
+            socket,
+            Method::GET,
+            &format!("/vms/{name}/logs?offset={offset}"),
+            None::<&()>,
+        )
+        .await?;
+        out.write_all(&bytes)
+            .and_then(|()| out.flush())
+            .map_err(|e| format!("writing the log: {e}"))?;
+        offset += bytes.len() as u64;
+        // The agent reads the VM's state before its log, so once it says
+        // ended, this read got everything.
+        let ended = headers
+            .get(VM_STATE_HEADER)
+            .is_some_and(|state| state == "ended");
+        if !follow || ended {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn stop(socket: &Path, name: &str, force: bool, timeout_secs: u64) -> Result<(), String> {
+    let request = StopRequest {
+        force,
+        timeout_secs: Some(timeout_secs),
+    };
+    client::call::<VmInfo>(
         socket,
         Method::POST,
         &format!("/vms/{name}/stop"),
-        Some(&StopRequest { force }),
+        Some(&request),
     )
     .await
     .map(drop)
+}
+
+async fn rm(socket: &Path, name: &str) -> Result<(), String> {
+    client::call::<()>(socket, Method::DELETE, &format!("/vms/{name}"), None::<&()>)
+        .await
+        .map(drop)
 }
 
 /// Parses `--mem`: a count of MiB with an optional `M`/`G` suffix.

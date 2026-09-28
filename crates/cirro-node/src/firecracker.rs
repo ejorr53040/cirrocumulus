@@ -135,6 +135,16 @@ impl Client {
         .await
     }
 
+    /// Presses Ctrl-Alt-Del in the guest (`SendCtrlAltDel`), which
+    /// guest-init turns into SIGTERM for its command. Post-boot only.
+    pub async fn send_ctrl_alt_del(&self) -> Result<(), Error> {
+        self.put(
+            "/actions",
+            serde_json::json!({"action_type": "SendCtrlAltDel"}),
+        )
+        .await
+    }
+
     /// Drives the boot sequence: machine config, boot source, root drive,
     /// then `InstanceStart`. Static device config (network, vsock, ...)
     /// has to happen between the root drive and `InstanceStart` too, once

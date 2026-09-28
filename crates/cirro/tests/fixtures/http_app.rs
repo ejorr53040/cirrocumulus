@@ -1,5 +1,6 @@
-// M3 fixture: the smallest app worth `curl`ing at a VM address. Answers
-// every connection on port 8080 with a fixed body, then closes it. Built
+// M3 fixture: the smallest command worth `curl`ing at a VM address. Answers
+// every connection on port 8080 with a fixed body, then closes it, after
+// printing a marker to the console once it is listening. Built
 // static for musl by `tests/node_agent.rs` (not part of the cargo
 // workspace, like scripts/step0/fixtures), so the guest needs no libc.
 use std::io::{Read, Write};
@@ -7,6 +8,7 @@ use std::net::TcpListener;
 
 fn main() {
     let listener = TcpListener::bind("0.0.0.0:8080").expect("bind 0.0.0.0:8080");
+    println!("HTTP_FIXTURE_LISTENING");
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
         let mut request = [0u8; 1024];
