@@ -12,6 +12,7 @@
 //! agent never strands VMs it can no longer find, and Ended VMs are
 //! forgotten along with their logs.
 
+use crate::egress;
 use crate::vm::{self, Stop, Vm, VmSpec};
 use bytes::Bytes;
 use cirro_proto::{EndReason, Ended, ErrorBody, RunRequest, StopRequest, VM_STATE_HEADER, VmInfo};
@@ -64,6 +65,12 @@ impl FromStr for Subnet {
             network: u32::from(addr) & mask,
             prefix_len,
         })
+    }
+}
+
+impl std::fmt::Display for Subnet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", Ipv4Addr::from(self.network), self.prefix_len)
     }
 }
 
@@ -150,10 +157,20 @@ struct Agent {
 
 /// Runs the agent until SIGTERM or SIGINT, then tears down every VM and
 /// removes the socket, console logs, and the jail tree and parent cgroup
-/// once empty.
+/// once empty. The Node's egress policy is ensured first, and outlives the
+/// agent.
 pub async fn run(config: Config) -> io::Result<()> {
     let logs_dir = config.state_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
+
+    // Fail closed: no VM starts without the egress policy in place.
+    let egress_iface = egress::default_route_iface();
+    if egress_iface.is_none() {
+        eprintln!("cirro node: no IPv4 default route, so VMs won't reach the internet");
+    }
+    egress::enable_ip_forward(&config.state_dir.join("ip_forward.before"))?;
+    egress::ensure_node_policy(&config.subnet.to_string(), egress_iface.as_deref())
+        .map_err(|e| io::Error::other(format!("apply the Node's egress policy: {e}")))?;
     let agent = Arc::new(Agent {
         node: vm::NodeConfig {
             firecracker: config.firecracker,
