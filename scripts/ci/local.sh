@@ -26,6 +26,7 @@ step "hygiene"
 scripts/ci/check-hygiene.sh
 step "CI script tests"
 scripts/ci/tests/check-commits.test.sh
+scripts/ci/tests/changes.test.sh
 step "rustfmt"
 cargo fmt --all --check
 step "clippy"
