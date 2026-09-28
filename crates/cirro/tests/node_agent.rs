@@ -2,6 +2,9 @@
 //! state dir, socket and Node subnet, driven only through the `cirro` CLI.
 //! Every test ends by asserting the Node holds no Cirrocumulus state.
 //!
+//! Tests run in parallel, so each one gets its own Node subnet and only
+//! checks for leftovers belonging to that subnet.
+//!
 //! Skipped (not failed) when `/dev/kvm` is missing, or when the test
 //! agent's sudoers rule isn't set up. The rule names a fixed path the
 //! freshly built `cirro` is copied to before each run:
@@ -24,10 +27,9 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-const SUBNET: &str = "10.77.250.0/24";
-const SUBNET_PREFIX: &str = "10.77.250.";
 const HTTP_PORT: u16 = 8080;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -71,67 +73,121 @@ fn latest_kernel() -> PathBuf {
 
 /// Copies the freshly built `cirro` to the sudoers-approved path (via a
 /// rename, so a half-written binary is never runnable there) and checks
-/// `sudo -n` will run it. `None` means the rule is missing.
-fn install_test_agent() -> Option<PathBuf> {
-    let path = test_agent_path();
-    std::fs::create_dir_all(path.parent().unwrap()).expect("create test agent dir");
-    let staging = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::copy(env!("CARGO_BIN_EXE_cirro"), &staging).expect("stage test agent binary");
-    std::fs::rename(&staging, &path).expect("install test agent binary");
-
-    let ok = std::process::Command::new("sudo")
-        .arg("-n")
-        .arg(&path)
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    ok.then_some(path)
+/// `sudo -n` will run it, once per test run. `None` means the rule is
+/// missing.
+fn test_agent() -> Option<&'static Path> {
+    static AGENT: OnceLock<Option<PathBuf>> = OnceLock::new();
+    AGENT
+        .get_or_init(|| {
+            let path = test_agent_path();
+            std::fs::create_dir_all(path.parent().unwrap()).expect("create test agent dir");
+            let staging = path.with_extension(format!("tmp-{}", std::process::id()));
+            std::fs::copy(env!("CARGO_BIN_EXE_cirro"), &staging).expect("stage test agent");
+            std::fs::rename(&staging, &path).expect("install test agent binary");
+            let ok = std::process::Command::new("sudo")
+                .arg("-n")
+                .arg(&path)
+                .arg("--version")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            ok.then_some(path)
+        })
+        .as_deref()
 }
 
-/// A rootfs with guest-init as `/init` and the HTTP fixture as
-/// `/app/http_app`, built without root via `mkfs.ext4 -d`.
-fn build_http_rootfs(dir: &Path) -> PathBuf {
-    let tree = dir.join("rootfs-tree");
-    for sub in ["proc", "sys", "dev", "app"] {
-        std::fs::create_dir_all(tree.join(sub)).expect("create rootfs tree");
-    }
-    let guest_init =
-        repo_root().join("target/guest-init-embed/x86_64-unknown-linux-musl/release/guest-init");
-    std::fs::copy(&guest_init, tree.join("init")).expect("copy guest-init into rootfs tree");
+/// The rootfs images the tests boot, built once per test run without root
+/// (`mkfs.ext4 -d`). Every image carries the fixture commands under `/app`.
+struct Rootfs {
+    /// guest-init as `/init`.
+    guest_init: PathBuf,
+    /// No `/init` at all, so the guest never starts guest-init.
+    no_init: PathBuf,
+}
 
-    let status = std::process::Command::new("rustc")
-        .args(["--target", "x86_64-unknown-linux-musl", "-O", "-o"])
-        .arg(tree.join("app/http_app"))
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/http_app.rs"))
-        .status()
-        .expect("run rustc");
-    assert!(status.success(), "building the HTTP fixture failed");
+fn rootfs() -> &'static Rootfs {
+    static ROOTFS: OnceLock<Rootfs> = OnceLock::new();
+    ROOTFS.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("node-agent-rootfs");
+        let tree = dir.join("tree");
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["proc", "sys", "dev", "app"] {
+            std::fs::create_dir_all(tree.join(sub)).expect("create rootfs tree");
+        }
+        for fixture in ["http_app", "ignore_term"] {
+            let status = std::process::Command::new("rustc")
+                .args(["--target", "x86_64-unknown-linux-musl", "-O", "-o"])
+                .arg(tree.join("app").join(fixture))
+                .arg(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join(format!("tests/fixtures/{fixture}.rs")),
+                )
+                .status()
+                .expect("run rustc");
+            assert!(status.success(), "building the {fixture} fixture failed");
+        }
+        let no_init = make_image(&tree, &dir.join("no-init.ext4"));
+        let guest_init_bin = repo_root()
+            .join("target/guest-init-embed/x86_64-unknown-linux-musl/release/guest-init");
+        std::fs::copy(&guest_init_bin, tree.join("init")).expect("copy guest-init into tree");
+        let guest_init = make_image(&tree, &dir.join("guest-init.ext4"));
+        Rootfs {
+            guest_init,
+            no_init,
+        }
+    })
+}
 
-    let image = dir.join("rootfs.ext4");
-    let file = std::fs::File::create(&image).expect("create rootfs image");
+fn make_image(tree: &Path, image: &Path) -> PathBuf {
+    let file = std::fs::File::create(image).expect("create rootfs image");
     file.set_len(32 * 1024 * 1024).expect("size rootfs image");
     let status = std::process::Command::new("mkfs.ext4")
         .args(["-q", "-F", "-d"])
-        .arg(&tree)
-        .arg(&image)
+        .arg(tree)
+        .arg(image)
         .status()
         .expect("run mkfs.ext4");
     assert!(status.success(), "mkfs.ext4 failed");
-    image
+    image.to_path_buf()
 }
 
-/// A throwaway Node agent. Dropping it stops the agent and removes its
-/// state dir, so a failed assertion doesn't strand anything.
+/// A throwaway Node agent on Node subnet `10.77.<octet>.0/24`. Dropping it
+/// stops the agent and removes its state dir, so a failed assertion doesn't
+/// strand anything.
 struct Agent {
     sudo: Child,
+    octet: u8,
     state_dir: PathBuf,
     socket: PathBuf,
 }
 
 impl Agent {
-    fn start(agent_bin: &Path, state_dir: PathBuf) -> Agent {
+    /// Starts an agent whose socket belongs to the test user's group, or
+    /// returns `None` (after saying why) when the test has to skip.
+    fn start(octet: u8) -> Option<Agent> {
+        Agent::start_with_socket_group(octet, &getgid().as_raw().to_string())
+    }
+
+    fn start_with_socket_group(octet: u8, socket_group: &str) -> Option<Agent> {
+        if !Path::new("/dev/kvm").exists() {
+            eprintln!("skipping: /dev/kvm not present");
+            return None;
+        }
+        let Some(agent_bin) = test_agent() else {
+            eprintln!(
+                "skipping: `sudo -n {} --version` failed -- add the NOPASSWD sudoers rule \
+                 in this test's module doc first",
+                test_agent_path().display()
+            );
+            return None;
+        };
+
+        // Under $HOME, not /tmp: jailer mknods /dev/kvm in the jail, and /tmp
+        // is usually a nodev tmpfs. Kept short so jail socket paths fit in a
+        // sockaddr_un.
+        let state_dir = home().join(format!(".cache/cirro-t{}-{octet}", std::process::id()));
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
         let socket = state_dir.join("agent.sock");
         let repo = repo_root();
         let sudo = std::process::Command::new("sudo")
@@ -141,8 +197,8 @@ impl Agent {
             .arg(&state_dir)
             .arg("--socket")
             .arg(&socket)
-            .args(["--socket-group", &getgid().as_raw().to_string()])
-            .args(["--subnet", SUBNET])
+            .args(["--socket-group", socket_group])
+            .args(["--subnet", &format!("10.77.{octet}.0/24")])
             .arg("--firecracker")
             .arg(repo.join("firecracker"))
             .arg("--jailer")
@@ -153,6 +209,7 @@ impl Agent {
             .expect("start the Node agent");
         let agent = Agent {
             sudo,
+            octet,
             state_dir,
             socket,
         };
@@ -165,13 +222,67 @@ impl Agent {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
-        agent
+        Some(agent)
     }
 
     fn cirro(&self) -> Command {
         let mut cmd = Command::cargo_bin("cirro").unwrap();
         cmd.env("CIRRO_SOCKET", &self.socket);
         cmd
+    }
+
+    /// `cirro run --name <name> <rootfs> -- <command...>`.
+    fn run(&self, name: &str, rootfs: &Path, command: &[&str]) -> assert_cmd::assert::Assert {
+        self.cirro()
+            .args(["run", "--name", name])
+            .arg(rootfs)
+            .arg("--")
+            .args(command)
+            .assert()
+    }
+
+    /// `cirro ps`, or `cirro ps -a` when `all`.
+    fn ps(&self, all: bool) -> String {
+        let mut cmd = self.cirro();
+        cmd.arg("ps");
+        if all {
+            cmd.arg("-a");
+        }
+        stdout(cmd.assert().success())
+    }
+
+    fn subnet_prefix(&self) -> String {
+        format!("10.77.{}.", self.octet)
+    }
+
+    /// Everything a VM could leave on the Node, as seen from outside the
+    /// agent. Host object names embed the Node subnet's third octet.
+    fn assert_no_cirro_state(&self) {
+        let id_prefix = format!("cirro-{:02x}", self.octet);
+        let netns = stdout_of(&["ip", "netns", "list"]);
+        assert!(
+            !netns.lines().any(|l| l.starts_with(&id_prefix)),
+            "leftover network namespaces:\n{netns}"
+        );
+        let links = stdout_of(&["ip", "-o", "link", "show"]);
+        assert!(!links.contains(&id_prefix), "leftover links:\n{links}");
+        let routes = stdout_of(&["ip", "route", "show"]);
+        assert!(
+            !routes.contains(&self.subnet_prefix()),
+            "leftover routes into the Node subnet:\n{routes}"
+        );
+        let jails: Vec<_> = std::fs::read_dir(self.state_dir.join("jail/firecracker"))
+            .into_iter()
+            .flatten()
+            .collect();
+        assert!(jails.is_empty(), "leftover jail dirs: {jails:?}");
+        let cgroups: Vec<_> = std::fs::read_dir("/sys/fs/cgroup/cirro")
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(&id_prefix))
+            .collect();
+        assert!(cgroups.is_empty(), "leftover VM cgroups: {cgroups:?}");
     }
 }
 
@@ -182,6 +293,20 @@ impl Drop for Agent {
         let _ = self.sudo.wait();
         let _ = std::fs::remove_dir_all(&self.state_dir);
     }
+}
+
+fn stdout(assert: assert_cmd::assert::Assert) -> String {
+    String::from_utf8_lossy(&assert.get_output().stdout).into_owned()
+}
+
+fn stderr(assert: assert_cmd::assert::Assert) -> String {
+    String::from_utf8_lossy(&assert.get_output().stderr).into_owned()
+}
+
+/// The `ps` row for `name`, if listed.
+fn row<'a>(ps: &'a str, name: &str) -> Option<&'a str> {
+    ps.lines()
+        .find(|l| l.split_whitespace().next() == Some(name))
 }
 
 fn http_get(address: &str, port: u16) -> std::io::Result<String> {
@@ -220,70 +345,22 @@ fn stdout_of(args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-/// Everything a VM could leave on the Node, as seen from outside the agent.
-fn assert_no_cirro_state(state_dir: &Path) {
-    let netns = stdout_of(&["ip", "netns", "list"]);
-    assert!(
-        !netns.lines().any(|l| l.starts_with("cirro-")),
-        "leftover network namespaces:\n{netns}"
-    );
-    let links = stdout_of(&["ip", "-o", "link", "show"]);
-    assert!(!links.contains("cirro-"), "leftover links:\n{links}");
-    let routes = stdout_of(&["ip", "route", "show"]);
-    assert!(
-        !routes.contains(SUBNET_PREFIX),
-        "leftover routes into {SUBNET}:\n{routes}"
-    );
-    let jails: Vec<_> = std::fs::read_dir(state_dir.join("jail/firecracker"))
-        .into_iter()
-        .flatten()
-        .collect();
-    assert!(jails.is_empty(), "leftover jail dirs: {jails:?}");
-    let cgroups: Vec<_> = std::fs::read_dir("/sys/fs/cgroup/cirro")
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with("cirro-"))
-        .collect();
-    assert!(cgroups.is_empty(), "leftover VM cgroups: {cgroups:?}");
-}
-
 #[test]
 fn run_serves_http_at_the_vm_address_and_stop_force_leaves_nothing() {
-    if !Path::new("/dev/kvm").exists() {
-        eprintln!("skipping: /dev/kvm not present");
-        return;
-    }
-    let Some(agent_bin) = install_test_agent() else {
-        eprintln!(
-            "skipping: `sudo -n {} --version` failed -- add the NOPASSWD sudoers rule \
-             in this test's module doc first",
-            test_agent_path().display()
-        );
+    let Some(agent) = Agent::start(250) else {
         return;
     };
 
-    // Under $HOME, not /tmp: jailer mknods /dev/kvm in the jail, and /tmp
-    // is usually a nodev tmpfs. Kept short so jail socket paths fit in a
-    // sockaddr_un.
-    let state_dir = home().join(format!(".cache/cirro-t{}", std::process::id()));
-    std::fs::create_dir_all(&state_dir).expect("create state dir");
-    let rootfs = build_http_rootfs(&state_dir);
-    let agent = Agent::start(&agent_bin, state_dir.clone());
-
-    let run = agent
-        .cirro()
-        .args(["run", "--name", "web"])
-        .arg(&rootfs)
-        .args(["--", "/app/http_app"])
-        .assert()
-        .success();
-    let address = String::from_utf8_lossy(&run.get_output().stdout)
-        .trim()
-        .to_string();
+    let address = stdout(
+        agent
+            .run("web", &rootfs().guest_init, &["/app/http_app"])
+            .success(),
+    )
+    .trim()
+    .to_string();
     assert!(
-        address.starts_with(SUBNET_PREFIX),
-        "`cirro run` should print a VM address in {SUBNET}, got {address:?}"
+        address.starts_with(&agent.subnet_prefix()),
+        "`cirro run` should print a VM address in the Node subnet, got {address:?}"
     );
 
     let response = wait_for_http(&address, HTTP_PORT);
@@ -292,12 +369,8 @@ fn run_serves_http_at_the_vm_address_and_stop_force_leaves_nothing() {
         "unexpected response from the VM: {response:?}"
     );
 
-    let ps = agent.cirro().arg("ps").assert().success();
-    let ps = String::from_utf8_lossy(&ps.get_output().stdout).into_owned();
-    let web = ps
-        .lines()
-        .find(|l| l.split_whitespace().next() == Some("web"))
-        .unwrap_or_else(|| panic!("`cirro ps` doesn't list web:\n{ps}"));
+    let ps = agent.ps(false);
+    let web = row(&ps, "web").unwrap_or_else(|| panic!("`cirro ps` doesn't list web:\n{ps}"));
     assert!(web.contains(&address), "ps row lacks the VM address: {web}");
     assert!(web.contains("256M"), "ps row lacks the memory: {web}");
 
@@ -307,12 +380,262 @@ fn run_serves_http_at_the_vm_address_and_stop_force_leaves_nothing() {
         .assert()
         .success();
 
-    let ps = agent.cirro().arg("ps").assert().success();
-    let ps = String::from_utf8_lossy(&ps.get_output().stdout).into_owned();
+    let ps = agent.ps(false);
     assert!(
-        !ps.lines()
-            .any(|l| l.split_whitespace().next() == Some("web")),
+        row(&ps, "web").is_none(),
         "web is still listed after stop --force:\n{ps}"
     );
-    assert_no_cirro_state(&state_dir);
+    agent.assert_no_cirro_state();
+}
+
+#[test]
+fn invalid_and_duplicate_names_are_refused() {
+    let Some(agent) = Agent::start(251) else {
+        return;
+    };
+
+    let too_long = "a".repeat(33);
+    for name in ["Web", "web_1", "web.1", "", too_long.as_str()] {
+        let err = stderr(
+            agent
+                .run(name, &rootfs().guest_init, &["/app/http_app"])
+                .failure(),
+        );
+        assert!(
+            err.contains("name"),
+            "refusing {name:?} should explain the name rules, got: {err}"
+        );
+    }
+    let longest = "a".repeat(32);
+    agent
+        .run(&longest, &rootfs().guest_init, &["/app/http_app"])
+        .success();
+
+    agent
+        .run("web-1", &rootfs().guest_init, &["/app/http_app"])
+        .success();
+    let err = stderr(
+        agent
+            .run("web-1", &rootfs().guest_init, &["/app/http_app"])
+            .failure(),
+    );
+    assert!(
+        err.contains("already exists"),
+        "a duplicate name should be refused, got: {err}"
+    );
+
+    for name in [longest.as_str(), "web-1"] {
+        agent
+            .cirro()
+            .args(["stop", "--force", name])
+            .assert()
+            .success();
+    }
+    agent.assert_no_cirro_state();
+}
+
+/// Polls `cirro logs <name>` until it contains `marker`.
+fn wait_for_log(agent: &Agent, name: &str, marker: &str) -> String {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let logs = stdout(agent.cirro().args(["logs", name]).assert().success());
+        if logs.contains(marker) {
+            return logs;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "`cirro logs {name}` never showed {marker:?}; got:\n{logs}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn graceful_stop_leaves_an_ended_vm_whose_logs_last_until_rm() {
+    let Some(agent) = Agent::start(252) else {
+        return;
+    };
+
+    agent
+        .run("web", &rootfs().guest_init, &["/app/http_app"])
+        .success();
+    wait_for_log(&agent, "web", "HTTP_APP_LISTENING");
+    let err = stderr(agent.cirro().args(["rm", "web"]).assert().failure());
+    assert!(
+        err.contains("running"),
+        "rm should refuse a running VM, got: {err}"
+    );
+
+    agent.cirro().args(["stop", "web"]).assert().success();
+    assert!(
+        row(&agent.ps(false), "web").is_none(),
+        "plain ps should not list an Ended VM"
+    );
+    let ps = agent.ps(true);
+    let ended = row(&ps, "web").unwrap_or_else(|| panic!("ps -a doesn't list web:\n{ps}"));
+    assert!(ended.contains("graceful"), "end reason missing: {ended}");
+    wait_for_log(&agent, "web", "HTTP_APP_LISTENING");
+
+    // Reusing the name replaces the Ended VM's record.
+    agent
+        .run("web", &rootfs().guest_init, &["/app/http_app"])
+        .success();
+    let ps = agent.ps(true);
+    let rows: Vec<_> = ps
+        .lines()
+        .filter(|l| l.split_whitespace().next() == Some("web"))
+        .collect();
+    assert_eq!(rows.len(), 1, "one record per name:\n{ps}");
+    assert!(
+        !rows[0].contains("graceful"),
+        "old record kept: {}",
+        rows[0]
+    );
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "web"])
+        .assert()
+        .success();
+    let ps = agent.ps(true);
+    let ended = row(&ps, "web").unwrap_or_else(|| panic!("ps -a doesn't list web:\n{ps}"));
+    assert!(ended.contains("forced"), "end reason missing: {ended}");
+
+    agent.cirro().args(["rm", "web"]).assert().success();
+    assert!(row(&agent.ps(true), "web").is_none(), "rm left the record");
+    agent.cirro().args(["logs", "web"]).assert().failure();
+    agent.assert_no_cirro_state();
+}
+
+#[test]
+fn graceful_stop_forces_a_vm_that_ignores_sigterm_after_its_timeout() {
+    let Some(agent) = Agent::start(253) else {
+        return;
+    };
+
+    agent
+        .run("stubborn", &rootfs().guest_init, &["/app/ignore_term"])
+        .success();
+    wait_for_log(&agent, "stubborn", "IGNORE_TERM_STARTED");
+
+    let started = Instant::now();
+    agent
+        .cirro()
+        .args(["stop", "--timeout", "2", "stubborn"])
+        .assert()
+        .success();
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_secs(2) && took < Duration::from_secs(8),
+        "stop --timeout 2 should give up after about 2s, took {took:?}"
+    );
+    let ps = agent.ps(true);
+    let ended = row(&ps, "stubborn").unwrap_or_else(|| panic!("ps -a lacks stubborn:\n{ps}"));
+    assert!(ended.contains("forced"), "end reason missing: {ended}");
+    // guest-init did pass the stop on, and the command ignored it.
+    wait_for_log(&agent, "stubborn", "GUEST_INIT_FORWARDING_SIGTERM");
+    agent.assert_no_cirro_state();
+}
+
+#[test]
+fn run_reports_why_a_vm_failed_to_start_and_leaves_nothing() {
+    let Some(agent) = Agent::start(254) else {
+        return;
+    };
+
+    // No guest-init: the guest kernel finds no init and panics.
+    let started = Instant::now();
+    let err = stderr(
+        agent
+            .run("no-init", &rootfs().no_init, &["/app/http_app"])
+            .failure(),
+    );
+    assert!(
+        err.contains("crashed") && err.contains("Kernel panic"),
+        "run should say the VM crashed and show the console tail, got:\n{err}"
+    );
+    assert!(
+        started.elapsed() < TIMEOUT,
+        "a guest that panics should fail run at once, not at the config timeout"
+    );
+
+    // A command that doesn't exist: guest-init can't exec it and the VM ends.
+    let err = stderr(
+        agent
+            .run("no-cmd", &rootfs().guest_init, &["/app/does-not-exist"])
+            .failure(),
+    );
+    assert!(
+        err.contains("exited on its own") && err.contains("execv"),
+        "run should say the VM exited and show why, got:\n{err}"
+    );
+
+    let ps = agent.ps(true);
+    for name in ["no-init", "no-cmd"] {
+        assert!(
+            row(&ps, name).is_none(),
+            "a failed run left a record:\n{ps}"
+        );
+    }
+    agent.assert_no_cirro_state();
+}
+
+#[test]
+fn a_user_outside_the_socket_group_gets_a_clear_permission_error() {
+    // The test user isn't in group 0 (root), so the socket is closed to it.
+    let Some(agent) = Agent::start_with_socket_group(249, "0") else {
+        return;
+    };
+    let err = stderr(agent.cirro().arg("ps").assert().failure());
+    assert!(
+        err.contains("permission denied") && err.contains("group"),
+        "expected a permission error naming the group, got: {err}"
+    );
+}
+
+#[test]
+fn logs_follow_streams_a_running_vm_until_it_ends() {
+    let Some(agent) = Agent::start(248) else {
+        return;
+    };
+    agent
+        .run("web", &rootfs().guest_init, &["/app/http_app"])
+        .success();
+
+    let mut follow = std::process::Command::new(env!("CARGO_BIN_EXE_cirro"))
+        .env("CIRRO_SOCKET", &agent.socket)
+        .args(["logs", "-f", "web"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start cirro logs -f");
+    wait_for_log(&agent, "web", "HTTP_APP_LISTENING");
+    agent.cirro().args(["stop", "web"]).assert().success();
+
+    let deadline = Instant::now() + TIMEOUT;
+    let status = loop {
+        if let Some(status) = follow.try_wait().expect("poll cirro logs -f") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = follow.kill();
+            panic!("`cirro logs -f` kept running after the VM ended");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(status.success(), "`cirro logs -f` failed: {status}");
+    let mut output = String::new();
+    follow
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    // Output from before and after the stop: it followed, not just dumped.
+    for marker in ["HTTP_APP_LISTENING", "GUEST_INIT_FORWARDING_SIGTERM"] {
+        assert!(
+            output.contains(marker),
+            "logs -f missed {marker}:\n{output}"
+        );
+    }
+    agent.assert_no_cirro_state();
 }

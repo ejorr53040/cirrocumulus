@@ -3,8 +3,10 @@
 //!
 //! [`Vm::start`] does every host-side step in order, and each step pushes
 //! its undo onto a stack before the next one runs. A failure part-way
-//! through unwinds that stack, and [`Vm::kill`] unwinds it for a VM that
-//! started, so both paths leave the Node exactly as they found it.
+//! through unwinds that stack. A VM that started is then owned by
+//! [`Vm::supervise`] until it ends, whether it stops gracefully, is forced,
+//! or exits or crashes on its own. Every one of those paths unwinds the
+//! same stack, so the Node is left exactly as it was found.
 //!
 //! Networking follows ADRs 0001 and 0003. Each VM gets its own network
 //! namespace holding its tap. The guest always configures the same Guest
@@ -19,6 +21,8 @@
 //! to find them again.
 
 use crate::firecracker::{BootConfig, Client};
+use cirro_proto::EndReason;
+use std::io::{Read, Seek, SeekFrom};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -26,6 +30,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
+use tokio::sync::mpsc;
 
 /// The address every guest configures on `eth0` (ADR 0003).
 pub const GUEST_ADDRESS: Ipv4Addr = Ipv4Addr::new(172, 16, 0, 2);
@@ -41,6 +46,12 @@ const VSOCK_GUEST_CID: u32 = 3;
 const VSOCK_SOCKET_IN_JAIL: &str = "v.sock";
 /// How long guest-init has to accept its config before `start` gives up.
 const CONFIG_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a VM must stay up after getting its config for `start` to
+/// count it as started: a command that fails at once is reported by `run`
+/// rather than looking like success.
+const START_GRACE: Duration = Duration::from_secs(2);
+/// How many console lines a failed start reports.
+const CONSOLE_TAIL_LINES: usize = 10;
 /// How long jailer has to bring up Firecracker's API socket.
 const API_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
 /// Fixed VMM overhead added to the guest's memory for the cgroup ceiling,
@@ -60,8 +71,6 @@ pub struct NodeConfig {
     /// jailer's `--chroot-base-dir`. Must not be on a `nodev` mount, and must
     /// be short enough that jail socket paths fit in a `sockaddr_un`.
     pub jail_base: PathBuf,
-    /// Where console logs go while a VM runs.
-    pub state_dir: PathBuf,
     /// The Node's own address in the Node subnet (`.1`).
     pub node_address: Ipv4Addr,
 }
@@ -73,6 +82,19 @@ pub struct VmSpec {
     pub mem_mib: u32,
     pub vcpus: u8,
     pub command: Vec<String>,
+    /// Where the console goes. Created (or truncated) by `start` and never
+    /// removed here: it outlives the VM as its Ended VM's log.
+    pub console_log: PathBuf,
+}
+
+/// A request to [`Vm::supervise`] to stop the VM.
+#[derive(Debug, Clone, Copy)]
+pub enum Stop {
+    /// Send Ctrl-Alt-Del (guest-init turns it into SIGTERM for the command),
+    /// then kill the VMM if the VM hasn't ended within `timeout`.
+    Graceful { timeout: Duration },
+    /// Kill the VMM now.
+    Force,
 }
 
 #[derive(Debug)]
@@ -88,7 +110,13 @@ impl std::error::Error for Error {}
 
 /// A started VM, holding everything needed to tear it down.
 pub struct Vm {
+    /// The VMM: jailer execs into Firecracker without forking, so this is
+    /// Firecracker itself once spawned. Always the last thing started, so
+    /// teardown kills it before unwinding `undo`.
+    vmm: Option<Child>,
     undo: Vec<Undo>,
+    api_socket: PathBuf,
+    console_log: PathBuf,
 }
 
 /// The name of every host object belonging to the VM at `vm_address`, e.g.
@@ -106,21 +134,75 @@ pub fn parent_cgroup() -> PathBuf {
 
 impl Vm {
     /// Brings up the VM described by `spec`, returning once guest-init has
-    /// its config. On failure, everything done so far is undone first.
+    /// its config and the VM has stayed up for a 2 s grace period. On failure,
+    /// everything done so far is undone first, and the error says why the
+    /// VM didn't start, with the tail of its console when there is one.
     pub async fn start(node: &NodeConfig, spec: &VmSpec) -> Result<Vm, Error> {
-        let mut vm = Vm { undo: Vec::new() };
+        let mut vm = Vm {
+            vmm: None,
+            undo: Vec::new(),
+            api_socket: PathBuf::new(),
+            console_log: spec.console_log.clone(),
+        };
         match vm.start_steps(node, spec).await {
             Ok(()) => Ok(vm),
             Err(e) => {
-                vm.kill().await;
+                vm.teardown().await;
                 Err(e)
             }
         }
     }
 
-    /// Kills the VM's Firecracker process immediately and removes all of
-    /// its host state.
-    pub async fn kill(mut self) {
+    /// Owns the VM until it ends, then removes all of its host state and
+    /// says why it ended: on its own (exited or crashed), or because of a
+    /// [`Stop`] from `stops`. A closed `stops` counts as [`Stop::Force`].
+    pub async fn supervise(mut self, mut stops: mpsc::Receiver<Stop>) -> EndReason {
+        let reason = self.run_until_ended(&mut stops).await;
+        self.teardown().await;
+        reason
+    }
+
+    async fn run_until_ended(&mut self, stops: &mut mpsc::Receiver<Stop>) -> EndReason {
+        let client = Client::new(&self.api_socket);
+        let console_log = self.console_log.clone();
+        let vmm = self.vmm.as_mut().expect("a started VM has a VMM");
+        tokio::select! {
+            status = vmm.wait() => natural_end(status, &console_log),
+            stop = stops.recv() => match stop {
+                Some(Stop::Graceful { timeout }) => {
+                    if client.send_ctrl_alt_del().await.is_err() {
+                        kill(vmm).await;
+                        return EndReason::Forced;
+                    }
+                    let deadline = tokio::time::sleep(timeout);
+                    tokio::pin!(deadline);
+                    loop {
+                        tokio::select! {
+                            _ = vmm.wait() => return EndReason::Graceful,
+                            _ = &mut deadline => break,
+                            stop = stops.recv() => match stop {
+                                Some(Stop::Graceful { .. }) => continue,
+                                Some(Stop::Force) | None => break,
+                            },
+                        }
+                    }
+                    kill(vmm).await;
+                    EndReason::Forced
+                }
+                Some(Stop::Force) | None => {
+                    kill(vmm).await;
+                    EndReason::Forced
+                }
+            },
+        }
+    }
+
+    /// Kills the VMM if it's still running, then unwinds every registered
+    /// start step.
+    async fn teardown(&mut self) {
+        if let Some(vmm) = self.vmm.as_mut() {
+            kill(vmm).await;
+        }
         while let Some(step) = self.undo.pop() {
             if let Err(e) = step.run().await {
                 eprintln!("cirro node: teardown: {e}");
@@ -197,14 +279,12 @@ impl Vm {
         // 4. jailer, in the namespace and under the VM's cgroup limits.
         let jail_dir = node.jail_base.join("firecracker").join(&id);
         let root = jail_dir.join("root");
-        let console_path = node.state_dir.join(format!("{id}.console.log"));
         self.undo.push(Undo::RemoveDir(jail_dir));
-        self.undo.push(Undo::RemoveFile(console_path.clone()));
         self.undo
             .push(Undo::RemoveCgroup(parent_cgroup().join(&id)));
         std::fs::create_dir_all(&node.jail_base).map_err(|e| err("create jail base dir", e))?;
         let console =
-            std::fs::File::create(&console_path).map_err(|e| err("create console log", e))?;
+            std::fs::File::create(&self.console_log).map_err(|e| err("create console log", e))?;
         let memory_max = (u64::from(spec.mem_mib) + VMM_OVERHEAD_MIB) * 1024 * 1024;
         let cpu_max = format!("cpu.max={} 100000", u32::from(spec.vcpus) * 100_000);
         let child = Command::new(&node.jailer)
@@ -234,15 +314,16 @@ impl Vm {
             .stderr(console)
             .spawn()
             .map_err(|e| err("spawn jailer", e))?;
-        self.undo.push(Undo::KillVmm(child));
+        self.vmm = Some(child);
 
         let api_socket = root.join("run/firecracker.socket");
+        self.api_socket = api_socket.clone();
         let deadline = Instant::now() + API_SOCKET_TIMEOUT;
         while !api_socket.exists() {
             if let Some(status) = self.vmm_exit_status() {
                 return Err(Error(format!(
-                    "jailer exited ({status}) before Firecracker was up: {}",
-                    console_tail(&console_path)
+                    "jailer exited ({status}) before Firecracker was up; last console lines:\n{}",
+                    console_tail(&self.console_log)
                 )));
             }
             if Instant::now() >= deadline {
@@ -293,34 +374,118 @@ impl Vm {
             .await
             .map_err(|e| err("boot", e))?;
 
-        // 6. guest-init's config over vsock.
-        deliver_config(&root.join(VSOCK_SOCKET_IN_JAIL), &spec.command).await
+        // 6. guest-init's config over vsock, then the grace period.
+        self.deliver_config(&root.join(VSOCK_SOCKET_IN_JAIL), &spec.command)
+            .await?;
+        let vmm = self.vmm.as_mut().expect("the VMM was just spawned");
+        match tokio::time::timeout(START_GRACE, vmm.wait()).await {
+            Err(_) => Ok(()),
+            Ok(status) => Err(self.ended_during_start(status)),
+        }
     }
-}
 
-impl Vm {
+    /// Sends guest-init its config with Firecracker's host-initiated vsock
+    /// handshake: connect to the jail's vsock socket, send `CONNECT <port>`,
+    /// wait for `OK`, write the JSON, then close. Until guest-init is
+    /// listening, Firecracker drops the connection instead of answering
+    /// `OK`, so this retries from scratch until [`CONFIG_TIMEOUT`], giving up
+    /// early if the VM ends first.
+    async fn deliver_config(&mut self, vsock: &Path, command: &[String]) -> Result<(), Error> {
+        let (exec, args) = command
+            .split_first()
+            .ok_or_else(|| Error("no command to run".into()))?;
+        let config = format!(
+            "{{\"exec\":{},\"args\":{}}}",
+            json_string(exec),
+            json_array(args)
+        );
+        let deadline = Instant::now() + CONFIG_TIMEOUT;
+        let mut last_error = String::from("never tried");
+        while Instant::now() < deadline {
+            if let Some(status) = self.vmm_exit_status() {
+                return Err(self.ended_during_start(Ok(status)));
+            }
+            match try_deliver_config(vsock, &config).await {
+                Ok(()) => return Ok(()),
+                Err(e) => last_error = e,
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err(Error(format!(
+            "guest-init never accepted its config within {CONFIG_TIMEOUT:?} ({last_error}); \
+             does the rootfs have guest-init as /init?"
+        )))
+    }
+
     /// Whether the VMM process has already exited, and how. `None` while it
     /// runs, or before it's been spawned.
     fn vmm_exit_status(&mut self) -> Option<std::process::ExitStatus> {
-        self.undo.iter_mut().find_map(|step| match step {
-            Undo::KillVmm(child) => child.try_wait().ok().flatten(),
-            _ => None,
-        })
+        self.vmm.as_mut()?.try_wait().ok().flatten()
+    }
+
+    fn ended_during_start(&self, status: std::io::Result<std::process::ExitStatus>) -> Error {
+        let how = match natural_end(status, &self.console_log) {
+            EndReason::Crashed => "crashed",
+            _ => "exited on its own",
+        };
+        // A panic's register dump pushes its reason out of the tail.
+        let panic = console_tail_bytes(&self.console_log)
+            .lines()
+            .rev()
+            .find(|l| l.contains("Kernel panic"))
+            .map(|l| format!(" ({})", l.trim()))
+            .unwrap_or_default();
+        Error(format!(
+            "the VM {how} while starting{panic}; last console lines:\n{}",
+            console_tail(&self.console_log)
+        ))
     }
 }
 
-/// The last few lines of a console log, for error messages. The log itself
-/// is removed with the rest of the VM's host state.
-fn console_tail(path: &Path) -> String {
-    const LINES: usize = 5;
-    let console = std::fs::read_to_string(path).unwrap_or_default();
-    let lines: Vec<&str> = console.lines().collect();
-    let tail = lines[lines.len().saturating_sub(LINES)..].join(" | ");
-    if tail.is_empty() {
-        "no console output".to_string()
-    } else {
-        tail
+async fn kill(vmm: &mut Child) {
+    let _ = vmm.start_kill();
+    let _ = vmm.wait().await;
+}
+
+/// Why a VM ended when nothing asked it to. guest-init reboots the guest
+/// once its command exits, which Firecracker exits cleanly on; a guest
+/// kernel panic takes the same reboot path (`panic=1`), so the console is
+/// what tells the two apart.
+fn natural_end(status: std::io::Result<std::process::ExitStatus>, console_log: &Path) -> EndReason {
+    let panicked = console_tail_bytes(console_log).contains("Kernel panic");
+    match status {
+        Ok(s) if s.success() && !panicked => EndReason::Exited,
+        _ => EndReason::Crashed,
     }
+}
+
+/// The last [`CONSOLE_TAIL_LINES`] lines of a console log, indented, for
+/// error messages.
+fn console_tail(path: &Path) -> String {
+    let console = console_tail_bytes(path);
+    let lines: Vec<&str> = console.lines().collect();
+    let tail = &lines[lines.len().saturating_sub(CONSOLE_TAIL_LINES)..];
+    if tail.is_empty() {
+        "  (no console output)".to_string()
+    } else {
+        tail.iter()
+            .map(|l| format!("  {l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// The end of a console log, without reading all of a long one.
+fn console_tail_bytes(path: &Path) -> String {
+    const TAIL_BYTES: u64 = 16 * 1024;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let len = file.metadata().map_or(0, |m| m.len());
+    let _ = file.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)));
+    let mut bytes = Vec::new();
+    let _ = file.read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// One step of teardown, registered as the matching start step succeeds.
@@ -328,9 +493,7 @@ enum Undo {
     DeleteNetns(String),
     DeleteLink(String),
     RemoveDir(PathBuf),
-    RemoveFile(PathBuf),
     RemoveCgroup(PathBuf),
-    KillVmm(Child),
 }
 
 impl Undo {
@@ -339,18 +502,7 @@ impl Undo {
             Undo::DeleteNetns(name) => ip(&["netns", "del", &name]).await,
             Undo::DeleteLink(name) => ip(&["link", "del", &name]).await,
             Undo::RemoveDir(path) => remove_if_present(std::fs::remove_dir_all(&path), &path),
-            Undo::RemoveFile(path) => remove_if_present(std::fs::remove_file(&path), &path),
             Undo::RemoveCgroup(path) => remove_if_present(std::fs::remove_dir(&path), &path),
-            Undo::KillVmm(mut child) => {
-                // jailer execs into Firecracker without forking, so this is
-                // the VMM itself.
-                let _ = child.start_kill();
-                child
-                    .wait()
-                    .await
-                    .map(drop)
-                    .map_err(|e| err("wait for Firecracker", e))
-            }
         }
     }
 }
@@ -373,34 +525,6 @@ fn nat_ruleset(vm_address: Ipv4Addr) -> String {
          ip saddr {GUEST_ADDRESS} snat to {vm_address}; }}\n\
          }}\n"
     )
-}
-
-/// Sends guest-init its config with Firecracker's host-initiated vsock
-/// handshake: connect to the jail's vsock socket, send `CONNECT <port>`,
-/// wait for `OK`, write the JSON, then close. Until guest-init is
-/// listening, Firecracker drops the connection instead of answering `OK`,
-/// so this retries from scratch until [`CONFIG_TIMEOUT`].
-async fn deliver_config(vsock: &Path, command: &[String]) -> Result<(), Error> {
-    let (exec, args) = command
-        .split_first()
-        .ok_or_else(|| Error("no command to run".into()))?;
-    let config = format!(
-        "{{\"exec\":{},\"args\":{}}}",
-        json_string(exec),
-        json_array(args)
-    );
-    let deadline = Instant::now() + CONFIG_TIMEOUT;
-    let mut last_error = String::from("never tried");
-    while Instant::now() < deadline {
-        match try_deliver_config(vsock, &config).await {
-            Ok(()) => return Ok(()),
-            Err(e) => last_error = e,
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    Err(Error(format!(
-        "guest-init never accepted its config within {CONFIG_TIMEOUT:?} ({last_error})"
-    )))
 }
 
 async fn try_deliver_config(vsock: &Path, config: &str) -> Result<(), String> {
