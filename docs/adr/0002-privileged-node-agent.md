@@ -5,3 +5,5 @@
 ## Consequences
 
 VMs outlive the Node agent: restarting or upgrading it must not stop workloads. On startup the agent re-adopts VMs that are still running from its persisted state and fully removes the host state of any that died while it was down, so a crash never leaves artifacts behind. The CLI reaches the agent through a socket writable by a `cirro` group, which makes that group equivalent to control over every VM on the Node (not host root); the threat model must say so.
+
+**Not yet true (M3 slice 1, #7):** the agent keeps its VMs in memory, so it tears every VM down when it stops rather than strand ones it could no longer find. VMs outliving the agent arrives with persisted state and startup reconcile in #9, which should delete this note.
