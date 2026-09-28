@@ -24,7 +24,7 @@ use assert_cmd::Command;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::{Pid, getgid};
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::OnceLock;
@@ -117,7 +117,7 @@ fn rootfs() -> &'static Rootfs {
         for sub in ["proc", "sys", "dev", "app"] {
             std::fs::create_dir_all(tree.join(sub)).expect("create rootfs tree");
         }
-        for fixture in ["http_app", "ignore_term", "exit_later"] {
+        for fixture in ["http_app", "ignore_term", "exit_later", "probe"] {
             let status = std::process::Command::new("rustc")
                 .args(["--target", "x86_64-unknown-linux-musl", "-O", "-o"])
                 .arg(tree.join("app").join(fixture))
@@ -702,5 +702,150 @@ fn run_gives_up_on_a_vm_that_never_takes_its_config() {
         row(&agent.ps(true), "deaf").is_none(),
         "a failed run left a record"
     );
+    agent.assert_no_cirro_state();
+}
+
+/// Whether this host itself can reach `addr` (a TCP answer, even a
+/// refusal, counts), so a test doesn't blame the VM for the network.
+fn host_reaches(addr: SocketAddr) -> bool {
+    match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+        Ok(_) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::ConnectionRefused,
+    }
+}
+
+/// The Node's default gateway: the nearest thing on its LAN that answers.
+fn default_gateway() -> Option<std::net::Ipv4Addr> {
+    stdout_of(&["ip", "-o", "-4", "route", "show", "default"])
+        .split_whitespace()
+        .skip_while(|w| *w != "via")
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// Runs the probe fixture in a VM against `targets` and returns each
+/// target's result word (`OPEN`, `REFUSED` or `FAILED`).
+fn probe_from_vm(agent: &Agent, name: &str, targets: &[String]) -> Vec<(String, String)> {
+    let mut command = vec!["/app/probe"];
+    command.extend(targets.iter().map(String::as_str));
+    agent.run(name, &rootfs().guest_init, &command).success();
+    // Each blocked target takes the probe's full 3 s timeout.
+    let deadline = Instant::now() + TIMEOUT + Duration::from_secs(4 * targets.len() as u64);
+    let logs = loop {
+        let logs = stdout(agent.cirro().args(["logs", name]).assert().success());
+        if logs.contains("PROBE_DONE") {
+            break logs;
+        }
+        assert!(Instant::now() < deadline, "probe never finished:\n{logs}");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    agent
+        .cirro()
+        .args(["stop", "--force", name])
+        .assert()
+        .success();
+    targets
+        .iter()
+        .map(|t| {
+            let word = logs
+                .lines()
+                .find_map(|l| l.strip_prefix(&format!("PROBE {t} ")))
+                .and_then(|rest| rest.split_whitespace().next())
+                .unwrap_or_else(|| panic!("no probe result for {t}:\n{logs}"));
+            (t.clone(), word.to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn vms_reach_the_internet_but_not_smtp_each_other_or_the_lan() {
+    let internet: SocketAddr = "1.1.1.1:443".parse().unwrap();
+    if !host_reaches(internet) {
+        eprintln!("skipping: this host can't reach {internet}, so VM egress can't be judged");
+        return;
+    }
+    // A real SMTP server, and another of its ports that this host can reach
+    // (networks filter these differently), to show the drop is about port
+    // 25, not the server.
+    let smtp = ("smtp.gmail.com", 25)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.find(SocketAddr::is_ipv4))
+        .filter(|addr| host_reaches(*addr));
+    if smtp.is_none() {
+        eprintln!("note: this host can't reach smtp.gmail.com:25 itself; skipping the SMTP check");
+    }
+    let smtp_other_port = smtp.and_then(|smtp| {
+        [465, 587]
+            .into_iter()
+            .map(|port| SocketAddr::from((smtp.ip(), port)))
+            .find(|addr| host_reaches(*addr))
+    });
+    let gateway = default_gateway()
+        .map(|gw| SocketAddr::from((gw, 80)))
+        .filter(|addr| host_reaches(*addr));
+    if gateway.is_none() {
+        eprintln!("note: the default gateway doesn't answer on port 80; skipping the LAN check");
+    }
+
+    // The policy is applied at agent startup and must survive a restart.
+    drop(Agent::start(245));
+    let Some(agent) = Agent::start(245) else {
+        return;
+    };
+
+    let target = stdout(
+        agent
+            .run("target", &rootfs().guest_init, &["/app/http_app"])
+            .success(),
+    )
+    .trim()
+    .to_string();
+    let other_vm = format!("{target}:{HTTP_PORT}");
+
+    let mut targets = vec![internet.to_string(), other_vm.clone()];
+    targets.extend(smtp.iter().chain(&smtp_other_port).map(ToString::to_string));
+    if let Some(gateway) = gateway {
+        targets.push(gateway.to_string());
+    }
+    let results = probe_from_vm(&agent, "prober", &targets);
+    let result = |t: &str| results.iter().find(|(k, _)| k == t).unwrap().1.clone();
+
+    assert_eq!(
+        result(&internet.to_string()),
+        "OPEN",
+        "the internet: {results:?}"
+    );
+    assert_eq!(result(&other_vm), "FAILED", "another VM: {results:?}");
+    if let Some(smtp) = smtp {
+        assert_eq!(result(&smtp.to_string()), "FAILED", "SMTP: {results:?}");
+    }
+    if let Some(other) = smtp_other_port {
+        assert_eq!(
+            result(&other.to_string()),
+            "OPEN",
+            "the SMTP server's other port: {results:?}"
+        );
+    }
+    if let Some(gateway) = gateway {
+        assert_eq!(
+            result(&gateway.to_string()),
+            "FAILED",
+            "the LAN: {results:?}"
+        );
+    }
+
+    // The Node can still reach the VM.
+    let response = wait_for_http(&target, HTTP_PORT);
+    assert!(
+        response.contains("hello from cirro"),
+        "Node lost the VM: {response}"
+    );
+    agent
+        .cirro()
+        .args(["stop", "--force", "target"])
+        .assert()
+        .success();
     agent.assert_no_cirro_state();
 }
