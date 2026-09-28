@@ -21,8 +21,15 @@ rather not leave it in place.
 ./fetch_kernel.sh    # downloads a CI-built vmlinux (once; skips if present)
 ./build_rootfs.sh     # builds a minimal busybox rootfs (rerun after editing it)
 ./build_rootfs_guest_init.sh  # cross-compiles guest-init (M2) and rootfs's it
+./build_rootfs_nat.sh  # busybox rootfs whose guest configures eth0 and probes 1.1.1.1:443 (M3 NAT)
 ./tests/run.sh
 ```
+
+`build_rootfs_nat.sh` isn't used by `tests/run.sh`: its `rootfs-nat.ext4` is
+booted by `cirro-node`'s `jailed_boot_with_nat_reaches_the_internet` test
+(`cargo test -p cirro-node --test jailer_network`). Its guest addressing
+(`172.16.61.2/30`, gateway `.1`) is hardcoded to match the host side that
+test configures, and it prints `STEP0_HAS_INTERNET` once the NAT'd path works.
 
 Four seams are tested, each through the real Firecracker API socket (no
 mocks):
