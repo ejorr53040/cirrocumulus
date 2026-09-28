@@ -131,6 +131,158 @@ pub fn configure_link_via_sudo(name: &str, address: Ipv4Addr, prefix_len: u8) ->
     run_sudo_ip(&["link", "set", name, "up"])
 }
 
+/// Enables IPv4 masquerade NAT for `subnet`/`prefix_len` out through
+/// `egress_iface`, per RESEARCH.md M3's nftables NAT slice. Without this,
+/// a VM's tap-assigned address (configured by `configure_link_via_sudo`)
+/// has a host-side gateway but no route out: the kernel won't forward
+/// between netns-mates by default, and even with forwarding on, the
+/// VM's private source address isn't reachable from the wider internet
+/// without being rewritten to the host's own egress address.
+///
+/// Also adds an explicit `accept` at the `forward` hook for `subnet`, at
+/// priority -1 (ahead of the default filter priority most firewall
+/// managers use, e.g. `ufw`'s own forward-drop chain at priority 0):
+/// masquerading alone isn't enough on a host that already has a
+/// default-deny forward policy from something like `ufw` or `firewalld`,
+/// since that runs as an independent base chain at the same `forward`
+/// hook and can drop the packet before it ever reaches this table's own
+/// `postrouting` chain. Cirrocumulus owns the security boundary for its
+/// own tap traffic (jailer + cgroups, not the host firewall -- see
+/// RESEARCH.md's "Security model"), so explicitly accepting forward
+/// traffic for a VM's own private /30 is intentional, not a hole: it
+/// only ever un-blocks traffic to/from addresses this project itself
+/// assigned.
+///
+/// Same narrowly `sudo`-scoped-command pattern as
+/// `create_persistent_tap_owned_by`/`configure_link_via_sudo`, for the
+/// same reason: an unprivileged caller has no `CAP_NET_ADMIN` to flip
+/// `ip_forward` or add nftables rules itself. Needs
+/// `/etc/sudoers.d/cirro-nft` (see this function's test's module doc for
+/// the exact NOPASSWD rule).
+///
+/// Safe to call more than once: `nft add table`/`add chain` are no-ops
+/// if they already exist, and a repeat `add rule` for the same subnet
+/// only adds harmless duplicate rules -- the same tolerance this project
+/// already gives a re-created tap of the same name.
+///
+/// This is *host-persistent* state: the `cirro-nat` table (and the broad
+/// `forward ... accept` rules it puts at priority -1, ahead of the host
+/// firewall) outlive the VM, this process, and -- because those duplicate
+/// rules accumulate on every call -- pile up across runs. So every caller
+/// that enables NAT must pair it with [`disable_nat`] on teardown (a
+/// delete-on-drop guard, so a panic still tears it down), or it leaves a
+/// networking artifact behind that affects the host and the next run.
+pub fn enable_nat(subnet: Ipv4Addr, prefix_len: u8, egress_iface: &str) -> io::Result<()> {
+    let cidr = format!("{subnet}/{prefix_len}");
+
+    run_sudo(&["/usr/bin/sysctl", "-w", "net.ipv4.ip_forward=1"])?;
+    run_sudo(&["/usr/bin/nft", "add", "table", "ip", "cirro-nat"])?;
+    run_sudo(&[
+        "/usr/bin/nft",
+        "add",
+        "chain",
+        "ip",
+        "cirro-nat",
+        "postrouting",
+        "{",
+        "type",
+        "nat",
+        "hook",
+        "postrouting",
+        "priority",
+        "100",
+        ";",
+        "}",
+    ])?;
+    run_sudo(&[
+        "/usr/bin/nft",
+        "add",
+        "rule",
+        "ip",
+        "cirro-nat",
+        "postrouting",
+        "ip",
+        "saddr",
+        &cidr,
+        "oifname",
+        egress_iface,
+        "masquerade",
+    ])?;
+    run_sudo(&[
+        "/usr/bin/nft",
+        "add",
+        "chain",
+        "ip",
+        "cirro-nat",
+        "forward",
+        "{",
+        "type",
+        "filter",
+        "hook",
+        "forward",
+        "priority",
+        "-1",
+        ";",
+        "}",
+    ])?;
+    run_sudo(&[
+        "/usr/bin/nft", "add", "rule", "ip", "cirro-nat", "forward", "ip", "saddr", &cidr,
+        "accept",
+    ])?;
+    run_sudo(&[
+        "/usr/bin/nft", "add", "rule", "ip", "cirro-nat", "forward", "ip", "daddr", &cidr,
+        "accept",
+    ])
+}
+
+/// Tears down everything [`enable_nat`] added, so a run leaves no NAT
+/// artifact behind on the host. Deleting the `cirro-nat` table removes its
+/// `postrouting`/`forward` chains and every rule in them in one atomic
+/// operation -- including the accumulated duplicates repeated `enable_nat`
+/// calls leave -- so this is the whole teardown, not a per-rule one.
+///
+/// Best-effort and idempotent, matching how the rest of this module treats
+/// cleanup (see [`delete_persistent_tap`]): callers should `let _ =` the
+/// result on a cleanup path. Deleting a table that isn't there fails with
+/// `No such file or directory`, which is folded away here so calling this
+/// when nothing was ever set up (or twice) isn't an error -- only a real
+/// failure to remove an *existing* table surfaces.
+///
+/// `net.ipv4.ip_forward` is deliberately left as `enable_nat` set it, not
+/// forced back to `0`: it's a single global toggle, commonly already on
+/// (Docker, libvirt, a router host), and this code can't know its value
+/// before `enable_nat` ran -- so blindly zeroing it on teardown would
+/// itself be an artifact, breaking unrelated host forwarding. The
+/// `cirro-nat` table is the only state this module owns outright, so it's
+/// the only state it removes.
+///
+/// Uses the same narrowly `sudo`-scoped pattern as `enable_nat`; needs the
+/// matching `nft delete table ip cirro-nat` NOPASSWD line (see the NAT
+/// test's module doc).
+pub fn disable_nat() -> io::Result<()> {
+    match run_sudo(&["/usr/bin/nft", "delete", "table", "ip", "cirro-nat"]) {
+        Err(e) if e.to_string().contains("No such file or directory") => Ok(()),
+        other => other,
+    }
+}
+
+/// Runs `sudo -n <argv[0]> <argv[1..]>`, capturing (rather than
+/// inheriting) the child's stdout/stderr and folding stderr into the
+/// returned error on failure, same as `run_sudo_ip` below.
+fn run_sudo(argv: &[&str]) -> io::Result<()> {
+    let (bin, args) = argv.split_first().expect("argv must be non-empty");
+    let output = Command::new("sudo").arg("-n").arg(bin).args(args).output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "sudo {} failed: {}: {}",
+            argv.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
 /// Runs `sudo -n /usr/bin/ip <args>`, matching the `/etc/sudoers.d/cirro-tap`
 /// NOPASSWD scoping this project's networking tests document. Captures
 /// (rather than inherits) the child's stdout/stderr, folding stderr into
