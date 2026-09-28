@@ -87,7 +87,21 @@ jobs:
           persist-credentials: false
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
-          tool: shellcheck@0.11.0,typos@1.50.3,actionlint@1.7.12
+          tool: shellcheck@0.11.0,typos@1.50.3
+      - name: Install actionlint
+        # Straight from the release, pinned by version and SHA-256:
+        # install-action's manifest can lag actionlint releases, and its
+        # cargo-binstall fallback can't install a Go tool (issue #3).
+        env:
+          VERSION: 1.7.12
+          SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          tarball="actionlint_${VERSION}_linux_amd64.tar.gz"
+          curl -fsSLo "$RUNNER_TEMP/$tarball" \
+            "https://github.com/rhysd/actionlint/releases/download/v${VERSION}/${tarball}"
+          echo "$SHA256  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP" actionlint
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - name: shellcheck
         run: scripts/ci/check-shell.sh
       - name: CI script tests
@@ -160,7 +174,13 @@ jobs:
           for sha in "${commits[@]}"; do
             echo "::group::$(git log -1 --format='%h %s' "$sha")"
             git checkout --quiet "$sha"
-            rustup toolchain install > /dev/null # a commit may bump rust-toolchain.toml
+            # Whatever toolchain this commit resolves to (its own
+            # rust-toolchain.toml, or the runner's stable if it predates
+            # one) needs clippy plus the musl target build.rs embeds
+            # guest-init with (issue #2).
+            if [ -f rust-toolchain.toml ]; then rustup toolchain install > /dev/null; fi
+            rustup component add clippy > /dev/null
+            rustup target add x86_64-unknown-linux-musl > /dev/null
             cargo clippy --workspace --all-targets --locked -- -D warnings
             echo "::endgroup::"
           done
