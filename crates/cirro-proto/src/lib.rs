@@ -23,7 +23,7 @@ pub struct RunRequest {
     pub rootfs: PathBuf,
     pub mem_mib: u32,
     pub vcpus: u8,
-    /// The app guest-init runs: `command[0]` is the executable.
+    /// The command guest-init runs: `command[0]` is the executable.
     pub command: Vec<String>,
 }
 
@@ -40,7 +40,7 @@ pub struct VmInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StopRequest {
-    /// Kill the VM immediately instead of asking the app to exit.
+    /// Kill the VM immediately instead of asking its command to exit.
     pub force: bool,
 }
 

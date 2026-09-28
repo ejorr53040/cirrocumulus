@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 const SUBNET: &str = "10.77.250.0/24";
 const SUBNET_PREFIX: &str = "10.77.250.";
-const APP_PORT: u16 = 8080;
+const HTTP_PORT: u16 = 8080;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 fn repo_root() -> PathBuf {
@@ -107,7 +107,7 @@ fn build_http_rootfs(dir: &Path) -> PathBuf {
         .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/http_app.rs"))
         .status()
         .expect("run rustc");
-    assert!(status.success(), "building the HTTP fixture app failed");
+    assert!(status.success(), "building the HTTP fixture failed");
 
     let image = dir.join("rootfs.ext4");
     let file = std::fs::File::create(&image).expect("create rootfs image");
@@ -196,8 +196,8 @@ fn http_get(address: &str, port: u16) -> std::io::Result<String> {
     Ok(response)
 }
 
-/// Retries until the app answers: `run` returns once guest-init has its
-/// config, a moment before the app itself is listening.
+/// Retries until the fixture answers: `run` returns once guest-init has its
+/// config, a moment before the fixture itself is listening.
 fn wait_for_http(address: &str, port: u16) -> String {
     let deadline = Instant::now() + TIMEOUT;
     loop {
@@ -286,10 +286,10 @@ fn run_serves_http_at_the_vm_address_and_stop_force_leaves_nothing() {
         "`cirro run` should print a VM address in {SUBNET}, got {address:?}"
     );
 
-    let response = wait_for_http(&address, APP_PORT);
+    let response = wait_for_http(&address, HTTP_PORT);
     assert!(
         response.contains("hello from cirro"),
-        "unexpected response from the app: {response:?}"
+        "unexpected response from the VM: {response:?}"
     );
 
     let ps = agent.cirro().arg("ps").assert().success();

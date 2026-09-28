@@ -34,6 +34,11 @@ const GUEST_GATEWAY: Ipv4Addr = Ipv4Addr::new(172, 16, 0, 1);
 
 /// The fixed vsock port guest-init reads its config on (M2 protocol).
 const VSOCK_CONFIG_PORT: u32 = 52;
+/// The guest's vsock context id. Any id from 3 up works; each VM has its own
+/// vsock device, so every guest can use the same one.
+const VSOCK_GUEST_CID: u32 = 3;
+/// Where Firecracker puts the host end of the vsock device, inside the jail.
+const VSOCK_SOCKET_IN_JAIL: &str = "v.sock";
 /// How long guest-init has to accept its config before `start` gives up.
 const CONFIG_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long jailer has to bring up Firecracker's API socket.
@@ -48,7 +53,7 @@ const PARENT_CGROUP: &str = "cirro";
 const VM_UID_BASE: u32 = 900_000;
 
 /// Node-wide settings every VM start needs.
-pub struct Host {
+pub struct NodeConfig {
     pub firecracker: PathBuf,
     pub jailer: PathBuf,
     pub kernel: PathBuf,
@@ -102,9 +107,9 @@ pub fn parent_cgroup() -> PathBuf {
 impl Vm {
     /// Brings up the VM described by `spec`, returning once guest-init has
     /// its config. On failure, everything done so far is undone first.
-    pub async fn start(host: &Host, spec: &VmSpec) -> Result<Vm, Error> {
+    pub async fn start(node: &NodeConfig, spec: &VmSpec) -> Result<Vm, Error> {
         let mut vm = Vm { undo: Vec::new() };
-        match vm.start_steps(host, spec).await {
+        match vm.start_steps(node, spec).await {
             Ok(()) => Ok(vm),
             Err(e) => {
                 vm.kill().await;
@@ -123,12 +128,12 @@ impl Vm {
         }
     }
 
-    async fn start_steps(&mut self, host: &Host, spec: &VmSpec) -> Result<(), Error> {
+    async fn start_steps(&mut self, node: &NodeConfig, spec: &VmSpec) -> Result<(), Error> {
         let id = host_id(spec.vm_address);
         let [_, _, c, d] = spec.vm_address.octets();
         let uid = VM_UID_BASE + (u32::from(c) << 8 | u32::from(d));
         let vm_addr = spec.vm_address.to_string();
-        let node_addr = host.node_address.to_string();
+        let node_addr = node.node_address.to_string();
 
         // 1. The VM's network namespace, with its tap inside.
         ip(&["netns", "add", &id]).await?;
@@ -190,26 +195,26 @@ impl Vm {
         .await?;
 
         // 4. jailer, in the namespace and under the VM's cgroup limits.
-        let jail_dir = host.jail_base.join("firecracker").join(&id);
+        let jail_dir = node.jail_base.join("firecracker").join(&id);
         let root = jail_dir.join("root");
-        let console_path = host.state_dir.join(format!("{id}.console.log"));
+        let console_path = node.state_dir.join(format!("{id}.console.log"));
         self.undo.push(Undo::RemoveDir(jail_dir));
         self.undo.push(Undo::RemoveFile(console_path.clone()));
         self.undo
             .push(Undo::RemoveCgroup(parent_cgroup().join(&id)));
-        std::fs::create_dir_all(&host.jail_base).map_err(|e| err("create jail base dir", e))?;
+        std::fs::create_dir_all(&node.jail_base).map_err(|e| err("create jail base dir", e))?;
         let console =
             std::fs::File::create(&console_path).map_err(|e| err("create console log", e))?;
         let memory_max = (u64::from(spec.mem_mib) + VMM_OVERHEAD_MIB) * 1024 * 1024;
         let cpu_max = format!("cpu.max={} 100000", u32::from(spec.vcpus) * 100_000);
-        let child = Command::new(&host.jailer)
+        let child = Command::new(&node.jailer)
             .arg("--id")
             .arg(&id)
             .arg("--exec-file")
-            .arg(&host.firecracker)
+            .arg(&node.firecracker)
             .args(["--uid", &uid_s, "--gid", &uid_s])
             .arg("--chroot-base-dir")
-            .arg(&host.jail_base)
+            .arg(&node.jail_base)
             .arg("--netns")
             .arg(Path::new("/run/netns").join(&id))
             .args(["--cgroup-version", "2", "--parent-cgroup", PARENT_CGROUP])
@@ -217,6 +222,9 @@ impl Vm {
             .arg(format!("memory.max={memory_max}"))
             .arg("--cgroup")
             .arg(cpu_max)
+            // A backstop: if a `Vm` is ever dropped without `kill`, at least
+            // the VMM doesn't outlive it.
+            .kill_on_drop(true)
             .stdin(Stdio::null())
             .stdout(
                 console
@@ -231,6 +239,12 @@ impl Vm {
         let api_socket = root.join("run/firecracker.socket");
         let deadline = Instant::now() + API_SOCKET_TIMEOUT;
         while !api_socket.exists() {
+            if let Some(status) = self.vmm_exit_status() {
+                return Err(Error(format!(
+                    "jailer exited ({status}) before Firecracker was up: {}",
+                    console_tail(&console_path)
+                )));
+            }
             if Instant::now() >= deadline {
                 return Err(Error(format!(
                     "Firecracker's API socket never appeared at {}",
@@ -242,8 +256,8 @@ impl Vm {
 
         // 5. Kernel and rootfs into the jail, then the devices.
         let kernel_in_jail = root.join("vmlinux");
-        if std::fs::hard_link(&host.kernel, &kernel_in_jail).is_err() {
-            std::fs::copy(&host.kernel, &kernel_in_jail)
+        if std::fs::hard_link(&node.kernel, &kernel_in_jail).is_err() {
+            std::fs::copy(&node.kernel, &kernel_in_jail)
                 .map_err(|e| err("copy kernel into jail", e))?;
         }
         let rootfs_in_jail = root.join("rootfs.ext4");
@@ -262,7 +276,7 @@ impl Vm {
             .await
             .map_err(|e| err("attach tap", e))?;
         client
-            .attach_vsock(3, "/v.sock")
+            .attach_vsock(VSOCK_GUEST_CID, &format!("/{VSOCK_SOCKET_IN_JAIL}"))
             .await
             .map_err(|e| err("attach vsock", e))?;
         client
@@ -280,7 +294,32 @@ impl Vm {
             .map_err(|e| err("boot", e))?;
 
         // 6. guest-init's config over vsock.
-        deliver_config(&root.join("v.sock"), &spec.command).await
+        deliver_config(&root.join(VSOCK_SOCKET_IN_JAIL), &spec.command).await
+    }
+}
+
+impl Vm {
+    /// Whether the VMM process has already exited, and how. `None` while it
+    /// runs, or before it's been spawned.
+    fn vmm_exit_status(&mut self) -> Option<std::process::ExitStatus> {
+        self.undo.iter_mut().find_map(|step| match step {
+            Undo::KillVmm(child) => child.try_wait().ok().flatten(),
+            _ => None,
+        })
+    }
+}
+
+/// The last few lines of a console log, for error messages. The log itself
+/// is removed with the rest of the VM's host state.
+fn console_tail(path: &Path) -> String {
+    const LINES: usize = 5;
+    let console = std::fs::read_to_string(path).unwrap_or_default();
+    let lines: Vec<&str> = console.lines().collect();
+    let tail = lines[lines.len().saturating_sub(LINES)..].join(" | ");
+    if tail.is_empty() {
+        "no console output".to_string()
+    } else {
+        tail
     }
 }
 

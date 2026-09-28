@@ -16,14 +16,16 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use nix::sys::stat::{Mode, umask};
 use std::collections::BTreeMap;
 use std::io;
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
 
@@ -81,7 +83,7 @@ pub struct Config {
 }
 
 enum Entry {
-    /// Holds the name and VM address while `Vm::start` runs.
+    /// `Vm::start` is running; the entry reserves the name and VM address.
     Starting,
     Running {
         info: VmInfo,
@@ -90,9 +92,12 @@ enum Entry {
 }
 
 struct Agent {
-    host: vm::Host,
+    node: vm::NodeConfig,
     subnet: Subnet,
     vms: Mutex<BTreeMap<String, (Ipv4Addr, Entry)>>,
+    /// Set once shutdown begins, so no new VM starts after the agent has
+    /// begun tearing VMs down.
+    shutting_down: AtomicBool,
 }
 
 /// Runs the agent until SIGTERM or SIGINT, then tears down every VM and
@@ -100,7 +105,7 @@ struct Agent {
 pub async fn run(config: Config) -> io::Result<()> {
     std::fs::create_dir_all(&config.state_dir)?;
     let agent = Arc::new(Agent {
-        host: vm::Host {
+        node: vm::NodeConfig {
             firecracker: config.firecracker,
             jailer: config.jailer,
             kernel: config.kernel,
@@ -110,14 +115,23 @@ pub async fn run(config: Config) -> io::Result<()> {
         },
         subnet: config.subnet,
         vms: Mutex::new(BTreeMap::new()),
+        shutting_down: AtomicBool::new(false),
     });
 
+    let gid = resolve_group(&config.socket_group)?;
+    if let Some(dir) = config.socket.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     match std::fs::remove_file(&config.socket) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
         _ => {}
     }
-    let listener = UnixListener::bind(&config.socket)?;
-    let gid = resolve_group(&config.socket_group)?;
+    // Bind under a umask that leaves the socket root-only until it's handed
+    // to its group, so it's never briefly open to everyone.
+    let old_umask = umask(Mode::from_bits_truncate(0o177));
+    let bound = UnixListener::bind(&config.socket);
+    umask(old_umask);
+    let listener = bound?;
     std::os::unix::fs::chown(&config.socket, Some(0), Some(gid))?;
     std::fs::set_permissions(&config.socket, std::fs::Permissions::from_mode(0o660))?;
 
@@ -160,7 +174,7 @@ pub async fn run(config: Config) -> io::Result<()> {
 type ApiResponse = Response<Full<Bytes>>;
 
 impl Agent {
-    async fn handle(&self, req: Request<Incoming>) -> ApiResponse {
+    async fn handle(self: Arc<Self>, req: Request<Incoming>) -> ApiResponse {
         let method = req.method().clone();
         let path = req.uri().path().to_string();
         let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
@@ -195,7 +209,7 @@ impl Agent {
             .collect()
     }
 
-    async fn run_vm(&self, run: RunRequest) -> Result<ApiResponse, ApiError> {
+    async fn run_vm(self: Arc<Self>, run: RunRequest) -> Result<ApiResponse, ApiError> {
         if run.command.is_empty() {
             return Err(bad_request("no command given to run in the VM"));
         }
@@ -204,6 +218,12 @@ impl Agent {
         }
         let vm_address = {
             let mut vms = self.vms.lock().unwrap();
+            if self.shutting_down.load(Ordering::SeqCst) {
+                return Err(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the Node agent is shutting down".into(),
+                ));
+            }
             if vms.contains_key(&run.name) {
                 return Err(ApiError(
                     StatusCode::CONFLICT,
@@ -232,10 +252,28 @@ impl Agent {
             vcpus: run.vcpus,
             command: run.command,
         };
-        match Vm::start(&self.host, &spec).await {
+        // Started on its own task, so the start runs to completion (success,
+        // or a full unwind) even if the client disconnects and hyper drops
+        // this request's future.
+        let name = run.name;
+        tokio::spawn(async move { self.start_vm(name, spec).await })
+            .await
+            .unwrap_or_else(|e| {
+                Err(ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("starting the VM panicked: {e}"),
+                ))
+            })
+    }
+
+    /// Runs `Vm::start` for a name and VM address already reserved as
+    /// `Entry::Starting`, then records the result.
+    async fn start_vm(&self, name: String, spec: VmSpec) -> Result<ApiResponse, ApiError> {
+        let vm_address = spec.vm_address;
+        match Vm::start(&self.node, &spec).await {
             Ok(vm) => {
                 let info = VmInfo {
-                    name: run.name.clone(),
+                    name: name.clone(),
                     vm_address,
                     mem_mib: spec.mem_mib,
                     vcpus: spec.vcpus,
@@ -244,7 +282,7 @@ impl Agent {
                         .map_or(0, |d| d.as_secs()),
                 };
                 self.vms.lock().unwrap().insert(
-                    run.name,
+                    name,
                     (
                         vm_address,
                         Entry::Running {
@@ -256,10 +294,10 @@ impl Agent {
                 Ok(json(StatusCode::CREATED, &info))
             }
             Err(e) => {
-                self.vms.lock().unwrap().remove(&run.name);
+                self.vms.lock().unwrap().remove(&name);
                 Err(ApiError(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("starting VM {:?} failed: {e}", run.name),
+                    format!("starting VM {name:?} failed: {e}"),
                 ))
             }
         }
@@ -300,23 +338,39 @@ impl Agent {
             .expect("build empty response"))
     }
 
+    /// Tears down every VM, including ones still starting: each start
+    /// finishes (bounded by its own timeouts) as a running VM to kill, or
+    /// unwinds itself.
     async fn shutdown(&self) {
-        let running: Vec<Vm> = {
-            let mut vms = self.vms.lock().unwrap();
-            std::mem::take(&mut *vms)
-                .into_values()
-                .filter_map(|(_, entry)| match entry {
-                    Entry::Running { vm, .. } => Some(vm),
-                    Entry::Starting => None,
-                })
-                .collect()
-        };
-        for vm in running {
-            vm.kill().await;
+        self.shutting_down.store(true, Ordering::SeqCst);
+        loop {
+            let (running, any_starting) = {
+                let mut vms = self.vms.lock().unwrap();
+                let running_names: Vec<String> = vms
+                    .iter()
+                    .filter(|(_, (_, entry))| matches!(entry, Entry::Running { .. }))
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                let running: Vec<Vm> = running_names
+                    .iter()
+                    .filter_map(|name| match vms.remove(name) {
+                        Some((_, Entry::Running { vm, .. })) => Some(vm),
+                        _ => None,
+                    })
+                    .collect();
+                (running, !vms.is_empty())
+            };
+            for vm in running {
+                vm.kill().await;
+            }
+            if !any_starting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         // Only succeed once empty, so a jail still in use is never removed.
-        let _ = std::fs::remove_dir(self.host.jail_base.join("firecracker"));
-        let _ = std::fs::remove_dir(&self.host.jail_base);
+        let _ = std::fs::remove_dir(self.node.jail_base.join("firecracker"));
+        let _ = std::fs::remove_dir(&self.node.jail_base);
         let _ = std::fs::remove_dir(vm::parent_cgroup());
     }
 }

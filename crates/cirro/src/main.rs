@@ -57,7 +57,7 @@ enum Command {
         vcpus: u8,
         /// An ext4 rootfs with guest-init as /init
         rootfs: PathBuf,
-        /// The app to run, and its arguments
+        /// The command to run in the VM, and its arguments
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
