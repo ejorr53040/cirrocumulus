@@ -1,0 +1,187 @@
+# Strict CI for cirrocumulus. Every gate is blocking; `ci-ok` at the bottom
+# is the single status check to mark "required" in branch protection.
+#
+# Run the same gates locally with scripts/ci/local.sh, and install the git
+# hooks (commit-msg + pre-push) with scripts/ci/install-hooks.sh.
+#
+# Actions are pinned to full commit SHAs (tag in the trailing comment);
+# Dependabot (.github/dependabot.yml) keeps them current.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Mondays 06:00 UTC: new RustSec advisories land without any code change.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  git:
+    name: Git history & repo hygiene
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Commit messages & linear history
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          case "$EVENT" in
+            pull_request)
+              range="$PR_BASE..$PR_HEAD" ;;
+            push)
+              if [ -n "$PUSH_BEFORE" ] && git cat-file -e "$PUSH_BEFORE^{commit}" 2> /dev/null; then
+                range="$PUSH_BEFORE..$GITHUB_SHA"
+              else
+                range="$GITHUB_SHA~1..$GITHUB_SHA" # new branch / force push: check the tip
+              fi ;;
+            *)
+              echo "no new commits to check on $EVENT"; exit 0 ;;
+          esac
+          scripts/ci/check-commits.sh "$range"
+
+      - name: PR title (becomes the commit subject on squash-merge)
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          printf '%s\n' "$PR_TITLE" > "$RUNNER_TEMP/pr-title"
+          scripts/ci/check-commits.sh --file "$RUNNER_TEMP/pr-title"
+
+      - name: Repo hygiene
+        run: scripts/ci/check-hygiene.sh
+
+  lint:
+    name: Lint (shell, spelling, workflows)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: shellcheck@0.11.0,typos@1.50.3,actionlint@1.7.12
+      - name: shellcheck
+        run: scripts/ci/check-shell.sh
+      - name: CI script tests
+        run: scripts/ci/tests/check-commits.test.sh
+      - name: typos
+        run: typos
+      - name: actionlint
+        run: actionlint
+
+  rust:
+    name: Rust (fmt, clippy, docs, tests)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install && rustup show active-toolchain
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --all-features --locked
+      - name: tests
+        run: scripts/ci/test.sh
+
+  supply-chain:
+    name: Supply chain (cargo-deny, unused deps)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-deny@0.20.2,cargo-machete@0.9.2
+      - name: cargo deny (advisories, licenses, bans, sources)
+        run: cargo deny --locked check
+      - name: cargo machete (unused dependencies)
+        run: cargo machete
+
+  every-commit-builds:
+    # Keeps history bisectable: each commit in a PR must pass clippy on its
+    # own, not just the tip. The `rust` job already covers the tip itself.
+    name: Every commit builds
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install && rustup show active-toolchain
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: clippy on each commit
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mapfile -t commits < <(git rev-list --reverse "$PR_BASE..$PR_HEAD~1")
+          echo "checking ${#commits[@]} commit(s) before the tip"
+          for sha in "${commits[@]}"; do
+            echo "::group::$(git log -1 --format='%h %s' "$sha")"
+            git checkout --quiet "$sha"
+            rustup toolchain install > /dev/null # a commit may bump rust-toolchain.toml
+            cargo clippy --workspace --all-targets --locked -- -D warnings
+            echo "::endgroup::"
+          done
+
+  ci-ok:
+    # The one check to require in branch protection. Fails if any gate
+    # failed or was cancelled; `every-commit-builds` is skipped on pushes.
+    name: CI OK
+    if: always()
+    needs: [git, lint, rust, supply-chain, every-commit-builds]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: All gates passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: $RESULTS"
+          for r in $RESULTS; do
+            case "$r" in
+              success | skipped) ;;
+              *) echo "::error::a required gate finished with '$r'"; exit 1 ;;
+            esac
+          done

@@ -1,0 +1,27 @@
+# Weekly dependency PRs. Each one has to pass the full CI gate
+# (.github/workflows/ci.yml), including cargo-deny, before it can merge.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "Cargo"
+    groups:
+      # Semver-compatible bumps land as one PR; breaking bumps stay separate.
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "CI"
+    groups:
+      actions:
+        patterns: ["*"]

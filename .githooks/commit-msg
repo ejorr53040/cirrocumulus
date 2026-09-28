@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Enforce CI's commit-message rules at commit time. Installed by
+# scripts/ci/install-hooks.sh.
+exec "$(git rev-parse --show-toplevel)/scripts/ci/check-commits.sh" --file "$1"
