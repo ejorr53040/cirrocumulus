@@ -25,6 +25,8 @@ allow = [
     "MIT",
     "Unicode-3.0",
     "Unlicense",
+    # foldhash, via rusqlite -> hashlink. Permissive, like the rest.
+    "Zlib",
 ]
 confidence-threshold = 0.93
 unused-allowed-license = "allow"

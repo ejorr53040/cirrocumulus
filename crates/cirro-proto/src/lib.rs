@@ -70,6 +70,10 @@ pub enum EndReason {
     Exited,
     /// The guest crashed, or the VMM died unexpectedly.
     Crashed,
+    /// It was already gone when the agent started again, so how it ended is
+    /// unknown.
+    #[serde(rename = "agent_down")]
+    AgentDown,
 }
 
 impl EndReason {
@@ -79,6 +83,7 @@ impl EndReason {
             EndReason::Forced => "forced",
             EndReason::Exited => "exited",
             EndReason::Crashed => "crashed",
+            EndReason::AgentDown => "died while the agent was down",
         }
     }
 }

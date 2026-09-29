@@ -29,6 +29,7 @@ tokio.workspace = true
 assert_cmd.workspace = true
 nix = { workspace = true, features = ["signal", "user"] }
 predicates.workspace = true
+rusqlite.workspace = true
 
 [lints]
 workspace = true

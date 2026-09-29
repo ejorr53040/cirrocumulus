@@ -19,9 +19,15 @@
 //! is named by [`host_id`], derived from the VM address. Names stay unique
 //! on the Node while the address is held, and nothing else needs recording
 //! to find them again.
+//!
+//! VMs outlive the Node agent (ADR 0002): the VMM is never tied to the
+//! agent that started it. A later agent takes a VM back with [`Vm::adopt`],
+//! given the VM address and the VMM's [`ProcessId`], and removes the host
+//! state of one that is gone or was never recorded with [`clean_up`].
 
 use crate::firecracker::{BootConfig, Client};
 use cirro_proto::EndReason;
+use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -50,6 +56,16 @@ const CONFIG_TIMEOUT: Duration = Duration::from_secs(10);
 /// count it as started: a command that fails at once is reported by `run`
 /// rather than looking like success.
 const START_GRACE: Duration = Duration::from_secs(2);
+/// How often an adopted VMM, which isn't this agent's child, is checked for
+/// having ended.
+const ADOPTED_POLL: Duration = Duration::from_millis(200);
+/// Where a network namespace shows up, and where a host-side link does.
+const NETNS_DIR: &str = "/run/netns";
+const NET_DEVICES_DIR: &str = "/sys/class/net";
+/// How often, and at most how many times, the cgroup of a VMM that has just
+/// been killed is checked for having emptied or become removable.
+const CGROUP_POLL: Duration = Duration::from_millis(20);
+const CGROUP_POLL_ATTEMPTS: u32 = 100;
 /// How many console lines a failed start reports.
 const CONSOLE_TAIL_LINES: usize = 10;
 /// How long jailer has to bring up Firecracker's API socket.
@@ -113,10 +129,109 @@ pub struct Vm {
     /// The VMM: jailer execs into Firecracker without forking, so this is
     /// Firecracker itself once spawned. Always the last thing started, so
     /// teardown kills it before unwinding `undo`.
-    vmm: Option<Child>,
+    vmm: Option<Vmm>,
     undo: Vec<Undo>,
     api_socket: PathBuf,
     console_log: PathBuf,
+    /// The VMM's identity, known once it has started.
+    process: Option<ProcessId>,
+}
+
+/// A VMM process, identified by its pid and start time together so that a
+/// pid reused by some other process is never mistaken for the VMM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessId {
+    pub pid: u32,
+    /// The process's start time from `/proc/<pid>/stat`, in clock ticks
+    /// since boot.
+    pub start_time: u64,
+}
+
+impl ProcessId {
+    /// The identity of the running process `pid`.
+    fn of(pid: u32) -> Option<ProcessId> {
+        let (_, start_time) = proc_stat(pid)?;
+        Some(ProcessId { pid, start_time })
+    }
+
+    /// Whether this exact process is still running. A zombie has ended.
+    pub fn is_running(self) -> bool {
+        proc_stat(self.pid).is_some_and(|(state, start)| state != 'Z' && start == self.start_time)
+    }
+}
+
+/// The state and start time of a process, from `/proc/<pid>/stat`. Its
+/// fields follow the command name, which is in parentheses and may itself
+/// contain spaces and parentheses, so they are counted from the last `)`.
+fn proc_stat(pid: u32) -> Option<(char, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    // `state` is field 3 and the start time field 22.
+    let start_time = fields.nth(18)?.parse().ok()?;
+    Some((state, start_time))
+}
+
+/// How the agent holds a VM's VMM.
+enum Vmm {
+    /// Started by this agent, so its exit status is known.
+    Child(Child),
+    /// Started by an earlier agent, so it is only known by its identity and
+    /// by the cgroup jailer put it in, which holds nothing else.
+    Adopted { process: ProcessId, cgroup: PathBuf },
+}
+
+impl Vmm {
+    /// `Some` once the VMM has ended, with its exit status if it was
+    /// started by this agent.
+    fn ended(&mut self) -> Option<Option<std::process::ExitStatus>> {
+        match self {
+            Vmm::Child(child) => child.try_wait().ok().flatten().map(Some),
+            Vmm::Adopted { process, .. } => (!process.is_running()).then_some(None),
+        }
+    }
+
+    /// Waits for the VMM to end, and gives its exit status if known.
+    async fn wait(&mut self) -> Option<std::process::ExitStatus> {
+        match self {
+            Vmm::Child(child) => child.wait().await.ok(),
+            Vmm::Adopted { process, .. } => {
+                while process.is_running() {
+                    tokio::time::sleep(ADOPTED_POLL).await;
+                }
+                None
+            }
+        }
+    }
+
+    /// Whether the kernel's OOM killer killed something in the VM's cgroup.
+    /// An adopted VMM's exit status is lost, and this is the one way left to
+    /// tell such a crash from an exit.
+    fn oom_killed(&self) -> bool {
+        let Vmm::Adopted { cgroup, .. } = self else {
+            return false;
+        };
+        std::fs::read_to_string(cgroup.join("memory.events")).is_ok_and(|events| {
+            events
+                .lines()
+                .filter_map(|l| l.strip_prefix("oom_kill "))
+                .any(|count| count.trim() != "0")
+        })
+    }
+
+    async fn kill(&mut self) {
+        match self {
+            // Killing through the cgroup can't hit a pid that was reused
+            // after the VMM ended, as signalling a bare pid could.
+            Vmm::Adopted { cgroup, .. } => {
+                let _ = std::fs::write(cgroup.join("cgroup.kill"), "1");
+            }
+            Vmm::Child(child) => {
+                let _ = child.start_kill();
+            }
+        }
+        self.wait().await;
+    }
 }
 
 /// The name of every host object belonging to the VM at `vm_address`, e.g.
@@ -143,6 +258,7 @@ impl Vm {
             undo: Vec::new(),
             api_socket: PathBuf::new(),
             console_log: spec.console_log.clone(),
+            process: None,
         };
         match vm.start_steps(node, spec).await {
             Ok(()) => Ok(vm),
@@ -151,6 +267,38 @@ impl Vm {
                 Err(e)
             }
         }
+    }
+
+    /// Takes back a VM an earlier agent started, which is still running as
+    /// `process`. Everything else it needs is named from its VM address.
+    pub fn adopt(
+        node: &NodeConfig,
+        vm_address: Ipv4Addr,
+        process: ProcessId,
+        console_log: PathBuf,
+    ) -> Vm {
+        let id = host_id(vm_address);
+        Vm {
+            vmm: Some(Vmm::Adopted {
+                process,
+                cgroup: parent_cgroup().join(&id),
+            }),
+            undo: undo_steps(node, &id),
+            api_socket: jail_dir(node, &id).join("root/run/firecracker.socket"),
+            console_log,
+            process: Some(process),
+        }
+    }
+
+    /// The VMM's identity, for recording it: after `start` succeeds, or on a
+    /// VM taken back with `adopt`.
+    pub fn process(&self) -> ProcessId {
+        self.process.expect("a started VM has a VMM process")
+    }
+
+    /// Kills a VM that started but can't be kept, and removes its host state.
+    pub async fn destroy(mut self) {
+        self.teardown().await;
     }
 
     /// Owns the VM until it ends, then removes all of its host state and
@@ -170,17 +318,17 @@ impl Vm {
         // when a stop arrives at the same moment.
         let stop = tokio::select! {
             biased;
-            status = vmm.wait() => return natural_end(status, &console_log),
+            status = vmm.wait() => return vmm_natural_end(vmm, status, &console_log),
             stop = stops.recv() => stop,
         };
         match stop {
             Some(Stop::Graceful { timeout }) => {
                 if client.send_ctrl_alt_del().await.is_err() {
                     // Most likely the VM ended on its own just now.
-                    if let Ok(Some(status)) = vmm.try_wait() {
-                        return natural_end(Ok(status), &console_log);
+                    if let Some(status) = vmm.ended() {
+                        return vmm_natural_end(vmm, status, &console_log);
                     }
-                    kill(vmm).await;
+                    vmm.kill().await;
                     return EndReason::Forced;
                 }
                 let deadline = tokio::time::sleep(timeout);
@@ -196,11 +344,11 @@ impl Vm {
                         },
                     }
                 }
-                kill(vmm).await;
+                vmm.kill().await;
                 EndReason::Forced
             }
             Some(Stop::Force) | None => {
-                kill(vmm).await;
+                vmm.kill().await;
                 EndReason::Forced
             }
         }
@@ -210,7 +358,7 @@ impl Vm {
     /// start step.
     async fn teardown(&mut self) {
         if let Some(vmm) = self.vmm.as_mut() {
-            kill(vmm).await;
+            vmm.kill().await;
         }
         while let Some(step) = self.undo.pop() {
             if let Err(e) = step.run().await {
@@ -228,7 +376,7 @@ impl Vm {
 
         // 1. The VM's network namespace, with its tap inside.
         ip(&["netns", "add", &id]).await?;
-        self.undo.push(Undo::DeleteNetns(id.clone()));
+        self.undo.push(Undo::netns(&id));
         let uid_s = uid.to_string();
         ip_in(&id, &["link", "set", "lo", "up"]).await?;
         ip_in(
@@ -251,7 +399,7 @@ impl Vm {
             "link", "add", &id, "type", "veth", "peer", "name", "veth0", "netns", &id,
         ])
         .await?;
-        self.undo.push(Undo::DeleteLink(id.clone()));
+        self.undo.push(Undo::link(&id));
         ip(&["addr", "add", &format!("{node_addr}/32"), "dev", &id]).await?;
         ip(&["link", "set", &id, "up"]).await?;
         ip_in(
@@ -286,11 +434,9 @@ impl Vm {
         .await?;
 
         // 4. jailer, in the namespace and under the VM's cgroup limits.
-        let jail_dir = node.jail_base.join("firecracker").join(&id);
-        let root = jail_dir.join("root");
-        self.undo.push(Undo::RemoveDir(jail_dir));
-        self.undo
-            .push(Undo::RemoveCgroup(parent_cgroup().join(&id)));
+        let root = jail_dir(node, &id).join("root");
+        self.undo.push(Undo::jail_dir(node, &id));
+        self.undo.push(Undo::cgroup(&id));
         std::fs::create_dir_all(&node.jail_base).map_err(|e| err("create jail base dir", e))?;
         let console =
             std::fs::File::create(&self.console_log).map_err(|e| err("create console log", e))?;
@@ -311,9 +457,7 @@ impl Vm {
             .arg(format!("memory.max={memory_max}"))
             .arg("--cgroup")
             .arg(cpu_max)
-            // A backstop: if a `Vm` is ever dropped without `kill`, at least
-            // the VMM doesn't outlive it.
-            .kill_on_drop(true)
+            // No `kill_on_drop`: the VMM outlives the agent (ADR 0002).
             .stdin(Stdio::null())
             .stdout(
                 console
@@ -323,7 +467,16 @@ impl Vm {
             .stderr(console)
             .spawn()
             .map_err(|e| err("spawn jailer", e))?;
-        self.vmm = Some(child);
+        // jailer execs into Firecracker without forking, so the pid and its
+        // start time are Firecracker's from here on.
+        self.process = child.id().and_then(ProcessId::of);
+        if self.process.is_none() {
+            self.vmm = Some(Vmm::Child(child));
+            return Err(Error(
+                "jailer exited before its process could be identified".into(),
+            ));
+        }
+        self.vmm = Some(Vmm::Child(child));
 
         let api_socket = root.join("run/firecracker.socket");
         self.api_socket = api_socket.clone();
@@ -412,7 +565,7 @@ impl Vm {
         let mut last_error = String::from("never tried");
         while Instant::now() < deadline {
             if let Some(status) = self.vmm_exit_status() {
-                return Err(self.ended_during_start(Ok(status)));
+                return Err(self.ended_during_start(Some(status)));
             }
             match try_deliver_config(vsock, &config).await {
                 Ok(()) => return Ok(()),
@@ -431,10 +584,10 @@ impl Vm {
     /// Whether the VMM process has already exited, and how. `None` while it
     /// runs, or before it's been spawned.
     fn vmm_exit_status(&mut self) -> Option<std::process::ExitStatus> {
-        self.vmm.as_mut()?.try_wait().ok().flatten()
+        self.vmm.as_mut()?.ended().flatten()
     }
 
-    fn ended_during_start(&self, status: std::io::Result<std::process::ExitStatus>) -> Error {
+    fn ended_during_start(&self, status: Option<std::process::ExitStatus>) -> Error {
         let how = match natural_end(status, &self.console_log) {
             EndReason::Crashed => "crashed",
             _ => "exited on its own",
@@ -453,32 +606,42 @@ impl Vm {
     }
 }
 
-/// Why a VM ended after being asked to stop gracefully: graceful, unless it
-/// crashed on the way down.
-fn graceful_end(
-    status: std::io::Result<std::process::ExitStatus>,
+/// [`natural_end`] for a VMM this agent holds, which also counts an OOM kill
+/// as a crash.
+fn vmm_natural_end(
+    vmm: &Vmm,
+    status: Option<std::process::ExitStatus>,
     console_log: &Path,
 ) -> EndReason {
+    if vmm.oom_killed() {
+        EndReason::Crashed
+    } else {
+        natural_end(status, console_log)
+    }
+}
+
+/// Why a VM ended after being asked to stop gracefully: graceful, unless it
+/// crashed on the way down.
+fn graceful_end(status: Option<std::process::ExitStatus>, console_log: &Path) -> EndReason {
     match natural_end(status, console_log) {
         EndReason::Crashed => EndReason::Crashed,
         _ => EndReason::Graceful,
     }
 }
 
-async fn kill(vmm: &mut Child) {
-    let _ = vmm.start_kill();
-    let _ = vmm.wait().await;
-}
-
 /// Why a VM ended when nothing asked it to. guest-init reboots the guest
 /// once its command exits, which Firecracker exits cleanly on; a guest
 /// kernel panic takes the same reboot path (`panic=1`), so the console is
 /// what tells the two apart.
-fn natural_end(status: std::io::Result<std::process::ExitStatus>, console_log: &Path) -> EndReason {
+///
+/// `status` is `None` for a VMM that isn't this agent's child, whose exit
+/// status is lost; such a VM counts as exited unless its console shows a panic.
+fn natural_end(status: Option<std::process::ExitStatus>, console_log: &Path) -> EndReason {
     let panicked = console_tail_bytes(console_log).contains("Kernel panic");
     match status {
-        Ok(s) if s.success() && !panicked => EndReason::Exited,
-        _ => EndReason::Crashed,
+        Some(s) if !s.success() => EndReason::Crashed,
+        _ if panicked => EndReason::Crashed,
+        _ => EndReason::Exited,
     }
 }
 
@@ -520,16 +683,125 @@ enum Undo {
 }
 
 impl Undo {
+    fn netns(id: &str) -> Undo {
+        Undo::DeleteNetns(id.to_string())
+    }
+
+    fn link(id: &str) -> Undo {
+        Undo::DeleteLink(id.to_string())
+    }
+
+    fn jail_dir(node: &NodeConfig, id: &str) -> Undo {
+        Undo::RemoveDir(jail_dir(node, id))
+    }
+
+    fn cgroup(id: &str) -> Undo {
+        Undo::RemoveCgroup(parent_cgroup().join(id))
+    }
+
+    /// Undoes the step, and counts a step whose object is already gone as
+    /// undone: a later agent doesn't know how far an earlier one got.
     async fn run(self) -> Result<(), Error> {
         match self {
+            Undo::DeleteNetns(name) if !Path::new(NETNS_DIR).join(&name).exists() => Ok(()),
             Undo::DeleteNetns(name) => ip(&["netns", "del", &name]).await,
+            Undo::DeleteLink(name) if !Path::new(NET_DEVICES_DIR).join(&name).exists() => Ok(()),
             Undo::DeleteLink(name) => ip(&["link", "del", &name]).await,
             Undo::RemoveDir(path) => remove_if_present(std::fs::remove_dir_all(&path), &path),
-            Undo::RemoveCgroup(path) => remove_if_present(std::fs::remove_dir(&path), &path),
+            Undo::RemoveCgroup(path) => {
+                // A killed process holds its cgroup until it has been reaped.
+                let mut result = std::fs::remove_dir(&path);
+                for _ in 0..CGROUP_POLL_ATTEMPTS {
+                    match &result {
+                        Err(e) if e.kind() == std::io::ErrorKind::ResourceBusy => {
+                            tokio::time::sleep(CGROUP_POLL).await;
+                            result = std::fs::remove_dir(&path);
+                        }
+                        _ => break,
+                    }
+                }
+                remove_if_present(result, &path)
+            }
         }
     }
 }
 
+/// The jail directory of the VM named `id`.
+fn jail_dir(node: &NodeConfig, id: &str) -> PathBuf {
+    node.jail_base.join("firecracker").join(id)
+}
+
+/// Every step that undoes a fully started VM, in the order they run.
+fn undo_steps(node: &NodeConfig, id: &str) -> Vec<Undo> {
+    // Popped from the end, so the reverse of the order start pushes them.
+    vec![
+        Undo::netns(id),
+        Undo::link(id),
+        Undo::jail_dir(node, id),
+        Undo::cgroup(id),
+    ]
+}
+
+/// Removes everything the VM at `vm_address` may have left on the Node, for
+/// a VM that is gone or was never recorded: kills whatever still runs in its
+/// cgroup, then removes its cgroup, jail directory, veth and namespace.
+pub async fn clean_up(node: &NodeConfig, vm_address: Ipv4Addr) {
+    let id = host_id(vm_address);
+    kill_cgroup(&parent_cgroup().join(&id)).await;
+    let mut steps = undo_steps(node, &id);
+    while let Some(step) = steps.pop() {
+        if let Err(e) = step.run().await {
+            eprintln!("cirro node: clean up {id}: {e}");
+        }
+    }
+}
+
+/// Kills every process in a cgroup and waits for it to empty.
+async fn kill_cgroup(cgroup: &Path) {
+    if std::fs::write(cgroup.join("cgroup.kill"), "1").is_err() {
+        return;
+    }
+    for _ in 0..CGROUP_POLL_ATTEMPTS {
+        match std::fs::read_to_string(cgroup.join("cgroup.procs")) {
+            Ok(procs) if !procs.trim().is_empty() => {
+                tokio::time::sleep(CGROUP_POLL).await;
+            }
+            _ => return,
+        }
+    }
+}
+
+/// The low 16 bits of the VM address of every VM that has host state on
+/// this Node, in any form: a namespace, a veth, a jail directory or a
+/// cgroup. See [`host_id`] for the naming.
+pub fn host_state_owners(node: &NodeConfig) -> BTreeSet<u16> {
+    let names_in = |dir: PathBuf| -> Vec<String> {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .collect()
+    };
+    [
+        names_in(PathBuf::from(NETNS_DIR)),
+        names_in(PathBuf::from(NET_DEVICES_DIR)),
+        names_in(node.jail_base.join("firecracker")),
+        names_in(parent_cgroup()),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|name| parse_host_id(&name))
+    .collect()
+}
+
+/// The inverse of [`host_id`]: the low 16 bits of the VM address.
+fn parse_host_id(name: &str) -> Option<u16> {
+    let hex = name.strip_prefix("cirro-")?;
+    if hex.len() != 4 {
+        return None;
+    }
+    u16::from_str_radix(hex, 16).ok()
+}
 fn remove_if_present(result: std::io::Result<()>, path: &Path) -> Result<(), Error> {
     match result {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
