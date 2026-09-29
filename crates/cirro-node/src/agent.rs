@@ -13,6 +13,7 @@
 //! running process before it opens its socket.
 
 use crate::egress;
+use crate::rootfs_open;
 use crate::state::{Record, Store};
 use crate::vm::{self, Stop, Vm, VmSpec};
 use bytes::Bytes;
@@ -34,6 +35,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UnixListener;
+use tokio::net::unix::UCred;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, watch};
 
@@ -192,6 +194,7 @@ pub async fn run(config: Config) -> io::Result<()> {
     egress::enable_ip_forward(&config.state_dir.join("ip_forward.before"))?;
     egress::ensure_node_policy(&config.subnet.to_string(), egress_iface.as_deref())
         .map_err(|e| io::Error::other(format!("apply the Node's egress policy: {e}")))?;
+    let gid = resolve_group(&config.socket_group)?;
     let agent = Arc::new(Agent {
         node: vm::NodeConfig {
             firecracker: config.firecracker,
@@ -199,6 +202,7 @@ pub async fn run(config: Config) -> io::Result<()> {
             kernel: config.kernel,
             jail_base: config.state_dir.join("jail"),
             node_address: config.subnet.node_address(),
+            cirro_gid: gid,
         },
         subnet: config.subnet,
         logs_dir: logs_dir.clone(),
@@ -209,7 +213,6 @@ pub async fn run(config: Config) -> io::Result<()> {
     });
     agent.reconcile().await?;
 
-    let gid = resolve_group(&config.socket_group)?;
     if let Some(dir) = config.socket.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -238,11 +241,18 @@ pub async fn run(config: Config) -> io::Result<()> {
                         continue;
                     }
                 };
+                let cred = match stream.peer_cred() {
+                    Ok(cred) => cred,
+                    Err(e) => {
+                        eprintln!("cirro node: read peer credentials: {e}");
+                        continue;
+                    }
+                };
                 let agent = agent.clone();
                 tokio::spawn(async move {
                     let service = service_fn(move |req| {
                         let agent = agent.clone();
-                        async move { Ok::<_, hyper::Error>(agent.handle(req).await) }
+                        async move { Ok::<_, hyper::Error>(agent.handle(req, cred).await) }
                     });
                     if let Err(e) = http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), service)
@@ -288,7 +298,7 @@ fn refuse_if_already_running(socket: &Path) -> io::Result<()> {
 type ApiResponse = Response<Full<Bytes>>;
 
 impl Agent {
-    async fn handle(self: Arc<Self>, req: Request<Incoming>) -> ApiResponse {
+    async fn handle(self: Arc<Self>, req: Request<Incoming>, cred: UCred) -> ApiResponse {
         let method = req.method().clone();
         let path = req.uri().path().to_string();
         let query = req.uri().query().unwrap_or("").to_string();
@@ -299,7 +309,7 @@ impl Agent {
                 Ok(json(StatusCode::OK, &self.list(all)))
             }
             (&Method::POST, ["vms"]) => match read_json::<RunRequest>(req).await {
-                Ok(run) => self.run_vm(run).await,
+                Ok(run) => self.run_vm(run, cred).await,
                 Err(e) => Err(e),
             },
             (&Method::POST, ["vms", name, "stop"]) => {
@@ -342,7 +352,11 @@ impl Agent {
         self.logs_dir.join(format!("{name}.{n}.log"))
     }
 
-    async fn run_vm(self: Arc<Self>, run: RunRequest) -> Result<ApiResponse, ApiError> {
+    async fn run_vm(
+        self: Arc<Self>,
+        run: RunRequest,
+        cred: UCred,
+    ) -> Result<ApiResponse, ApiError> {
         validate_name(&run.name)?;
         if run.command.is_empty() {
             return Err(bad_request("no command given to run in the VM"));
@@ -350,6 +364,26 @@ impl Agent {
         if !run.rootfs.is_absolute() {
             return Err(bad_request("the rootfs path must be absolute"));
         }
+        // Opened as the caller's own uid/gid, before anything else is
+        // reserved: the agent runs as root, but a `cirro` group member
+        // must never make it read a file (or device) they couldn't (#14).
+        let rootfs_path = run.rootfs.clone();
+        let (uid, gid) = (cred.uid(), cred.gid());
+        let rootfs_file =
+            tokio::task::spawn_blocking(move || rootfs_open::open_as(uid, gid, &rootfs_path))
+                .await
+                .map_err(|e| {
+                    ApiError(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("the rootfs-open helper panicked: {e}"),
+                    )
+                })?
+                .map_err(|e| match e {
+                    rootfs_open::Error::Denied(msg) => ApiError(StatusCode::FORBIDDEN, msg),
+                    rootfs_open::Error::Failed(msg) => {
+                        ApiError(StatusCode::INTERNAL_SERVER_ERROR, msg)
+                    }
+                })?;
         let log = self.new_log_path(&run.name);
         let (vm_address, replaced) = {
             let mut vms = self.vms.lock().unwrap();
@@ -397,6 +431,7 @@ impl Agent {
         let spec = VmSpec {
             vm_address,
             rootfs: run.rootfs,
+            rootfs_file,
             mem_mib: run.mem_mib,
             vcpus: run.vcpus,
             command: run.command,
