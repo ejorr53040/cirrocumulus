@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 bytes.workspace = true
+cirro-image.workspace = true
 cirro-node.workspace = true
 cirro-proto.workspace = true
 clap.workspace = true

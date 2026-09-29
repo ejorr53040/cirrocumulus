@@ -200,6 +200,36 @@ jobs:
       - name: cargo machete (unused dependencies)
         run: cargo machete
 
+  image:
+    # cirro-image builds ext4 from a tarball with `mke2fs -d`, which needs
+    # e2fsprogs 1.47.1+. ubuntu-24.04 ships 1.47.0, where those tests skip,
+    # so they run here on Debian trixie instead.
+    name: Image builder (Debian trixie)
+    needs: changes
+    if: >-
+      needs.changes.outputs.rust == 'true' &&
+      (needs.changes.outputs.crates == 'all' || contains(needs.changes.outputs.crates, 'cirro-image'))
+    runs-on: ubuntu-24.04
+    container: debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
+    timeout-minutes: 20
+    steps:
+      - name: Install e2fsprogs and a C linker
+        run: |
+          apt-get update -qq
+          apt-get install -qq -y --no-install-recommends \
+            ca-certificates curl e2fsprogs gcc libc6-dev > /dev/null
+          mke2fs -V
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: |
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" toolchain install
+      - name: cirro-image tests
+        run: cargo test --locked -p cirro-image
+
   every-commit-builds:
     # Keeps history bisectable: each commit in a PR must pass clippy on its
     # own, not just the tip. The `rust` job already covers the tip itself.
@@ -244,7 +274,7 @@ jobs:
     # itself fails, its dependents skip but its own failure still fails this.
     name: CI OK
     if: always()
-    needs: [changes, git, lint, rust, supply-chain, every-commit-builds]
+    needs: [changes, git, lint, rust, image, supply-chain, every-commit-builds]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
