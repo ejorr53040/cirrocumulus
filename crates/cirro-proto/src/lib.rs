@@ -25,6 +25,23 @@ use std::path::PathBuf;
 /// Response header on the logs endpoint: `running` or `ended`.
 pub const VM_STATE_HEADER: &str = "cirro-vm-state";
 
+/// `RunRequest.mem_mib`'s valid range, shared by the CLI's argument parser
+/// and the agent's own check on `run_vm` (the latter is the one that
+/// actually matters: the CLI is a convenience, not the trust boundary --
+/// anything on the agent's Unix socket can send a `RunRequest` the CLI
+/// never validated).
+pub const MIN_MEM_MIB: u32 = 128;
+/// A single VM taking down every other tenant's VMs on the Node by
+/// claiming an unbounded cgroup memory ceiling is exactly the sort of
+/// thing group membership (ADR 0002: "control over every VM on the Node,
+/// not host root") shouldn't buy you -- 64 GiB is generous for this
+/// project's single-spare-machine scale without being unbounded.
+pub const MAX_MEM_MIB: u32 = 65536;
+/// `RunRequest.vcpus`'s valid range, same sharing rationale as the memory
+/// bounds above.
+pub const MIN_VCPUS: u8 = 1;
+pub const MAX_VCPUS: u8 = 32;
+
 /// Boot a VM from a rootfs that already has guest-init as `/init`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRequest {

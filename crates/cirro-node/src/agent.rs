@@ -17,7 +17,10 @@ use crate::rootfs_open;
 use crate::state::{Record, Store};
 use crate::vm::{self, Stop, Vm, VmSpec};
 use bytes::Bytes;
-use cirro_proto::{EndReason, Ended, ErrorBody, RunRequest, StopRequest, VM_STATE_HEADER, VmInfo};
+use cirro_proto::{
+    EndReason, Ended, ErrorBody, MAX_MEM_MIB, MAX_VCPUS, MIN_MEM_MIB, MIN_VCPUS, RunRequest,
+    StopRequest, VM_STATE_HEADER, VmInfo,
+};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -303,6 +306,17 @@ impl Agent {
         let path = req.uri().path().to_string();
         let query = req.uri().query().unwrap_or("").to_string();
         let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+        // `run_vm` validates its own `name` (it's in the JSON body, not the
+        // path); every other `{name}` route below takes it from the URL
+        // instead, so it's validated once, here, before any of them run --
+        // consistent rejection of a malformed name across every route, and
+        // no handler echoes an unvalidated client-supplied string back
+        // unchecked (#7 in the 2026-09-28 security audit).
+        if let ["vms", name, ..] = segments.as_slice()
+            && let Err(e) = validate_name(name)
+        {
+            return json(e.0, &ErrorBody { error: e.1 });
+        }
         let result = match (&method, segments.as_slice()) {
             (&Method::GET, ["vms"]) => {
                 let all = query_param(&query, "all") == Some("true");
@@ -364,6 +378,13 @@ impl Agent {
         if !run.rootfs.is_absolute() {
             return Err(bad_request("the rootfs path must be absolute"));
         }
+        // The CLI's own `clap` parser bounds these too, but that's a
+        // convenience, not the trust boundary: anything that can reach
+        // this socket can send a `RunRequest` the CLI never built, so the
+        // agent has to enforce its own limits regardless of which client
+        // library issued the request.
+        in_bounds("vcpus", run.vcpus, MIN_VCPUS, MAX_VCPUS)?;
+        in_bounds("mem_mib", run.mem_mib, MIN_MEM_MIB, MAX_MEM_MIB)?;
         // Opened as the caller's own uid/gid, before anything else is
         // reserved: the agent runs as root, but a `cirro` group member
         // must never make it read a file (or device) they couldn't (#14).
@@ -760,6 +781,23 @@ fn next_log_number(logs_dir: &Path) -> u64 {
         })
         .max()
         .map_or(0, |highest| highest + 1)
+}
+
+/// `vcpus`/`mem_mib` (whichever `field` names) are within `[min, max]`, the
+/// same shape checked for both.
+fn in_bounds<T: PartialOrd + std::fmt::Display>(
+    field: &str,
+    value: T,
+    min: T,
+    max: T,
+) -> Result<(), ApiError> {
+    if value >= min && value <= max {
+        Ok(())
+    } else {
+        Err(bad_request(&format!(
+            "{field} must be between {min} and {max}, got {value}"
+        )))
+    }
 }
 
 /// VM names are 1-32 characters of lowercase letters, digits and hyphens,

@@ -156,7 +156,7 @@ pub struct ProcessId {
 
 impl ProcessId {
     /// The identity of the running process `pid`.
-    fn of(pid: u32) -> Option<ProcessId> {
+    pub(crate) fn of(pid: u32) -> Option<ProcessId> {
         let (_, start_time) = proc_stat(pid)?;
         Some(ProcessId { pid, start_time })
     }

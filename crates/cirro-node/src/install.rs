@@ -1,0 +1,348 @@
+//! `cirro node install` / `cirro node uninstall` (#11): sets up (and tears
+//! back down) everything a Node needs before `cirro node agent` can run --
+//! prerequisites, the pinned Firecracker/jailer/kernel, the `cirro` group,
+//! the state dir, and a systemd unit that starts the agent at boot.
+//!
+//! Everything install writes is recorded in one `NodeConfig` file at
+//! `<state_dir>/node.json`, so uninstall doesn't need to be told the same
+//! group/subnet/unit name again -- it reads back what install chose. This
+//! is also what makes a repeat `install` a no-op: called again with the
+//! same arguments, every step below finds its target already in the state
+//! it would have created and does nothing.
+
+use crate::agent::Subnet;
+use crate::egress;
+use crate::release::{self, ReleaseBinaries};
+use crate::state::Store;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+const IP_FORWARD_RECORD: &str = "ip_forward.before";
+const NODE_CONFIG_FILE: &str = "node.json";
+const RELEASE_SUBDIR: &str = "release";
+
+/// What `cirro node install` was given.
+pub struct InstallConfig {
+    pub state_dir: PathBuf,
+    pub socket: PathBuf,
+    /// The group created (if missing) and used for the agent socket.
+    pub group: String,
+    pub subnet: Subnet,
+    /// The systemd unit's name, without `.service`.
+    pub unit_name: String,
+    /// Skips fetching the pinned release when given -- the same convention
+    /// `node agent`'s own `--firecracker`/`--jailer`/`--kernel` flags use,
+    /// so tests can point install at local fixtures instead of the network.
+    pub release_override: Option<ReleaseBinaries>,
+}
+
+/// Everything install resolved, persisted so uninstall (and a future
+/// `cirro node agent` launched by the systemd unit) can find it again
+/// without being told the same arguments twice.
+#[derive(Serialize, Deserialize)]
+struct NodeConfig {
+    socket: PathBuf,
+    group: String,
+    subnet: String,
+    unit_name: String,
+    #[serde(flatten)]
+    release: ReleaseBinaries,
+}
+
+/// Checks KVM and cgroup v2 -- the successor to `scripts/step0/prereqs.sh`'s
+/// checks of the same two things (same `stat -f -c %T` test that script
+/// uses, rather than a raw `statfs(2)` FFI call, for the same reason this
+/// crate already shells out to `ip`/`nft` elsewhere). Runs first and
+/// changes nothing, so a Node that fails here is exactly as it was before
+/// `install` was called.
+pub fn check_prereqs() -> io::Result<()> {
+    let kvm = Path::new("/dev/kvm");
+    if !(kvm.exists() && is_rw(kvm)) {
+        return Err(io::Error::other(
+            "/dev/kvm is missing or not read/write for this user: Firecracker needs KVM",
+        ));
+    }
+    if cgroup_fs_type("/sys/fs/cgroup").as_deref() != Some("cgroup2fs") {
+        return Err(io::Error::other(
+            "/sys/fs/cgroup is not a unified cgroup v2 hierarchy: jailer needs --cgroup-version=2, \
+             which needs the v2 hierarchy",
+        ));
+    }
+    Ok(())
+}
+
+fn is_rw(path: &Path) -> bool {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .is_ok()
+}
+
+fn cgroup_fs_type(path: &str) -> Option<String> {
+    let output = Command::new("stat")
+        .args(["-f", "-c", "%T", path])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Sets up everything `cirro node agent` needs: prerequisites, the pinned
+/// release (unless overridden), the group, the state dir, the Node config
+/// and a systemd unit that starts the agent at boot. Idempotent -- see the
+/// module doc.
+pub fn install(cfg: &InstallConfig) -> io::Result<()> {
+    check_prereqs()?;
+
+    fs::create_dir_all(&cfg.state_dir)?;
+
+    let release = match &cfg.release_override {
+        Some(r) => r.clone(),
+        None => {
+            let release_dir = cfg.state_dir.join(RELEASE_SUBDIR);
+            fs::create_dir_all(&release_dir)?;
+            release::fetch(&release_dir)?
+        }
+    };
+
+    ensure_group(&cfg.group)?;
+
+    let node_config = NodeConfig {
+        socket: cfg.socket.clone(),
+        group: cfg.group.clone(),
+        subnet: cfg.subnet.to_string(),
+        unit_name: cfg.unit_name.clone(),
+        release,
+    };
+    write_node_config(&cfg.state_dir, &node_config)?;
+
+    install_unit(&node_config, &cfg.state_dir)?;
+
+    Ok(())
+}
+
+/// Reverses [`install`]: refuses while a VM is still running unless
+/// `force`, then removes the systemd unit, the group, the egress policy,
+/// restores `net.ipv4.ip_forward`, and removes the state dir -- everything
+/// install created, and everything the agent itself created while it ran
+/// (the egress table, `ip_forward.before`).
+pub fn uninstall(state_dir: &Path, force: bool) -> io::Result<()> {
+    let node_config = read_node_config(state_dir).map_err(|e| {
+        io::Error::other(format!(
+            "{}: {e} (nothing installed here?)",
+            state_dir.display()
+        ))
+    })?;
+
+    if !force {
+        refuse_if_vms_running(state_dir, &node_config.subnet)?;
+    }
+
+    remove_unit(&node_config.unit_name)?;
+    let _ = remove_group(&node_config.group);
+    let _ = egress::remove_node_policy();
+    egress::restore_ip_forward(&state_dir.join(IP_FORWARD_RECORD))?;
+
+    fs::remove_dir_all(state_dir)?;
+    Ok(())
+}
+
+fn refuse_if_vms_running(state_dir: &Path, subnet: &str) -> io::Result<()> {
+    let db = state_dir.join("state.db");
+    if !db.exists() {
+        return Ok(());
+    }
+    let running: Vec<String> = Store::open(&db, subnet)?
+        .load()?
+        .into_iter()
+        .filter(|r| r.process.is_some_and(|p| p.is_running()))
+        .map(|r| r.info.name)
+        .collect();
+    if running.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "refusing to uninstall: {} VM(s) still running ({}); stop them first or pass \
+             --force",
+            running.len(),
+            running.join(", ")
+        )))
+    }
+}
+
+/// `ensure_group`/`remove_group` are mirror images of each other: check
+/// whether `name` already matches the wanted existence state, and if not,
+/// run the command that would fix it.
+fn set_group_existence(name: &str, want_exists: bool, verb: &str) -> io::Result<()> {
+    if nix::unistd::Group::from_name(name)?.is_some() == want_exists {
+        return Ok(());
+    }
+    run(Command::new(verb).arg(name))
+}
+
+fn ensure_group(name: &str) -> io::Result<()> {
+    set_group_existence(name, true, "groupadd")
+}
+
+/// Best-effort: a group that's already gone (or never created, e.g. an
+/// install that only ever used a numeric gid) isn't a failure to undo.
+fn remove_group(name: &str) -> io::Result<()> {
+    set_group_existence(name, false, "groupdel")
+}
+
+fn write_node_config(state_dir: &Path, config: &NodeConfig) -> io::Result<()> {
+    let json = serde_json::to_string_pretty(config).map_err(io::Error::other)?;
+    fs::write(state_dir.join(NODE_CONFIG_FILE), json)
+}
+
+fn read_node_config(state_dir: &Path) -> io::Result<NodeConfig> {
+    let json = fs::read_to_string(state_dir.join(NODE_CONFIG_FILE))?;
+    serde_json::from_str(&json).map_err(io::Error::other)
+}
+
+/// Writes `<unit_name>.service`, running the agent with the paths
+/// `install` resolved, then `daemon-reload`s and enables it. Re-running
+/// with identical config writes the identical unit content and re-enables
+/// an already-enabled unit, both no-ops.
+fn install_unit(config: &NodeConfig, state_dir: &Path) -> io::Result<()> {
+    let cirro_bin = std::env::current_exe()?;
+    let unit = format!(
+        "[Unit]\n\
+         Description=Cirrocumulus Node agent\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\
+         \n\
+         [Service]\n\
+         ExecStart={bin} node agent --socket {socket} --socket-group {group} \
+         --subnet {subnet} --state-dir {state_dir} --firecracker {firecracker} \
+         --jailer {jailer} --kernel {kernel}\n\
+         Restart=on-failure\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        bin = cirro_bin.display(),
+        socket = config.socket.display(),
+        group = config.group,
+        subnet = config.subnet,
+        state_dir = state_dir.display(),
+        firecracker = config.release.firecracker.display(),
+        jailer = config.release.jailer.display(),
+        kernel = config.release.kernel.display(),
+    );
+    let unit_path = unit_path(&config.unit_name);
+    fs::write(&unit_path, unit)?;
+    run(Command::new("systemctl").arg("daemon-reload"))?;
+    run(Command::new("systemctl")
+        .args(["enable", "--now"])
+        .arg(format!("{}.service", config.unit_name)))
+}
+
+/// Stops, disables and removes the unit. Missing/not-enabled is fine --
+/// matches this module's general tolerance for "already undone".
+fn remove_unit(unit_name: &str) -> io::Result<()> {
+    let service = format!("{unit_name}.service");
+    let _ = Command::new("systemctl").args(["stop", &service]).status();
+    let _ = Command::new("systemctl")
+        .args(["disable", &service])
+        .status();
+    let path = unit_path(unit_name);
+    if path.exists() {
+        fs::remove_file(&path)?;
+    }
+    run(Command::new("systemctl").arg("daemon-reload"))
+}
+
+fn unit_path(unit_name: &str) -> PathBuf {
+    PathBuf::from("/etc/systemd/system").join(format!("{unit_name}.service"))
+}
+
+fn run(command: &mut Command) -> io::Result<()> {
+    release::run_capturing(command).map(drop)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vm::ProcessId;
+    use cirro_proto::{EndReason, Ended, VmInfo};
+
+    /// Needs no root at all: a real SQLite state dir and the test's own
+    /// process (a real, genuinely running pid) standing in for a VM's
+    /// VMM, so [`ProcessId::is_running`] sees the truth without mocking
+    /// it. Exercises the refusal decision `uninstall` makes, independent
+    /// of the group/systemd-unit mutation the full CLI path needs root
+    /// for (covered instead by `crates/cirro/tests/node_install.rs`).
+    fn tempdir() -> PathBuf {
+        crate::test_util::tempdir("cirro-install-test")
+    }
+
+    #[test]
+    fn does_not_refuse_when_the_state_db_does_not_exist_yet() {
+        let dir = tempdir();
+        refuse_if_vms_running(&dir, "10.77.0.0/24").expect("no db means nothing is running");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn does_not_refuse_when_every_vm_has_ended() {
+        let dir = tempdir();
+        let store = Store::open(&dir.join("state.db"), "10.77.0.0/24").unwrap();
+        let info = VmInfo {
+            name: "web".to_string(),
+            vm_address: None,
+            mem_mib: 256,
+            vcpus: 1,
+            started_at: 0,
+            ended: None,
+        };
+        let process = ProcessId::of(std::process::id()).expect("this test process exists");
+        store
+            .insert_running(&info, &dir.join("web.log"), process)
+            .unwrap();
+        store
+            .mark_ended(
+                "web",
+                &Ended {
+                    at: 0,
+                    reason: EndReason::Graceful,
+                },
+            )
+            .unwrap();
+        drop(store);
+
+        refuse_if_vms_running(&dir, "10.77.0.0/24").expect("an Ended VM isn't a running one");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_while_a_vm_is_running() {
+        let dir = tempdir();
+        let store = Store::open(&dir.join("state.db"), "10.77.0.0/24").unwrap();
+        let info = VmInfo {
+            name: "web".to_string(),
+            vm_address: None,
+            mem_mib: 256,
+            vcpus: 1,
+            started_at: 0,
+            ended: None,
+        };
+        // This test process is real and running, so `ProcessId::is_running`
+        // sees a genuinely live process -- exactly what a running VM's
+        // record looks like from `uninstall`'s point of view.
+        let process = ProcessId::of(std::process::id()).expect("this test process exists");
+        store
+            .insert_running(&info, &dir.join("web.log"), process)
+            .unwrap();
+        drop(store);
+
+        let err = refuse_if_vms_running(&dir, "10.77.0.0/24").unwrap_err();
+        assert!(err.to_string().contains("web"), "{err}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+}

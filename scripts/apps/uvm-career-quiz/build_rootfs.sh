@@ -52,10 +52,19 @@ mkdir -p "$ROOTFS_TREE"
 # `add` exits non-zero because of the expected post-install/trigger
 # failures described above; the packages themselves land regardless, which
 # is what the chroot smoke test above already confirmed.
+#
+# `--keys-dir` points at this repo's own copy of Alpine's current x86_64
+# signing keys (`alpine-keys` 2.4-r1, the same package a real Alpine
+# install trusts out of the box) instead of `--allow-untrusted`, which used
+# to skip package signature verification entirely -- every package here,
+# including the Python interpreter that ends up running the app's code in
+# the guest, was previously trusted on TLS-to-the-CDN alone (2026-09-28
+# security audit, #4).
 "$APK" \
     -X "https://dl-cdn.alpinelinux.org/alpine/$ALPINE_BRANCH/main" \
     -X "https://dl-cdn.alpinelinux.org/alpine/$ALPINE_BRANCH/community" \
-    -U --allow-untrusted --root "$ROOTFS_TREE" --initdb \
+    --keys-dir "$HERE/alpine-keys" \
+    -U --root "$ROOTFS_TREE" --initdb \
     add alpine-baselayout python3 py3-flask \
     || true
 

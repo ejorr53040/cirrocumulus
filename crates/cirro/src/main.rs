@@ -2,6 +2,7 @@ mod client;
 mod open_rootfs;
 
 use cirro_node::agent::{self, Subnet};
+use cirro_node::release::ReleaseBinaries;
 use cirro_proto::{RunRequest, StopRequest, VM_STATE_HEADER, VmInfo};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use hyper::Method;
@@ -55,7 +56,8 @@ enum Command {
         #[arg(long, default_value = "256M", value_parser = parse_mem_mib)]
         mem: u32,
         /// Guest vCPUs
-        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=32))]
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8)
+            .range(i64::from(cirro_proto::MIN_VCPUS)..=i64::from(cirro_proto::MAX_VCPUS)))]
         vcpus: u8,
         /// An ext4 rootfs with guest-init as /init
         rootfs: PathBuf,
@@ -111,7 +113,38 @@ enum Command {
 #[derive(Subcommand)]
 enum NodeCommand {
     /// Fetch and verify firecracker and jailer, check KVM and cgroup v2
-    Install,
+    Install {
+        /// Where the agent keeps jails, console logs and its own config
+        #[arg(long, default_value = "/var/lib/cirro")]
+        state_dir: PathBuf,
+        /// The group created (if missing) and used for the agent socket
+        #[arg(long, default_value = "cirro")]
+        group: String,
+        /// The Node subnet VM addresses come from
+        #[arg(long, default_value = "10.77.0.0/24")]
+        subnet: Subnet,
+        /// The systemd unit's name, without `.service`
+        #[arg(long, default_value = "cirro")]
+        unit_name: String,
+        /// Use this firecracker instead of fetching the pinned release
+        #[arg(long, requires = "jailer", requires = "kernel")]
+        firecracker: Option<PathBuf>,
+        /// Use this jailer instead of fetching the pinned release
+        #[arg(long, requires = "firecracker", requires = "kernel")]
+        jailer: Option<PathBuf>,
+        /// Use this guest kernel instead of fetching the pinned release
+        #[arg(long, requires = "firecracker", requires = "jailer")]
+        kernel: Option<PathBuf>,
+    },
+    /// Reverse `install`: refuses while a VM is running unless `--force`
+    Uninstall {
+        /// The state dir `install` was given
+        #[arg(long, default_value = "/var/lib/cirro")]
+        state_dir: PathBuf,
+        /// Uninstall even if VMs are still running
+        #[arg(long)]
+        force: bool,
+    },
     /// Join this node to a cluster
     Join { token: String },
     /// Run the Node agent in the foreground (as root)
@@ -199,6 +232,36 @@ fn main() -> ExitCode {
                 name,
             } => stop(&cli.socket, &name, force, timeout).await,
             Command::Rm { name } => rm(&cli.socket, &name).await,
+            Command::Node(NodeCommand::Install {
+                state_dir,
+                group,
+                subnet,
+                unit_name,
+                firecracker,
+                jailer,
+                kernel,
+            }) => cirro_node::install::install(&cirro_node::install::InstallConfig {
+                state_dir,
+                socket: cli.socket,
+                group,
+                subnet,
+                unit_name,
+                // `requires` on all three CLI args above guarantees this is
+                // never a partial combination.
+                release_override: match (firecracker, jailer, kernel) {
+                    (Some(firecracker), Some(jailer), Some(kernel)) => Some(ReleaseBinaries {
+                        firecracker,
+                        jailer,
+                        kernel,
+                    }),
+                    _ => None,
+                },
+            })
+            .map_err(|e| format!("node install: {e}")),
+            Command::Node(NodeCommand::Uninstall { state_dir, force }) => {
+                cirro_node::install::uninstall(&state_dir, force)
+                    .map_err(|e| format!("node uninstall: {e}"))
+            }
             _ => Err(format!("{}: not yet implemented", command_path(&matches))),
         }
     });
@@ -356,8 +419,14 @@ fn parse_mem_mib(s: &str) -> Result<u32, String> {
         .parse()
         .map_err(|_| format!("{s:?} is not a memory size like 256M or 1G"))?;
     match n.checked_mul(scale) {
-        Some(mib) if mib >= 128 => Ok(mib),
-        _ => Err(format!("{s:?}: memory must be at least 128M")),
+        Some(mib) if (cirro_proto::MIN_MEM_MIB..=cirro_proto::MAX_MEM_MIB).contains(&mib) => {
+            Ok(mib)
+        }
+        _ => Err(format!(
+            "{s:?}: memory must be between {}M and {}M",
+            cirro_proto::MIN_MEM_MIB,
+            cirro_proto::MAX_MEM_MIB
+        )),
     }
 }
 
