@@ -18,7 +18,7 @@ Needs a Linux x86_64 host with KVM (`/dev/kvm`) and cgroup v2, and systemd
 (the Node agent runs as a systemd unit).
 
 ```sh
-cargo build --release -p cirro
+cargo build --release -p cirrocumulus
 sudo install -m 755 target/release/cirro /usr/local/bin/cirro
 ```
 
