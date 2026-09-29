@@ -2,6 +2,12 @@
 # Step 0 prereq check: is this machine able to run Firecracker microVMs under
 # jailer at all, before any Rust gets written? Exits 0 if every check passes,
 # 1 otherwise, printing a pass/fail line per check either way.
+#
+# Superseded for an actual Node by `cirro node install` (#11), whose
+# `cirro_node::install::check_prereqs` checks KVM and cgroup v2 the same way
+# (and, unlike this script, refuses to change anything on the Node if either
+# check fails). This script stays for Step 0's own manual firecracker/jailer
+# poking, which predates `cirro` entirely.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

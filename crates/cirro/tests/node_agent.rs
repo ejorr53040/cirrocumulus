@@ -26,6 +26,7 @@ use nix::unistd::{Pid, getgid};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::OnceLock;
@@ -34,69 +35,8 @@ use std::time::{Duration, Instant};
 const HTTP_PORT: u16 = 8080;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("crates/cirro is two levels under the workspace root")
-        .to_path_buf()
-}
-
-fn home() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").expect("HOME set"))
-}
-
-/// Where the sudoers rule lets the test run `cirro` as root.
-fn test_agent_path() -> PathBuf {
-    home().join(".local/lib/cirro-test/cirro")
-}
-
-fn latest_kernel() -> PathBuf {
-    let build_dir = repo_root().join("scripts/step0/.build");
-    let mut kernels: Vec<PathBuf> = std::fs::read_dir(&build_dir)
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("vmlinux-"))
-        })
-        .collect();
-    kernels.sort();
-    kernels.pop().unwrap_or_else(|| {
-        panic!(
-            "no kernel image under {} -- run scripts/step0/fetch_kernel.sh first",
-            build_dir.display()
-        )
-    })
-}
-
-/// Copies the freshly built `cirro` to the sudoers-approved path (via a
-/// rename, so a half-written binary is never runnable there) and checks
-/// `sudo -n` will run it, once per test run. `None` means the rule is
-/// missing.
-fn test_agent() -> Option<&'static Path> {
-    static AGENT: OnceLock<Option<PathBuf>> = OnceLock::new();
-    AGENT
-        .get_or_init(|| {
-            let path = test_agent_path();
-            std::fs::create_dir_all(path.parent().unwrap()).expect("create test agent dir");
-            let staging = path.with_extension(format!("tmp-{}", std::process::id()));
-            std::fs::copy(env!("CARGO_BIN_EXE_cirro"), &staging).expect("stage test agent");
-            std::fs::rename(&staging, &path).expect("install test agent binary");
-            let ok = std::process::Command::new("sudo")
-                .arg("-n")
-                .arg(&path)
-                .arg("--version")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success());
-            ok.then_some(path)
-        })
-        .as_deref()
-}
+mod common;
+use common::{home, latest_kernel, repo_root, test_agent, test_agent_path};
 
 /// The rootfs images the tests boot, built once per test run without root
 /// (`mkfs.ext4 -d`). Every image carries the fixture commands under `/app`.
@@ -408,6 +348,29 @@ fn wait_for_http(address: &str, port: u16) -> String {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// A raw `POST {path}` straight over the agent's Unix socket, bypassing
+/// `cirro`'s own `clap` argument validation entirely -- the socket, not the
+/// CLI, is the actual trust boundary (ADR 0002), so some findings can only
+/// be proven at this seam (2026-09-28 security audit, #2: a client that
+/// isn't the `cirro` CLI can send a `RunRequest` clap would have rejected).
+fn post_raw(socket: &Path, path: &str, json_body: &str) -> std::io::Result<String> {
+    let mut stream = UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+    write!(
+        stream,
+        "POST {path} HTTP/1.0\r\n\
+         Host: localhost\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         \r\n\
+         {json_body}",
+        json_body.len()
+    )?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
 }
 
 fn stdout_of(args: &[&str]) -> String {
@@ -1116,6 +1079,67 @@ fn run_refuses_a_rootfs_thats_not_a_regular_file_and_leaves_nothing() {
         row(&ps, "not-regular").is_none(),
         "a refused run left a record:\n{ps}"
     );
+    agent.assert_no_cirro_state();
+}
+
+/// 2026-09-28 security audit, #2: `clap` bounds `--mem`/`--vcpus` in the
+/// CLI, but the CLI isn't the trust boundary -- ADR 0002 says the socket
+/// is. A raw client that skips `cirro` entirely must still be refused by
+/// the agent itself.
+#[test]
+fn run_rejects_resource_requests_outside_the_agents_own_bounds() {
+    let Some(agent) = Agent::start(235) else {
+        return;
+    };
+    let rootfs = rootfs().guest_init.display();
+
+    for (field, mem_mib, vcpus) in [
+        ("vcpus", "256", "0"),
+        ("vcpus", "256", "255"),
+        ("mem_mib", "0", "1"),
+        ("mem_mib", "4294967295", "1"),
+    ] {
+        let body = format!(
+            r#"{{"name":"oob","rootfs":"{rootfs}","mem_mib":{mem_mib},"vcpus":{vcpus},"command":["/app/http_app"]}}"#
+        );
+        let response = post_raw(&agent.socket, "/vms", &body).expect("send a raw /vms request");
+        assert!(
+            response.contains(" 400 "),
+            "expected a 400 for out-of-range {field}, got: {response}"
+        );
+        assert!(
+            response.contains(field),
+            "expected the error to name {field}, got: {response}"
+        );
+    }
+
+    let ps = agent.ps(true);
+    assert!(
+        row(&ps, "oob").is_none(),
+        "a rejected raw request left a record:\n{ps}"
+    );
+    agent.assert_no_cirro_state();
+}
+
+/// 2026-09-28 security audit, #7: `run_vm` validates `name`, but `stop`,
+/// `logs` and `remove` didn't -- inconsistent, and each would otherwise
+/// echo an unvalidated client-supplied name back into its own errors.
+#[test]
+fn stop_logs_and_rm_reject_invalid_names_up_front() {
+    let Some(agent) = Agent::start(234) else {
+        return;
+    };
+    for args in [
+        vec!["stop", "BADNAME"],
+        vec!["logs", "BADNAME"],
+        vec!["rm", "BADNAME"],
+    ] {
+        let err = stderr(agent.cirro().args(&args).assert().failure());
+        assert!(
+            err.contains("invalid VM name"),
+            "expected {args:?} to reject the name up front like `run` does, got: {err}"
+        );
+    }
     agent.assert_no_cirro_state();
 }
 

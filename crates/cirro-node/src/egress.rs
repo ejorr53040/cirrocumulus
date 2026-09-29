@@ -82,6 +82,22 @@ pub fn enable_ip_forward(record: &Path) -> io::Result<()> {
     std::fs::write(IP_FORWARD, "1")
 }
 
+/// Reverses [`enable_ip_forward`]: puts `net.ipv4.ip_forward` back to
+/// whatever it recorded at `record`, then removes the record. For `cirro
+/// node uninstall`. A missing record means no agent ever ran here (or a
+/// previous uninstall already restored it) -- a no-op, not an error, the
+/// same tolerance [`remove_node_policy`] gives a missing table.
+pub fn restore_ip_forward(record: &Path) -> io::Result<()> {
+    const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
+    let before = match std::fs::read_to_string(record) {
+        Ok(value) => value,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    std::fs::write(IP_FORWARD, before.trim())?;
+    std::fs::remove_file(record)
+}
+
 /// The interface the Node's IPv4 default route goes out of, if it has one.
 pub fn default_route_iface() -> Option<String> {
     let output = Command::new("ip")
