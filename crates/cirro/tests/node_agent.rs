@@ -35,6 +35,10 @@ use std::time::{Duration, Instant};
 const HTTP_PORT: u16 = 8080;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The Node subnet octets of the agents currently running in this process.
+static LIVE_OCTETS: std::sync::Mutex<std::collections::BTreeSet<u8>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
 mod common;
 use common::{home, latest_kernel, repo_root, test_agent, test_agent_path};
 
@@ -132,6 +136,14 @@ impl Agent {
             );
             return None;
         }
+
+        // Two live agents on one subnet sweep each other's VMs, which shows
+        // up as unrelated failures elsewhere in the suite.
+        let free = LIVE_OCTETS.lock().unwrap().insert(octet);
+        assert!(
+            free,
+            "octet {octet} is already used by another running test; give this test its own"
+        );
 
         // Under $HOME, not /tmp: jailer mknods /dev/kvm in the jail, and /tmp
         // is usually a nodev tmpfs. Kept short so jail socket paths fit in a
@@ -305,6 +317,7 @@ impl Drop for Agent {
         }
         self.stop_agent();
         let _ = std::fs::remove_dir_all(&self.state_dir);
+        LIVE_OCTETS.lock().unwrap().remove(&self.octet);
     }
 }
 
@@ -1013,7 +1026,7 @@ fn run_reports_why_a_vm_failed_to_start_and_leaves_nothing() {
 /// to control VMs, not read arbitrary root-readable files on the host.
 #[test]
 fn run_refuses_a_rootfs_the_caller_cant_read_and_leaves_nothing() {
-    let Some(agent) = Agent::start(244) else {
+    let Some(agent) = Agent::start(233) else {
         return;
     };
 
@@ -1056,7 +1069,7 @@ fn run_refuses_a_rootfs_the_caller_cant_read_and_leaves_nothing() {
 /// into the state dir's filesystem until it fills.
 #[test]
 fn run_refuses_a_rootfs_thats_not_a_regular_file_and_leaves_nothing() {
-    let Some(agent) = Agent::start(243) else {
+    let Some(agent) = Agent::start(232) else {
         return;
     };
 
@@ -1147,7 +1160,7 @@ fn stop_logs_and_rm_reject_invalid_names_up_front() {
 /// readable to the `cirro` group but not to everyone (#14).
 #[test]
 fn console_logs_are_not_world_readable() {
-    let Some(agent) = Agent::start(242) else {
+    let Some(agent) = Agent::start(231) else {
         return;
     };
 
@@ -1184,7 +1197,7 @@ fn console_logs_are_not_world_readable() {
 #[test]
 fn a_user_outside_the_socket_group_gets_a_clear_permission_error() {
     // The test user isn't in group 0 (root), so the socket is closed to it.
-    let Some(agent) = Agent::start_with_socket_group(249, "0") else {
+    let Some(agent) = Agent::start_with_socket_group(230, "0") else {
         return;
     };
     let err = stderr(agent.cirro().arg("ps").assert().failure());
