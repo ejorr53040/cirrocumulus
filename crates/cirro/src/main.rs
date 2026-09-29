@@ -1,8 +1,9 @@
 mod client;
 mod open_rootfs;
 
-use cirro_node::agent::{self, Subnet};
+use cirro_node::agent;
 use cirro_node::release::ReleaseBinaries;
+use cirro_node::subnet::Subnet;
 use cirro_proto::{RunRequest, StopRequest, VM_STATE_HEADER, VmInfo};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use hyper::Method;

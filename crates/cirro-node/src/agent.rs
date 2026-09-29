@@ -15,6 +15,7 @@
 use crate::egress;
 use crate::rootfs_open;
 use crate::state::{Record, Store};
+use crate::subnet::Subnet;
 use crate::vm::{self, Stop, Vm, VmSpec};
 use bytes::Bytes;
 use cirro_proto::{
@@ -33,7 +34,6 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -45,62 +45,6 @@ use tokio::sync::{mpsc, watch};
 /// How long a graceful stop waits for the VM to end before killing it,
 /// unless the request says otherwise.
 const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// A Node subnet such as `10.77.0.0/24`. `.1` is the Node's own address;
-/// VM addresses are handed out from `.2` up.
-#[derive(Debug, Clone, Copy)]
-pub struct Subnet {
-    network: u32,
-    prefix_len: u8,
-}
-
-impl FromStr for Subnet {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (addr, len) = s
-            .split_once('/')
-            .ok_or_else(|| format!("{s:?} is not a CIDR like 10.77.0.0/24"))?;
-        let addr: Ipv4Addr = addr.parse().map_err(|e| format!("{s:?}: {e}"))?;
-        let prefix_len: u8 = len.parse().map_err(|e| format!("{s:?}: {e}"))?;
-        if !(16..=30).contains(&prefix_len) {
-            return Err(format!("{s:?}: prefix length must be between 16 and 30"));
-        }
-        let mask = u32::MAX << (32 - prefix_len);
-        Ok(Subnet {
-            network: u32::from(addr) & mask,
-            prefix_len,
-        })
-    }
-}
-
-impl std::fmt::Display for Subnet {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}", Ipv4Addr::from(self.network), self.prefix_len)
-    }
-}
-
-impl Subnet {
-    fn node_address(self) -> Ipv4Addr {
-        Ipv4Addr::from(self.network + 1)
-    }
-
-    /// The VM address of this Node's subnet whose low 16 bits are `low`, the
-    /// part [`vm::host_id`] names host objects by.
-    fn vm_address_with_low16(self, low: u16) -> Option<Ipv4Addr> {
-        let address = self.network & 0xFFFF_0000 | u32::from(low);
-        let broadcast = self.network | (u32::MAX >> self.prefix_len);
-        (self.network + 2..broadcast)
-            .contains(&address)
-            .then(|| Ipv4Addr::from(address))
-    }
-
-    /// Every address a VM may hold, lowest first.
-    fn vm_addresses(self) -> impl Iterator<Item = Ipv4Addr> {
-        let broadcast = self.network | (u32::MAX >> self.prefix_len);
-        (self.network + 2..broadcast).map(Ipv4Addr::from)
-    }
-}
 
 /// Everything `cirro node agent` is started with.
 pub struct Config {
@@ -306,12 +250,8 @@ impl Agent {
         let path = req.uri().path().to_string();
         let query = req.uri().query().unwrap_or("").to_string();
         let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
-        // `run_vm` validates its own `name` (it's in the JSON body, not the
-        // path); every other `{name}` route below takes it from the URL
-        // instead, so it's validated once, here, before any of them run --
-        // consistent rejection of a malformed name across every route, and
-        // no handler echoes an unvalidated client-supplied string back
-        // unchecked (#7 in the 2026-09-28 security audit).
+        // Path names are validated here, once, so no handler echoes an
+        // unvalidated string back. `run_vm` validates the name in its body.
         if let ["vms", name, ..] = segments.as_slice()
             && let Err(e) = validate_name(name)
         {
@@ -378,11 +318,6 @@ impl Agent {
         if !run.rootfs.is_absolute() {
             return Err(bad_request("the rootfs path must be absolute"));
         }
-        // The CLI's own `clap` parser bounds these too, but that's a
-        // convenience, not the trust boundary: anything that can reach
-        // this socket can send a `RunRequest` the CLI never built, so the
-        // agent has to enforce its own limits regardless of which client
-        // library issued the request.
         in_bounds("vcpus", run.vcpus, MIN_VCPUS, MAX_VCPUS)?;
         in_bounds("mem_mib", run.mem_mib, MIN_MEM_MIB, MAX_MEM_MIB)?;
         // Opened as the caller's own uid/gid, before anything else is
@@ -393,17 +328,10 @@ impl Agent {
         let rootfs_file =
             tokio::task::spawn_blocking(move || rootfs_open::open_as(uid, gid, &rootfs_path))
                 .await
-                .map_err(|e| {
-                    ApiError(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("the rootfs-open helper panicked: {e}"),
-                    )
-                })?
+                .map_err(|e| internal(format!("the rootfs-open helper panicked: {e}")))?
                 .map_err(|e| match e {
                     rootfs_open::Error::Denied(msg) => ApiError(StatusCode::FORBIDDEN, msg),
-                    rootfs_open::Error::Failed(msg) => {
-                        ApiError(StatusCode::INTERNAL_SERVER_ERROR, msg)
-                    }
+                    rootfs_open::Error::Failed(msg) => internal(msg),
                 })?;
         let log = self.new_log_path(&run.name);
         let (vm_address, replaced) = {
@@ -464,12 +392,7 @@ impl Agent {
         let name = run.name;
         tokio::spawn(async move { self.start_vm(name, spec, replaced).await })
             .await
-            .unwrap_or_else(|e| {
-                Err(ApiError(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("starting the VM panicked: {e}"),
-                ))
-            })
+            .unwrap_or_else(|e| Err(internal(format!("starting the VM panicked: {e}"))))
     }
 
     /// Runs `Vm::start` for a name and VM address already reserved as
@@ -509,10 +432,9 @@ impl Agent {
         if let Err(e) = recorded {
             vm.destroy().await;
             self.forget_start(&name, replaced, &spec.console_log);
-            return Err(ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("VM {name:?} started, but recording it failed, so it was stopped: {e}"),
-            ));
+            return Err(internal(format!(
+                "VM {name:?} started, but recording it failed, so it was stopped: {e}"
+            )));
         }
         if let Some(old) = replaced {
             let _ = std::fs::remove_file(old.log);
@@ -682,10 +604,9 @@ impl Agent {
         let _ = ended.wait_for(|ended| *ended).await;
         match self.vms.lock().unwrap().get(name) {
             Some(Entry::Ended { info, .. }) => Ok(json(StatusCode::OK, info)),
-            _ => Err(ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("VM {name:?} ended, but its record is gone"),
-            )),
+            _ => Err(internal(format!(
+                "VM {name:?} ended, but its record is gone"
+            ))),
         }
     }
 
@@ -699,12 +620,7 @@ impl Agent {
         if let Ok(mut file) = std::fs::File::open(log) {
             file.seek(SeekFrom::Start(offset))
                 .and_then(|_| file.read_to_end(&mut bytes))
-                .map_err(|e| {
-                    ApiError(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("read the console log: {e}"),
-                    )
-                })?;
+                .map_err(|e| internal(format!("read the console log: {e}")))?;
         }
         Ok(Response::builder()
             .status(StatusCode::OK)
@@ -719,12 +635,11 @@ impl Agent {
         match vms.get(name) {
             None => Err(no_such_vm(name)),
             Some(Entry::Ended { log, .. }) => {
-                self.store.lock().unwrap().delete(name).map_err(|e| {
-                    ApiError(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("remove the record of {name:?}: {e}"),
-                    )
-                })?;
+                self.store
+                    .lock()
+                    .unwrap()
+                    .delete(name)
+                    .map_err(|e| internal(format!("remove the record of {name:?}: {e}")))?;
                 let _ = std::fs::remove_file(log);
                 vms.remove(name);
                 Ok(Response::builder()
@@ -849,6 +764,10 @@ struct ApiError(StatusCode, String);
 
 fn bad_request(message: &str) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, message.to_string())
+}
+
+fn internal(message: String) -> ApiError {
+    ApiError(StatusCode::INTERNAL_SERVER_ERROR, message)
 }
 
 fn no_such_vm(name: &str) -> ApiError {

@@ -10,10 +10,10 @@
 //! same arguments, every step below finds its target already in the state
 //! it would have created and does nothing.
 
-use crate::agent::Subnet;
 use crate::egress;
 use crate::release::{self, ReleaseBinaries};
 use crate::state::Store;
+use crate::subnet::Subnet;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
