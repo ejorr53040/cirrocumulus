@@ -41,6 +41,7 @@ use tokio::net::UnixListener;
 use tokio::net::unix::UCred;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, watch};
+use tracing::{Instrument, error, info, info_span, warn};
 
 /// How long a graceful stop waits for the VM to end before killing it,
 /// unless the request says otherwise.
@@ -136,7 +137,7 @@ pub async fn run(config: Config) -> io::Result<()> {
     // Fail closed: no VM starts without the egress policy in place.
     let egress_iface = egress::default_route_iface();
     if egress_iface.is_none() {
-        eprintln!("cirro node: no IPv4 default route, so VMs won't reach the internet");
+        warn!("no IPv4 default route, so VMs won't reach the internet");
     }
     egress::enable_ip_forward(&config.state_dir.join("ip_forward.before"))?;
     egress::ensure_node_policy(&config.subnet.to_string(), egress_iface.as_deref())
@@ -176,6 +177,7 @@ pub async fn run(config: Config) -> io::Result<()> {
     std::os::unix::fs::chown(&config.socket, Some(0), Some(gid))?;
     std::fs::set_permissions(&config.socket, std::fs::Permissions::from_mode(0o660))?;
 
+    info!(socket = %config.socket.display(), subnet = %config.subnet, "Node agent ready");
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
     loop {
@@ -184,28 +186,35 @@ pub async fn run(config: Config) -> io::Result<()> {
                 let (stream, _) = match accepted {
                     Ok(conn) => conn,
                     Err(e) => {
-                        eprintln!("cirro node: accept: {e}");
+                        warn!("accept: {e}");
                         continue;
                     }
                 };
                 let cred = match stream.peer_cred() {
                     Ok(cred) => cred,
                     Err(e) => {
-                        eprintln!("cirro node: read peer credentials: {e}");
+                        warn!("read peer credentials: {e}");
                         continue;
                     }
                 };
                 let agent = agent.clone();
                 tokio::spawn(async move {
-                    let service = service_fn(move |req| {
+                    let service = service_fn(move |req: Request<Incoming>| {
                         let agent = agent.clone();
+                        let span = info_span!(
+                            "request",
+                            method = %req.method(),
+                            path = req.uri().path(),
+                            uid = cred.uid(),
+                        );
                         async move { Ok::<_, hyper::Error>(agent.handle(req, cred).await) }
+                            .instrument(span)
                     });
                     if let Err(e) = http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), service)
                         .await
                     {
-                        eprintln!("cirro node: connection: {e}");
+                        warn!("connection: {e}");
                     }
                 });
             }
@@ -214,6 +223,7 @@ pub async fn run(config: Config) -> io::Result<()> {
         }
     }
 
+    info!("shutting down; running VMs stay up");
     let _ = std::fs::remove_file(&config.socket);
     agent.shutdown().await;
     Ok(())
@@ -390,7 +400,7 @@ impl Agent {
         // or a full unwind) even if the client disconnects and hyper drops
         // this request's future.
         let name = run.name;
-        tokio::spawn(async move { self.start_vm(name, spec, replaced).await })
+        tokio::spawn(async move { self.start_vm(name, spec, replaced).await }.in_current_span())
             .await
             .unwrap_or_else(|e| Err(internal(format!("starting the VM panicked: {e}"))))
     }
@@ -405,9 +415,13 @@ impl Agent {
         spec: VmSpec,
         replaced: Option<Replaced>,
     ) -> Result<ApiResponse, ApiError> {
-        let vm = match Vm::start(&self.node, &spec).await {
+        let vm = match Vm::start(&self.node, &spec)
+            .instrument(info_span!("start", vm = name, address = %spec.vm_address))
+            .await
+        {
             Ok(vm) => vm,
             Err(e) => {
+                warn!(vm = name, "failed to start: {e}");
                 self.forget_start(&name, replaced, &spec.console_log);
                 return Err(ApiError(
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -439,6 +453,7 @@ impl Agent {
         if let Some(old) = replaced {
             let _ = std::fs::remove_file(old.log);
         }
+        info!(vm = name, address = %spec.vm_address, "VM started");
         self.start_supervising(info.clone(), spec.console_log, vm);
         Ok(json(StatusCode::CREATED, &info))
     }
@@ -492,6 +507,7 @@ impl Agent {
                     )));
                 };
                 if process.is_running() {
+                    info!(vm = name, "re-adopted a running VM");
                     let vm = Vm::adopt(&self.node, vm_address, process, log.clone());
                     self.start_supervising(info, log, vm);
                     continue;
@@ -500,6 +516,7 @@ impl Agent {
                     at: now(),
                     reason: EndReason::AgentDown,
                 };
+                info!(vm = name, "VM ended while the agent was down");
                 self.store.lock().unwrap().mark_ended(&name, &ended)?;
                 Entry::Ended {
                     info: ended_info(info, ended),
@@ -561,9 +578,10 @@ impl Agent {
     fn record_end(&self, name: &str, reason: EndReason) {
         let mut vms = self.vms.lock().unwrap();
         if let Some(Entry::Running { info, log, .. }) = vms.remove(name) {
+            info!(vm = name, reason = reason.as_str(), "VM ended");
             let ended = Ended { at: now(), reason };
             if let Err(e) = self.store.lock().unwrap().mark_ended(name, &ended) {
-                eprintln!("cirro node: record the end of {name:?}: {e}");
+                error!(vm = name, "record the end: {e}");
             }
             let info = ended_info(info, ended);
             vms.insert(name.to_string(), Entry::Ended { info, log });

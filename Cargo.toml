@@ -24,6 +24,8 @@ nix = "0.31.3"
 rtnetlink = "0.23"
 rusqlite = { version = "0.40", features = ["bundled"] }
 futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"] }
 cirro-proto = { path = "crates/cirro-proto", version = "0.1.0" }
 cirro-node = { path = "crates/cirro-node", version = "0.1.0" }
 

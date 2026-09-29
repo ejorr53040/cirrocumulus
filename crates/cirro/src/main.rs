@@ -207,17 +207,20 @@ fn main() -> ExitCode {
                 firecracker,
                 jailer,
                 kernel,
-            }) => agent::run(agent::Config {
-                state_dir,
-                socket: cli.socket,
-                socket_group,
-                subnet,
-                firecracker,
-                jailer,
-                kernel,
-            })
-            .await
-            .map_err(|e| format!("node agent: {e}")),
+            }) => {
+                init_agent_logging();
+                agent::run(agent::Config {
+                    state_dir,
+                    socket: cli.socket,
+                    socket_group,
+                    subnet,
+                    firecracker,
+                    jailer,
+                    kernel,
+                })
+                .await
+                .map_err(|e| format!("node agent: {e}"))
+            }
             Command::Run {
                 name,
                 mem,
@@ -273,6 +276,18 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The Node agent logs to stderr (the journal, under systemd). `CIRRO_LOG`
+/// takes an `EnvFilter` directive such as `debug`; the default is `info`.
+fn init_agent_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_env("CIRRO_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .init();
 }
 
 /// `cirro node install`-style path of the subcommand that was invoked.
