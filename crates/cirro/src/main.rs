@@ -4,8 +4,8 @@ mod open_rootfs;
 use cirro_node::agent;
 use cirro_node::release::ReleaseBinaries;
 use cirro_node::subnet::Subnet;
-use cirro_proto::{RunRequest, StopRequest, VM_STATE_HEADER, VmInfo};
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use cirro_proto::{RunRequest, StopRequest, User, VM_STATE_HEADER, VmInfo};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use hyper::Method;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -49,23 +49,7 @@ enum Command {
     #[command(subcommand)]
     Server(ServerCommand),
     /// Boot a VM from a rootfs image and print its VM address
-    Run {
-        /// The VM's name
-        #[arg(long)]
-        name: String,
-        /// Guest memory, e.g. 256M or 1G
-        #[arg(long, default_value = "256M", value_parser = parse_mem_mib)]
-        mem: u32,
-        /// Guest vCPUs
-        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8)
-            .range(i64::from(cirro_proto::MIN_VCPUS)..=i64::from(cirro_proto::MAX_VCPUS)))]
-        vcpus: u8,
-        /// An ext4 rootfs with guest-init as /init
-        rootfs: PathBuf,
-        /// The command to run in the VM, and its arguments
-        #[arg(last = true, required = true)]
-        command: Vec<String>,
-    },
+    Run(RunArgs),
     /// List VMs
     Ps {
         /// Also list Ended VMs, with when and why they ended
@@ -109,6 +93,34 @@ enum Command {
     /// credential drop, issue #14). Not for direct use.
     #[command(name = "__open-rootfs", hide = true)]
     OpenRootfs { uid: u32, gid: u32, path: PathBuf },
+}
+
+#[derive(Args)]
+struct RunArgs {
+    /// The VM's name
+    #[arg(long)]
+    name: String,
+    /// Guest memory, e.g. 256M or 1G
+    #[arg(long, default_value = "256M", value_parser = parse_mem_mib)]
+    mem: u32,
+    /// Guest vCPUs
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8)
+        .range(i64::from(cirro_proto::MIN_VCPUS)..=i64::from(cirro_proto::MAX_VCPUS)))]
+    vcpus: u8,
+    /// Set an environment variable for the command (repeatable)
+    #[arg(short, long = "env", value_name = "KEY=VALUE", value_parser = parse_env)]
+    env: Vec<String>,
+    /// The directory the command starts in [default: /]
+    #[arg(short, long, value_name = "DIR")]
+    workdir: Option<String>,
+    /// Run the command as this numeric user and group [default: 0:0]
+    #[arg(short, long, value_name = "UID:GID", value_parser = parse_user)]
+    user: Option<User>,
+    /// An ext4 rootfs with guest-init as /init
+    rootfs: PathBuf,
+    /// The command to run in the VM, and its arguments
+    #[arg(last = true, required = true)]
+    command: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -221,13 +233,7 @@ fn main() -> ExitCode {
                 .await
                 .map_err(|e| format!("node agent: {e}"))
             }
-            Command::Run {
-                name,
-                mem,
-                vcpus,
-                rootfs,
-                command,
-            } => run(&cli.socket, name, mem, vcpus, rootfs, command).await,
+            Command::Run(args) => run(&cli.socket, args).await,
             Command::Ps { all } => ps(&cli.socket, all).await,
             Command::Logs { follow, name } => logs(&cli.socket, &name, follow).await,
             Command::Stop {
@@ -301,22 +307,18 @@ fn command_path(matches: &clap::ArgMatches) -> String {
     path.join(" ")
 }
 
-async fn run(
-    socket: &Path,
-    name: String,
-    mem_mib: u32,
-    vcpus: u8,
-    rootfs: PathBuf,
-    command: Vec<String>,
-) -> Result<(), String> {
-    let rootfs =
-        std::fs::canonicalize(&rootfs).map_err(|e| format!("rootfs {}: {e}", rootfs.display()))?;
+async fn run(socket: &Path, args: RunArgs) -> Result<(), String> {
+    let rootfs = std::fs::canonicalize(&args.rootfs)
+        .map_err(|e| format!("rootfs {}: {e}", args.rootfs.display()))?;
     let request = RunRequest {
-        name,
+        name: args.name,
         rootfs,
-        mem_mib,
-        vcpus,
-        command,
+        mem_mib: args.mem,
+        vcpus: args.vcpus,
+        command: args.command,
+        env: args.env,
+        workdir: args.workdir,
+        user: args.user,
     };
     let vm: VmInfo = client::call(socket, Method::POST, "/vms", Some(&request))
         .await?
@@ -444,6 +446,23 @@ fn parse_mem_mib(s: &str) -> Result<u32, String> {
             cirro_proto::MAX_MEM_MIB
         )),
     }
+}
+
+/// Parses `--env`: `KEY=VALUE` with a non-empty key.
+fn parse_env(s: &str) -> Result<String, String> {
+    match s.split_once('=') {
+        Some((key, _)) if !key.is_empty() => Ok(s.to_string()),
+        _ => Err(format!("{s:?} is not KEY=VALUE")),
+    }
+}
+
+/// Parses `--user`: `UID:GID`, both numeric.
+fn parse_user(s: &str) -> Result<User, String> {
+    let (uid, gid) = s
+        .split_once(':')
+        .and_then(|(u, g)| Some((u.parse().ok()?, g.parse().ok()?)))
+        .ok_or_else(|| format!("{s:?} is not a numeric UID:GID like 1000:1000"))?;
+    Ok(User { uid, gid })
 }
 
 fn format_mem(mib: u32) -> String {

@@ -43,8 +43,26 @@ pub struct RunRequest {
     pub rootfs: PathBuf,
     pub mem_mib: u32,
     pub vcpus: u8,
-    /// The command guest-init runs: `command[0]` is the executable.
+    /// The command guest-init runs: `command[0]` is the executable, looked up
+    /// on the command's `PATH` when it has no `/`.
     pub command: Vec<String>,
+    /// The command's environment, as `KEY=VALUE`. guest-init adds `PATH` and
+    /// `HOME` when they're missing.
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// The absolute directory the command starts in; `/` when unset.
+    #[serde(default)]
+    pub workdir: Option<String>,
+    /// Who the command runs as inside the guest; root when unset.
+    #[serde(default)]
+    pub user: Option<User>,
+}
+
+/// A numeric user and group inside the guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct User {
+    pub uid: u32,
+    pub gid: u32,
 }
 
 /// A VM, or an Ended VM when `ended` is set.

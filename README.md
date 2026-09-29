@@ -47,7 +47,8 @@ address on success.
 ## Usage
 
 ```sh
-cirro run --name <name> [--mem 256M] [--vcpus 1] <rootfs> -- <command> [args...]
+cirro run --name <name> [--mem 256M] [--vcpus 1] [-e KEY=VALUE]... [-w DIR] [-u UID:GID] \
+          <rootfs> -- <command> [args...]
 cirro ps [--all]                  # list VMs (--all includes Ended VMs)
 cirro logs [--follow] <name>      # a VM's console log
 cirro stop [--force] [--timeout <secs>] <name>

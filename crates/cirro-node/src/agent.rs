@@ -16,7 +16,7 @@ use crate::egress;
 use crate::rootfs_open;
 use crate::state::{Record, Store};
 use crate::subnet::Subnet;
-use crate::vm::{self, Stop, Vm, VmSpec};
+use crate::vm::{self, GuestConfig, Stop, Vm, VmSpec};
 use bytes::Bytes;
 use cirro_proto::{
     EndReason, Ended, ErrorBody, MAX_MEM_MIB, MAX_VCPUS, MIN_MEM_MIB, MIN_VCPUS, RunRequest,
@@ -322,9 +322,7 @@ impl Agent {
         cred: UCred,
     ) -> Result<ApiResponse, ApiError> {
         validate_name(&run.name)?;
-        if run.command.is_empty() {
-            return Err(bad_request("no command given to run in the VM"));
-        }
+        let guest = guest_config(&run)?;
         if !run.rootfs.is_absolute() {
             return Err(bad_request("the rootfs path must be absolute"));
         }
@@ -393,7 +391,7 @@ impl Agent {
             rootfs_file,
             mem_mib: run.mem_mib,
             vcpus: run.vcpus,
-            command: run.command,
+            guest,
             console_log: log,
         };
         // Started on its own task, so the start runs to completion (success,
@@ -731,6 +729,45 @@ fn in_bounds<T: PartialOrd + std::fmt::Display>(
             "{field} must be between {min} and {max}, got {value}"
         )))
     }
+}
+
+/// guest-init's config for `run`, refusing what guest-init, as PID 1, can't
+/// use: it would crash the guest instead of failing the request.
+fn guest_config(run: &RunRequest) -> Result<GuestConfig, ApiError> {
+    let (exec, args) = run
+        .command
+        .split_first()
+        .ok_or_else(|| bad_request("no command given to run in the VM"))?;
+    if exec.is_empty() || run.command.iter().any(|a| a.contains('\0')) {
+        return Err(bad_request(
+            "the command must be non-empty and can't contain NUL bytes",
+        ));
+    }
+    for entry in &run.env {
+        let valid = entry
+            .split_once('=')
+            .is_some_and(|(key, _)| !key.is_empty())
+            && !entry.contains('\0');
+        if !valid {
+            return Err(bad_request(&format!(
+                "env entry {entry:?} must be KEY=VALUE with a non-empty KEY and no NUL bytes"
+            )));
+        }
+    }
+    if let Some(dir) = &run.workdir
+        && (!dir.starts_with('/') || dir.contains('\0'))
+    {
+        return Err(bad_request(&format!(
+            "workdir {dir:?} must be an absolute path with no NUL bytes"
+        )));
+    }
+    Ok(GuestConfig {
+        exec: exec.clone(),
+        args: args.to_vec(),
+        env: run.env.clone(),
+        workdir: run.workdir.clone(),
+        user: run.user,
+    })
 }
 
 /// VM names are 1-32 characters of lowercase letters, digits and hyphens,

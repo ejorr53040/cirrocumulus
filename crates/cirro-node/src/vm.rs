@@ -95,6 +95,16 @@ pub struct NodeConfig {
     pub cirro_gid: u32,
 }
 
+/// What guest-init runs: its config, sent as JSON over vsock (M2 protocol).
+#[derive(Debug, serde::Serialize)]
+pub struct GuestConfig {
+    pub exec: String,
+    pub args: Vec<String>,
+    pub env: Vec<String>,
+    pub workdir: Option<String>,
+    pub user: Option<cirro_proto::User>,
+}
+
 /// What to start: the VM address is allocated by the caller.
 pub struct VmSpec {
     pub vm_address: Ipv4Addr,
@@ -104,7 +114,7 @@ pub struct VmSpec {
     pub rootfs_file: std::fs::File,
     pub mem_mib: u32,
     pub vcpus: u8,
-    pub command: Vec<String>,
+    pub guest: GuestConfig,
     /// Where the console goes. Created (or truncated) by `start` and never
     /// removed here: it outlives the VM as its Ended VM's log.
     pub console_log: PathBuf,
@@ -561,7 +571,7 @@ impl Vm {
             .map_err(|e| err("boot", e))?;
 
         // 6. guest-init's config over vsock, then the grace period.
-        self.deliver_config(&root.join(VSOCK_SOCKET_IN_JAIL), &spec.command)
+        self.deliver_config(&root.join(VSOCK_SOCKET_IN_JAIL), &spec.guest)
             .await?;
         let vmm = self.vmm.as_mut().expect("the VMM was just spawned");
         match tokio::time::timeout(START_GRACE, vmm.wait()).await {
@@ -576,15 +586,8 @@ impl Vm {
     /// listening, Firecracker drops the connection instead of answering
     /// `OK`, so this retries from scratch until [`CONFIG_TIMEOUT`], giving up
     /// early if the VM ends first.
-    async fn deliver_config(&mut self, vsock: &Path, command: &[String]) -> Result<(), Error> {
-        let (exec, args) = command
-            .split_first()
-            .ok_or_else(|| Error("no command to run".into()))?;
-        let config = format!(
-            "{{\"exec\":{},\"args\":{}}}",
-            json_string(exec),
-            json_array(args)
-        );
+    async fn deliver_config(&mut self, vsock: &Path, guest: &GuestConfig) -> Result<(), Error> {
+        let config = serde_json::to_string(guest).expect("serialize guest-init's config");
         let deadline = Instant::now() + CONFIG_TIMEOUT;
         let mut last_error = String::from("never tried");
         while Instant::now() < deadline {
@@ -870,14 +873,6 @@ async fn try_deliver_config(vsock: &Path, config: &str) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     stream.shutdown().await.map_err(|e| e.to_string())
-}
-
-fn json_string(s: &str) -> String {
-    serde_json::Value::String(s.to_string()).to_string()
-}
-
-fn json_array(items: &[String]) -> String {
-    serde_json::Value::from(items.to_vec()).to_string()
 }
 
 async fn ip(args: &[&str]) -> Result<(), Error> {

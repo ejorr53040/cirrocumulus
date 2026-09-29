@@ -62,7 +62,7 @@ fn rootfs() -> &'static Rootfs {
         for sub in ["proc", "sys", "dev", "app"] {
             std::fs::create_dir_all(tree.join(sub)).expect("create rootfs tree");
         }
-        for fixture in ["http_app", "ignore_term", "exit_later", "probe"] {
+        for fixture in ["http_app", "ignore_term", "exit_later", "probe", "whoami"] {
             let status = std::process::Command::new("rustc")
                 .args(["--target", "x86_64-unknown-linux-musl", "-O", "-o"])
                 .arg(tree.join("app").join(fixture))
@@ -92,7 +92,7 @@ fn rootfs() -> &'static Rootfs {
 
 fn make_image(tree: &Path, image: &Path) -> PathBuf {
     let file = std::fs::File::create(image).expect("create rootfs image");
-    file.set_len(32 * 1024 * 1024).expect("size rootfs image");
+    file.set_len(64 * 1024 * 1024).expect("size rootfs image");
     let status = std::process::Command::new("mkfs.ext4")
         .args(["-q", "-F", "-d"])
         .arg(tree)
@@ -1443,5 +1443,78 @@ fn vms_reach_the_internet_but_not_smtp_each_other_or_the_lan() {
         .args(["stop", "--force", "target"])
         .assert()
         .success();
+    agent.assert_no_cirro_state();
+}
+
+#[test]
+fn run_sets_the_commands_env_workdir_and_user_and_finds_it_on_path() {
+    let Some(agent) = Agent::start(229) else {
+        return;
+    };
+    agent
+        .cirro()
+        .args([
+            "run",
+            "--name",
+            "who",
+            "--workdir",
+            "/app",
+            "--user",
+            "1000:1001",
+        ])
+        .args(["--env", "PATH=/bin:/app", "--env", "GREETING=hello there"])
+        .arg(&rootfs().guest_init)
+        .args(["--", "whoami"])
+        .assert()
+        .success();
+
+    let logs = wait_for_log(&agent, "who", "WHOAMI_DONE");
+    for line in [
+        "WHOAMI uid=1000 gid=1001",
+        "WHOAMI cwd=/app",
+        "WHOAMI env PATH=/bin:/app",
+        "WHOAMI env GREETING=hello there",
+        // Added when the request doesn't set it, as Docker does.
+        "WHOAMI env HOME=/",
+    ] {
+        assert!(logs.contains(line), "missing {line:?} in:\n{logs}");
+    }
+    agent
+        .cirro()
+        .args(["stop", "--force", "who"])
+        .assert()
+        .success();
+    agent.assert_no_cirro_state();
+}
+
+/// guest-init is PID 1: a config it can't use would crash the guest, so the
+/// agent refuses such a request itself, whatever client sent it.
+#[test]
+fn run_rejects_an_env_workdir_or_command_the_guest_cant_use() {
+    let Some(agent) = Agent::start(228) else {
+        return;
+    };
+    let rootfs = rootfs().guest_init.display();
+    for (field, extra, command) in [
+        ("env", r#""env":["NO_EQUALS_SIGN"]"#, r#"["/app/whoami"]"#),
+        ("env", r#""env":["=value"]"#, r#"["/app/whoami"]"#),
+        ("env", r#""env":["A=nul\u0000byte"]"#, r#"["/app/whoami"]"#),
+        ("workdir", r#""workdir":"relative""#, r#"["/app/whoami"]"#),
+        ("command", r#""env":[]"#, r#"["/app/who\u0000ami"]"#),
+    ] {
+        let body = format!(
+            r#"{{"name":"bad","rootfs":"{rootfs}","mem_mib":256,"vcpus":1,"command":{command},{extra}}}"#
+        );
+        let response = post_raw(&agent.socket, "/vms", &body).expect("send a raw /vms request");
+        assert!(
+            response.contains(" 400 ") && response.contains(field),
+            "expected a 400 naming {field} for {extra} {command}, got: {response}"
+        );
+    }
+    let ps = agent.ps(true);
+    assert!(
+        row(&ps, "bad").is_none(),
+        "a rejected request left a record:\n{ps}"
+    );
     agent.assert_no_cirro_state();
 }
