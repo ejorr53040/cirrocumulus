@@ -615,6 +615,37 @@ fn an_agent_refuses_to_start_on_a_running_record_it_cannot_make_sense_of() {
 }
 
 #[test]
+fn an_agent_refuses_to_start_while_another_owns_its_socket() {
+    let Some(agent) = Agent::start(249) else {
+        return;
+    };
+    agent
+        .run("web", &rootfs().guest_init, &["/app/http_app"])
+        .success();
+
+    // The first agent is still alive: a second attempt on the same socket
+    // must refuse, not steal it out from under the first.
+    let output = run_until_it_exits(agent.agent_command(agent.octet))
+        .expect("an agent whose socket is already live should refuse to start, not run");
+    assert!(!output.status.success(), "it should fail: {output:?}");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains(&agent.socket.display().to_string()),
+        "the refusal should name the socket, got: {err}"
+    );
+
+    // Refusing touched nothing: the first agent still owns its VM.
+    let ps = agent.ps(false);
+    assert!(row(&ps, "web").is_some(), "web was lost:\n{ps}");
+    agent
+        .cirro()
+        .args(["stop", "--force", "web"])
+        .assert()
+        .success();
+    agent.assert_no_cirro_state();
+}
+
+#[test]
 fn a_vm_taken_back_after_a_restart_can_be_force_stopped() {
     let Some(mut agent) = Agent::start(239) else {
         return;

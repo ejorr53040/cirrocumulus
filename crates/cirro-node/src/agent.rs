@@ -172,10 +172,13 @@ struct Agent {
 /// cgroup go only if no VM is left in them. The Node's egress policy is
 /// ensured first, and outlives the agent.
 pub async fn run(config: Config) -> io::Result<()> {
+    // Both refusals below run before the agent changes anything on the
+    // Node: a live socket is checked first (the fastest way to tell this
+    // start is a mistake), then the state dir's subnet.
+    refuse_if_already_running(&config.socket)?;
+
     let logs_dir = config.state_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
-    // First, so a state dir made for another subnet is refused before the
-    // agent changes anything on the Node.
     let store = Store::open(
         &config.state_dir.join("state.db"),
         &config.subnet.to_string(),
@@ -257,6 +260,29 @@ pub async fn run(config: Config) -> io::Result<()> {
     let _ = std::fs::remove_file(&config.socket);
     agent.shutdown().await;
     Ok(())
+}
+
+/// Refuses to start if `socket` already has a live listener, telling that
+/// apart from a socket file merely left behind by a crash (connecting to it
+/// finds no one home). Any other error connecting -- wrong file type at
+/// that path, a permissions problem -- is treated as unsafe to guess about
+/// and also refused, rather than silently reused as if stale.
+fn refuse_if_already_running(socket: &Path) -> io::Result<()> {
+    match std::os::unix::net::UnixStream::connect(socket) {
+        Ok(_) => Err(io::Error::other(format!(
+            "cirro node: agent already running at {}",
+            socket.display()
+        ))),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 type ApiResponse = Response<Full<Bytes>>;
