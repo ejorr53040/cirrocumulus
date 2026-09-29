@@ -1,7 +1,5 @@
-//! Parses the app config guest-init reads before exec'ing it. Slice 2 reads
-//! this from a fixed path baked into the rootfs (`/etc/cirro-init.json`);
-//! a later slice replaces that source with vsock, keeping this same shape
-//! since it's JSON either way (see RESEARCH.md M2).
+//! Parses the app config the Node agent sends over vsock (RESEARCH.md M2).
+//! Every field but `exec` is optional, so older senders still work.
 
 use serde::Deserialize;
 
@@ -10,6 +8,19 @@ pub(crate) struct Config {
     pub(crate) exec: String,
     #[serde(default)]
     pub(crate) args: Vec<String>,
+    /// `KEY=VALUE` entries; see `launch::app_env` for the defaults added.
+    #[serde(default)]
+    pub(crate) env: Vec<String>,
+    #[serde(default)]
+    pub(crate) workdir: Option<String>,
+    #[serde(default)]
+    pub(crate) user: Option<User>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy)]
+pub(crate) struct User {
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
 }
 
 pub(crate) fn parse_config(json: &str) -> Result<Config, serde_json::Error> {
@@ -33,6 +44,26 @@ mod tests {
         let config = parse_config(r#"{"exec": "/app"}"#).unwrap();
 
         assert_eq!(config.args, Vec::<String>::new());
+    }
+
+    #[test]
+    fn parses_env_workdir_and_user() {
+        let config = parse_config(
+            r#"{"exec": "nginx", "env": ["A=1"], "workdir": "/srv", "user": {"uid": 101, "gid": 102}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.env, vec!["A=1"]);
+        assert_eq!(config.workdir.as_deref(), Some("/srv"));
+        assert_eq!(config.user, Some(User { uid: 101, gid: 102 }));
+    }
+
+    #[test]
+    fn treats_null_workdir_and_user_as_unset() {
+        let config = parse_config(r#"{"exec": "/app", "workdir": null, "user": null}"#).unwrap();
+
+        assert_eq!(config.workdir, None);
+        assert_eq!(config.user, None);
     }
 
     #[test]

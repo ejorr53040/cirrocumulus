@@ -12,6 +12,7 @@
 //! baking it into the image.
 
 mod config;
+mod launch;
 
 use config::Config;
 use nix::errno::Errno;
@@ -22,10 +23,11 @@ use nix::sys::socket::{
     AddressFamily, Backlog, SockFlag, SockType, VsockAddr, accept, bind, listen, socket,
 };
 use nix::sys::wait::waitpid;
-use nix::unistd::{ForkResult, Pid, execv, fork};
+use nix::unistd::{ForkResult, Gid, Pid, Uid, chdir, execve, fork, setgid, setgroups, setuid};
 use std::ffi::CString;
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -128,7 +130,7 @@ fn read_config_from_vsock() -> Config {
 }
 
 /// Forks and execs the configured app in the child, per RESEARCH.md M2.
-/// This is `fork`+`execv`, not a bare `execve` of PID 1 itself: guest-init
+/// This is `fork`+`execve`, not a bare `execve` of PID 1 itself: guest-init
 /// has to stay running as a distinct process to reap zombies, forward
 /// signals and power off on the app's exit, none of which is possible if
 /// the app's image had replaced guest-init's own.
@@ -136,30 +138,68 @@ fn read_config_from_vsock() -> Config {
 /// Returns the child's pid immediately after forking; reaping (including
 /// this child) is `reap_until_no_children`'s job, not this function's.
 fn spawn_configured_app(config: &Config) -> Pid {
-    let exec_path = CString::new(config.exec.as_str()).expect("exec path has no interior NUL");
-    let mut argv: Vec<CString> = vec![exec_path.clone()];
-    argv.extend(
-        config
-            .args
-            .iter()
-            .map(|a| CString::new(a.as_str()).expect("arg has no interior NUL")),
-    );
-
     // SAFETY: single-threaded at this point in boot (PID 1, right after
     // mount), so the child sees a consistent, not-mid-mutation process
-    // image between fork and execv.
+    // image between fork and execve.
     match unsafe { fork() }.expect("fork configured app") {
         ForkResult::Child => {
-            // execv's Ok is Infallible: it only ever returns on error, so
-            // matching it out (as `shutdown` does for `reboot`) diverges
-            // rather than needing to produce a `Pid` for this match arm.
-            match execv(&exec_path, &argv) {
-                Ok(never) => match never {},
-                Err(e) => panic!("execv configured app: {e}"),
-            }
+            // Never returns. A failure is reported on the console and ends
+            // the app, which guest-init then sees exit like any other.
+            let e = exec_app(config);
+            eprintln!("guest-init: execv {}: {e}", config.exec);
+            std::process::exit(127);
         }
         ForkResult::Parent { child } => child,
     }
+}
+
+/// In the forked child: enters the workdir, drops to the configured user
+/// and execs the app with its environment. Returns only on failure.
+fn exec_app(config: &Config) -> String {
+    let env = launch::app_env(&config.env);
+    if let Some(dir) = &config.workdir
+        && let Err(e) = chdir(dir.as_str())
+    {
+        return format!("chdir {dir}: {e}");
+    }
+    if let Some(user) = config.user {
+        let gid = Gid::from_raw(user.gid);
+        if let Err(e) = setgroups(&[gid])
+            .and_then(|()| setgid(gid))
+            .and_then(|()| setuid(Uid::from_raw(user.uid)))
+        {
+            return format!("switch to user {}:{}: {e}", user.uid, user.gid);
+        }
+    }
+    let path = launch::lookup(&env, "PATH").unwrap_or_default();
+    let Some(file) = launch::resolve(&config.exec, path, is_executable) else {
+        return format!("not found on PATH {path}");
+    };
+    let to_cstrings = |items: &[String]| -> Result<Vec<CString>, String> {
+        items
+            .iter()
+            .map(|s| CString::new(s.as_str()).map_err(|_| format!("NUL byte in {s:?}")))
+            .collect()
+    };
+    let argv = match to_cstrings(&[std::slice::from_ref(&config.exec), &config.args].concat()) {
+        Ok(argv) => argv,
+        Err(e) => return e,
+    };
+    let envp = match to_cstrings(&env) {
+        Ok(envp) => envp,
+        Err(e) => return e,
+    };
+    let Ok(file) = CString::new(file.as_os_str().as_encoded_bytes()) else {
+        return "NUL byte in the resolved path".to_string();
+    };
+    match execve(&file, &argv, &envp) {
+        Ok(never) => match never {},
+        Err(e) => e.to_string(),
+    }
+}
+
+fn is_executable(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 /// Makes a host-triggered shutdown request (Firecracker's `SendCtrlAltDel`
