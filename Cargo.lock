@@ -154,6 +154,7 @@ name = "cirro-image"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "serde",
  "tar",
 ]
 

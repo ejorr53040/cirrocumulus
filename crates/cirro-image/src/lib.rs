@@ -12,6 +12,8 @@
 //! image's ownership and setuid bits. Image layers are untrusted input, which
 //! is why this runs in the unprivileged CLI and never in the Node agent.
 
+pub mod run_config;
+
 use flate2::read::GzDecoder;
 use std::collections::BTreeMap;
 use std::fs::File;
