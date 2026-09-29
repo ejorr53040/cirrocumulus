@@ -369,7 +369,7 @@ impl Vm {
         }
         while let Some(step) = self.undo.pop() {
             if let Err(e) = step.run().await {
-                eprintln!("cirro node: teardown: {e}");
+                tracing::warn!("teardown: {e}");
             }
         }
     }
@@ -775,7 +775,7 @@ pub async fn clean_up(node: &NodeConfig, vm_address: Ipv4Addr) {
     let mut steps = undo_steps(node, &id);
     while let Some(step) = steps.pop() {
         if let Err(e) = step.run().await {
-            eprintln!("cirro node: clean up {id}: {e}");
+            tracing::warn!(id, "clean up: {e}");
         }
     }
 }
