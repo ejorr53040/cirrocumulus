@@ -10,3 +10,5 @@ extend-exclude = ["Cargo.lock", "BUILD_PATHWAY.md", "RESEARCH*.md", "*.rsa.pub"]
 # `carrer_quiz.db` is the upstream uvm-career-quiz app's own database
 # filename (see scripts/apps/uvm-career-quiz/build_rootfs.sh).
 carrer = "carrer"
+# `mke2fs`, e2fsprogs' filesystem builder, which cirro-image runs.
+mke = "mke"

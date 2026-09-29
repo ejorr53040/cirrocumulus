@@ -7,7 +7,7 @@ use cirro_node::subnet::Subnet;
 use cirro_proto::{RunRequest, StopRequest, User, VM_STATE_HEADER, VmInfo};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use hyper::Method;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -250,24 +250,30 @@ fn main() -> ExitCode {
                 firecracker,
                 jailer,
                 kernel,
-            }) => cirro_node::install::install(&cirro_node::install::InstallConfig {
-                state_dir,
-                socket: cli.socket,
-                group,
-                subnet,
-                unit_name,
-                // `requires` on all three CLI args above guarantees this is
-                // never a partial combination.
-                release_override: match (firecracker, jailer, kernel) {
-                    (Some(firecracker), Some(jailer), Some(kernel)) => Some(ReleaseBinaries {
-                        firecracker,
-                        jailer,
-                        kernel,
-                    }),
-                    _ => None,
-                },
-            })
-            .map_err(|e| format!("node install: {e}")),
+            }) => cirro_image::check_mke2fs()
+                .map_err(|e| io::Error::other(e.0))
+                .and_then(|()| {
+                    cirro_node::install::install(&cirro_node::install::InstallConfig {
+                        state_dir,
+                        socket: cli.socket,
+                        group,
+                        subnet,
+                        unit_name,
+                        // `requires` on all three CLI args above guarantees this is
+                        // never a partial combination.
+                        release_override: match (firecracker, jailer, kernel) {
+                            (Some(firecracker), Some(jailer), Some(kernel)) => {
+                                Some(ReleaseBinaries {
+                                    firecracker,
+                                    jailer,
+                                    kernel,
+                                })
+                            }
+                            _ => None,
+                        },
+                    })
+                })
+                .map_err(|e| format!("node install: {e}")),
             Command::Node(NodeCommand::Uninstall { state_dir, force }) => {
                 cirro_node::install::uninstall(&state_dir, force)
                     .map_err(|e| format!("node uninstall: {e}"))

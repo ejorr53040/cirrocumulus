@@ -25,9 +25,12 @@ rtnetlink = "0.23"
 rusqlite = { version = "0.40", features = ["bundled"] }
 futures-util = "0.3"
 tracing = "0.1"
+tar = "0.4"
+flate2 = "1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"] }
 cirro-proto = { path = "crates/cirro-proto", version = "0.1.0" }
 cirro-node = { path = "crates/cirro-node", version = "0.1.0" }
+cirro-image = { path = "crates/cirro-image", version = "0.1.0" }
 
 # Lints every crate opts into with `[lints] workspace = true`. CI runs
 # clippy with `-D warnings`, so "warn" here still fails the build.

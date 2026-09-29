@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+flate2.workspace = true
+tar.workspace = true
 
 [lints]
 workspace = true
