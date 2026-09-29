@@ -1,4 +1,6 @@
-//! VM lifecycle on one host: Firecracker API, jailer, taps, cgroups, snapshots, metrics sampling.
+//! The Node side of Cirrocumulus: the Node agent, the VM lifecycle (Firecracker API, jailer,
+//! per-VM network namespaces, cgroups), the Node-wide egress policy, SQLite state, and
+//! `cirro node install`/`uninstall`.
 
 pub mod agent;
 pub mod egress;
@@ -9,13 +11,11 @@ pub mod network;
 pub mod release;
 pub mod rootfs_open;
 mod state;
+pub mod subnet;
 pub mod vm;
 
 /// A fresh, empty temp dir per test, named `<prefix>-<pid>-<n>` so parallel
-/// test runs (same process, different threads) and parallel test *binaries*
-/// (different processes) never collide. Shared by `install`'s and
-/// `release`'s own `#[cfg(test)]` modules, which each used to define an
-/// identical copy of this with only their own prefix literal baked in.
+/// threads and parallel test binaries never collide.
 #[cfg(test)]
 pub(crate) mod test_util {
     use std::path::PathBuf;
