@@ -25,6 +25,7 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::{Pid, getgid};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::OnceLock;
@@ -1041,6 +1042,118 @@ fn run_reports_why_a_vm_failed_to_start_and_leaves_nothing() {
             "a failed run left a record:\n{ps}"
         );
     }
+    agent.assert_no_cirro_state();
+}
+
+/// A rootfs the caller can't read (#14): the agent runs as root, but must
+/// still be refused the file, since a `cirro` group member is only meant
+/// to control VMs, not read arbitrary root-readable files on the host.
+#[test]
+fn run_refuses_a_rootfs_the_caller_cant_read_and_leaves_nothing() {
+    let Some(agent) = Agent::start(244) else {
+        return;
+    };
+
+    let denied = Path::new(env!("CARGO_TARGET_TMPDIR")).join("denied-rootfs.ext4");
+    std::fs::copy(&rootfs().guest_init, &denied).expect("copy a rootfs to make an unreadable one");
+    // Resolved the same way `cirro run` resolves it, so it matches
+    // however the refusal names the path.
+    let denied_canonical = std::fs::canonicalize(&denied).expect("canonicalize the rootfs");
+    std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000))
+        .expect("chmod 000 the rootfs");
+    let err = stderr(agent.run("denied", &denied, &["/app/http_app"]).failure());
+    // Restore read access so the fixture can be cleaned up (or reused: the
+    // rootfs dir is only built once per test run).
+    std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o644))
+        .expect("restore the rootfs's permissions");
+
+    assert!(
+        err.to_lowercase().contains("permission denied"),
+        "expected a permission error, got: {err}"
+    );
+    // Names the caller's own rootfs path, not e.g. a Firecracker error
+    // about the copy already sitting in the jail: this must be refused
+    // before the file is ever copied as root, not just fail incidentally
+    // once Firecracker itself can't open a copy that inherited 000 mode
+    // bits (which `std::fs::copy` preserves from the source).
+    assert!(
+        err.contains(&denied_canonical.display().to_string()),
+        "expected the refusal to name the rootfs path {}, got: {err}",
+        denied_canonical.display()
+    );
+    let ps = agent.ps(true);
+    assert!(
+        row(&ps, "denied").is_none(),
+        "a refused run left a record:\n{ps}"
+    );
+    agent.assert_no_cirro_state();
+}
+
+/// `/dev/zero` as a rootfs (#14): the agent would otherwise copy forever
+/// into the state dir's filesystem until it fills.
+#[test]
+fn run_refuses_a_rootfs_thats_not_a_regular_file_and_leaves_nothing() {
+    let Some(agent) = Agent::start(243) else {
+        return;
+    };
+
+    let started = Instant::now();
+    let err = stderr(
+        agent
+            .run("not-regular", Path::new("/dev/zero"), &["/app/http_app"])
+            .failure(),
+    );
+    assert!(
+        err.contains("not a regular file"),
+        "expected a 'not a regular file' error, got: {err}"
+    );
+    assert!(
+        started.elapsed() < TIMEOUT,
+        "a rootfs that isn't a regular file should fail at once, not at the boot timeout"
+    );
+    let ps = agent.ps(true);
+    assert!(
+        row(&ps, "not-regular").is_none(),
+        "a refused run left a record:\n{ps}"
+    );
+    agent.assert_no_cirro_state();
+}
+
+/// Console logs hold whatever the VM's command printed, so they should be
+/// readable to the `cirro` group but not to everyone (#14).
+#[test]
+fn console_logs_are_not_world_readable() {
+    let Some(agent) = Agent::start(242) else {
+        return;
+    };
+
+    agent
+        .run("web", &rootfs().guest_init, &["/app/http_app"])
+        .success();
+    let logs_dir = agent.state_dir.join("logs");
+    let log = std::fs::read_dir(&logs_dir)
+        .expect("read the agent's logs dir")
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_name().to_string_lossy().starts_with("web."))
+        .unwrap_or_else(|| panic!("no console log for web under {}", logs_dir.display()))
+        .path();
+    let mode = std::fs::metadata(&log)
+        .expect("stat the console log")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode,
+        0o640,
+        "console log {} should be 0640, was {mode:o}",
+        log.display()
+    );
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "web"])
+        .assert()
+        .success();
     agent.assert_no_cirro_state();
 }
 

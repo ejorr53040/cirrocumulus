@@ -1,4 +1,5 @@
 mod client;
+mod open_rootfs;
 
 use cirro_node::agent::{self, Subnet};
 use cirro_proto::{RunRequest, StopRequest, VM_STATE_HEADER, VmInfo};
@@ -100,6 +101,11 @@ enum Command {
     /// Manage an app's SQLite database
     #[command(subcommand)]
     Db(DbCommand),
+    /// Internal: opens a rootfs path as the given uid/gid and sends the fd
+    /// back over stdin with SCM_RIGHTS (the Node agent's rootfs
+    /// credential drop, issue #14). Not for direct use.
+    #[command(name = "__open-rootfs", hide = true)]
+    OpenRootfs { uid: u32, gid: u32, path: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -151,6 +157,12 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(e) => e.exit(),
     };
+    // A synchronous leaf helper, dispatched before the tokio runtime exists:
+    // it neither needs nor should share it with the process it was spawned
+    // to serve.
+    if let Command::OpenRootfs { uid, gid, path } = &cli.command {
+        return open_rootfs::run(*uid, *gid, path);
+    }
     let runtime = tokio::runtime::Runtime::new().expect("start the tokio runtime");
     let result = runtime.block_on(async {
         match cli.command {

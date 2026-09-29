@@ -5,5 +5,6 @@ pub mod egress;
 pub mod firecracker;
 pub mod jailer;
 pub mod network;
+pub mod rootfs_open;
 mod state;
 pub mod vm;

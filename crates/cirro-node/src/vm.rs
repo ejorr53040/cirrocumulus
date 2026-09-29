@@ -30,6 +30,7 @@ use cirro_proto::EndReason;
 use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::net::Ipv4Addr;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -89,12 +90,18 @@ pub struct NodeConfig {
     pub jail_base: PathBuf,
     /// The Node's own address in the Node subnet (`.1`).
     pub node_address: Ipv4Addr,
+    /// The `cirro` group's gid, so console logs can be made readable to it
+    /// without being world-readable (#14).
+    pub cirro_gid: u32,
 }
 
 /// What to start: the VM address is allocated by the caller.
 pub struct VmSpec {
     pub vm_address: Ipv4Addr,
+    /// Only used to name `rootfs_file` in error messages: the file itself
+    /// is what actually gets copied, already opened as the caller (#14).
     pub rootfs: PathBuf,
+    pub rootfs_file: std::fs::File,
     pub mem_mib: u32,
     pub vcpus: u8,
     pub command: Vec<String>,
@@ -438,8 +445,19 @@ impl Vm {
         self.undo.push(Undo::jail_dir(node, &id));
         self.undo.push(Undo::cgroup(&id));
         std::fs::create_dir_all(&node.jail_base).map_err(|e| err("create jail base dir", e))?;
-        let console =
-            std::fs::File::create(&self.console_log).map_err(|e| err("create console log", e))?;
+        // 0640 from the moment it exists (never briefly at the create-call's
+        // default mode) and root:cirro: console logs hold whatever the VM's
+        // command printed, so a group member can read their own VM's log,
+        // but no one outside the group can (#14).
+        let console = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o640)
+            .open(&self.console_log)
+            .map_err(|e| err("create console log", e))?;
+        std::os::unix::fs::chown(&self.console_log, Some(0), Some(node.cirro_gid))
+            .map_err(|e| err("chown console log", e))?;
         let memory_max = (u64::from(spec.mem_mib) + VMM_OVERHEAD_MIB) * 1024 * 1024;
         let cpu_max = format!("cpu.max={} 100000", u32::from(spec.vcpus) * 100_000);
         let child = Command::new(&node.jailer)
@@ -504,7 +522,13 @@ impl Vm {
                 .map_err(|e| err("copy kernel into jail", e))?;
         }
         let rootfs_in_jail = root.join("rootfs.ext4");
-        std::fs::copy(&spec.rootfs, &rootfs_in_jail).map_err(|e| {
+        let mut rootfs_dest =
+            std::fs::File::create(&rootfs_in_jail).map_err(|e| err("create rootfs in jail", e))?;
+        // Copies from the fd the agent already opened as the caller (#14),
+        // never the path again: `&File` reads from its current offset (0,
+        // since nothing has read it yet), and `io::copy` specializes
+        // File-to-File on Linux via `copy_file_range`.
+        std::io::copy(&mut &spec.rootfs_file, &mut rootfs_dest).map_err(|e| {
             err(
                 &format!("copy rootfs {} into jail", spec.rootfs.display()),
                 e,
