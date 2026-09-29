@@ -8,9 +8,10 @@
 Every workload gets its own Firecracker microVM, locked down with jailer.
 Manage everything from your terminal.
 
-> Pre-alpha: single-node VM lifecycle (`node install`, `run`, `ps`, `logs`,
-> `ssh`, `stop`, `rm`, `park`, `wake`) is wired up; the multi-node control
-> plane (`cirro server`, `cirro node join`) is not.
+> Pre-alpha: the single-node VM lifecycle (`node install`, `run`, `ps`, `logs`,
+> `stop`, `rm`, `node uninstall`) works. `ssh`, `park`, `wake`, `top`, `bench`,
+> `db` and the multi-node control plane (`server`, `node join`) are listed in
+> `--help` but exit with "not yet implemented".
 
 ## Install
 
@@ -24,9 +25,9 @@ sudo install -m 755 target/release/cirro /usr/local/bin/cirro
 
 ## Run
 
-Set up the host once, as root -- checks prereqs, fetches and verifies the
-pinned Firecracker/jailer/kernel release, creates the `cirro` group and
-state dir, and installs + starts the Node agent as a systemd unit:
+Set up the host once, as root. This checks prereqs, fetches and verifies the
+pinned Firecracker, jailer and kernel release, creates the `cirro` group and
+state dir, and installs and starts the Node agent as a systemd unit:
 
 ```sh
 sudo cirro node install
@@ -49,13 +50,8 @@ address on success.
 cirro run --name <name> [--mem 256M] [--vcpus 1] <rootfs> -- <command> [args...]
 cirro ps [--all]                  # list VMs (--all includes Ended VMs)
 cirro logs [--follow] <name>      # a VM's console log
-cirro ssh <name>                  # open a shell in a VM
 cirro stop [--force] [--timeout <secs>] <name>
 cirro rm <name>                   # delete an Ended VM's record and log
-cirro park <name>                 # snapshot a VM to disk, free its RAM
-cirro wake <name>                 # restore a parked VM
-cirro top                         # live terminal dashboard
-cirro bench                       # measure boot, park and wake times
 cirro node uninstall [--force]    # reverse `node install`
 ```
 
@@ -73,4 +69,6 @@ scripts/ci/local.sh           # the same gates CI runs (--quick skips docs + tes
 
 All gates in `.github/workflows/ci.yml` block merging, including commit-message
 rules and a check that every commit builds. The real-Firecracker tests only
-compile in CI, so run them locally: see `scripts/step0/README.md`.
+compile in CI, so run them locally. `crates/cirro/tests/node_agent.rs` explains the
+one `sudoers` rule they need, and `scripts/step0/README.md` covers fetching the
+kernel.
