@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "coord": {
+      "command": "node",
+      "args": [
+        "/tmp/.mount_AmoebaefnoeP/resources/app/amoeba-runtime/mcp/dist/server.js"
+      ]
+    }
+  }
+}
