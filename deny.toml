@@ -22,6 +22,11 @@ ignore = []
 allow = [
     "Apache-2.0",
     "BSD-2-Clause",
+    # subtle, via rustls (image pulls). Permissive, Apache-2.0-compatible.
+    "BSD-3-Clause",
+    # ring, rustls-webpki and untrusted, via rustls (image pulls). ISC is
+    # MIT-equivalent.
+    "ISC",
     "MIT",
     "Unicode-3.0",
     "Unlicense",

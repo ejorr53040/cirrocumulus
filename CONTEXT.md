@@ -27,6 +27,14 @@ _Avoid_: instance, machine, container, guest (except for what runs inside)
 The record a VM leaves behind once it has stopped and its host state is gone: name, end time, end reason and console log. It is history, not a VM, and is replaced when its name is reused.
 _Avoid_: stopped VM, dead VM, exited container
 
+**Image**:
+An OCI image in a registry, named by a reference such as `nginx:alpine`, that a VM can be started from.
+_Avoid_: container image, Docker image (except when quoting Docker)
+
+**Rootfs**:
+The bootable ext4 filesystem a VM runs on, with guest-init as `/init`: built from an Image, or supplied by hand.
+_Avoid_: disk image, root disk
+
 **App**:
 A named, long-lived workload that owns a route (hostname → port) and has at most one VM at a time.
 _Avoid_: service, deployment

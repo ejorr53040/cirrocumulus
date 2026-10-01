@@ -12,7 +12,10 @@
 //! image's ownership and setuid bits. Image layers are untrusted input, which
 //! is why this runs in the unprivileged CLI and never in the Node agent.
 
+mod cache;
 pub mod run_config;
+
+pub use cache::{CachedImage, ImageCache};
 
 use flate2::read::GzDecoder;
 use std::collections::BTreeMap;
