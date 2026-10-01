@@ -69,6 +69,7 @@ fn rootfs() -> &'static Rootfs {
             "probe",
             "whoami",
             "spin",
+            "counter",
         ] {
             let status = std::process::Command::new("rustc")
                 .args(["--target", "x86_64-unknown-linux-musl", "-O", "-o"])
@@ -298,6 +299,21 @@ impl Agent {
             .filter(|e| e.file_name().to_string_lossy().starts_with(&id_prefix))
             .collect();
         assert!(cgroups.is_empty(), "leftover VM cgroups: {cgroups:?}");
+    }
+}
+
+impl Agent {
+    /// Stops the agent and checks that no snapshot is left in its state
+    /// dir. The parked dir is root-only, so it can't be listed from here,
+    /// but the agent removes it on the way out only when it's empty.
+    fn assert_no_snapshots(&mut self) {
+        self.stop_agent();
+        let parked = self.state_dir.join("parked");
+        assert!(
+            !parked.exists(),
+            "a snapshot is left in {} after the agent stopped",
+            parked.display()
+        );
     }
 }
 
@@ -1620,4 +1636,78 @@ fn top_once_shows_a_busy_vm_using_cpu_and_memory() {
         .assert()
         .success();
     agent.assert_no_cirro_state();
+}
+
+/// The VM address `cirro run` or `cirro wake` printed, and its last octet.
+fn vm_address(printed: &str) -> (String, u8) {
+    let address = printed.trim().to_string();
+    let host = address
+        .parse::<std::net::Ipv4Addr>()
+        .unwrap_or_else(|_| panic!("expected a VM address, got {printed:?}"))
+        .octets()[3];
+    (address, host)
+}
+
+/// The number in the counter fixture's `count N` answer.
+fn count(response: &str) -> u64 {
+    response
+        .rsplit_once("count ")
+        .and_then(|(_, n)| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("not a counter answer: {response:?}"))
+}
+
+/// M6: parking snapshots a VM to disk and frees everything it held on the
+/// Node; waking starts a new VM from that snapshot, so the guest carries on
+/// where it was instead of booting again.
+#[test]
+fn a_parked_vm_wakes_where_it_left_off_and_rm_leaves_nothing() {
+    let Some(mut agent) = Agent::start(225) else {
+        return;
+    };
+    let (address, host) = vm_address(&stdout(
+        agent
+            .run("counter", &rootfs().guest_init, &["/app/counter"])
+            .success(),
+    ));
+    wait_for_http(&address, HTTP_PORT);
+    let before = count(&http_get(&address, HTTP_PORT).expect("ask the counter"));
+    assert!(before >= 2, "the counter should have answered twice by now");
+
+    agent.cirro().args(["park", "counter"]).assert().success();
+    assert!(
+        host_state_of(225, host).is_empty(),
+        "a parked VM still holds host state: {:?}",
+        host_state_of(225, host)
+    );
+    let ps = agent.ps(false);
+    assert!(row(&ps, "counter").is_none(), "ps lists a parked VM:\n{ps}");
+    let ps = agent.ps(true);
+    let parked = row(&ps, "counter").unwrap_or_else(|| panic!("ps -a lacks counter:\n{ps}"));
+    assert!(
+        parked.contains("parked"),
+        "ps -a doesn't say parked: {parked}"
+    );
+
+    let (address, _) = vm_address(&stdout(
+        agent.cirro().args(["wake", "counter"]).assert().success(),
+    ));
+    // A guest that booted again would start counting from 1.
+    let after = count(&wait_for_http(&address, HTTP_PORT));
+    assert_eq!(after, before + 1, "the woken VM didn't carry on counting");
+    let ps = agent.ps(false);
+    assert!(
+        row(&ps, "counter").is_some_and(|r| r.contains(&address)),
+        "{ps}"
+    );
+
+    // Parked again, from a VM that was itself woken, then discarded.
+    agent.cirro().args(["park", "counter"]).assert().success();
+    agent.cirro().args(["rm", "counter"]).assert().success();
+    let ps = agent.ps(true);
+    assert!(
+        row(&ps, "counter").is_none(),
+        "rm left counter listed:\n{ps}"
+    );
+    agent.assert_no_cirro_state();
+    agent.assert_no_snapshots();
 }

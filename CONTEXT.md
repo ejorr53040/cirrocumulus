@@ -40,8 +40,12 @@ A named, long-lived workload that owns a route (hostname → port) and has at mo
 _Avoid_: service, deployment
 
 **Park / wake**:
-Snapshot an App's VM to disk and free its RAM / start a new VM for the App from that snapshot.
+Snapshot a VM to disk and end it, freeing its RAM / start a new VM under the same name from that snapshot. Parking an App parks its VM.
 _Avoid_: suspend, hibernate, resume
+
+**Parked VM**:
+An Ended VM whose end was a park, so it still holds a snapshot of the guest's memory, devices and Rootfs. Waking it uses up the snapshot; `rm` discards it. Its name can't be taken by a new `run` while the snapshot exists.
+_Avoid_: paused VM, sleeping VM, stopped VM
 
 ## Networking
 

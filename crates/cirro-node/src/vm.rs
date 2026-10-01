@@ -1,12 +1,16 @@
 //! Starting and tearing down one VM on this Node: the privileged half of
-//! `cirro run` / `cirro stop`, run inside the Node agent (ADR 0002).
+//! `cirro run` / `cirro stop` / `cirro park` / `cirro wake`, run inside the
+//! Node agent (ADR 0002).
 //!
-//! [`Vm::start`] does every host-side step in order, and each step pushes
+//! [`Vm::start`] boots a VM and [`Vm::wake`] restores one from a parked VM's
+//! snapshot. Both do the same host-side steps in order, and each step pushes
 //! its undo onto a stack before the next one runs. A failure part-way
 //! through unwinds that stack. A VM that started is then owned by
 //! [`Vm::supervise`] until it ends, whether it stops gracefully, is forced,
-//! or exits or crashes on its own. Every one of those paths unwinds the
-//! same stack, so the Node is left exactly as it was found.
+//! is parked, or exits or crashes on its own. Every one of those paths
+//! unwinds the same stack, so the Node is left exactly as it was found,
+//! apart from a parked VM's snapshot, which the park moves out of the jail
+//! first.
 //!
 //! Networking follows ADRs 0001 and 0003. Each VM gets its own network
 //! namespace holding its tap. The guest always configures the same Guest
@@ -37,12 +41,21 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// The address every guest configures on `eth0` (ADR 0003).
 pub const GUEST_ADDRESS: Ipv4Addr = Ipv4Addr::new(172, 16, 0, 2);
 /// The guest's gateway: the tap's address inside the VM's namespace.
 const GUEST_GATEWAY: Ipv4Addr = Ipv4Addr::new(172, 16, 0, 1);
+
+/// What a parked VM's snapshot directory holds: the device state, the guest
+/// memory and the rootfs as the guest left it, which belong together.
+const SNAPSHOT_FILES: [&str; 3] = ["vmstate", "mem", "rootfs.ext4"];
+/// Where a park writes the snapshot inside the jail, and where a wake puts
+/// it before loading. Different names, since a woken VM's memory stays
+/// mapped from its file and a later park must not write over it.
+const PARK_FILES: [&str; 3] = ["park.vmstate", "park.mem", "rootfs.ext4"];
+const WAKE_FILES: [&str; 3] = ["wake.vmstate", "wake.mem", "rootfs.ext4"];
 
 /// The fixed vsock port guest-init reads its config on (M2 protocol).
 const VSOCK_CONFIG_PORT: u32 = 52;
@@ -120,14 +133,34 @@ pub struct VmSpec {
     pub console_log: PathBuf,
 }
 
+/// What a parked VM needs to wake: the VM address is allocated by the
+/// caller, and the rest must match what the VM was parked with.
+pub struct WakeSpec {
+    pub vm_address: Ipv4Addr,
+    pub mem_mib: u32,
+    pub vcpus: u8,
+    /// The parked VM's snapshot directory. Its files move into the jail, so
+    /// a VM that wakes leaves it empty; a wake that fails puts them back.
+    pub snapshot: PathBuf,
+    /// Appended to: the woken guest's console carries on from the parked one.
+    pub console_log: PathBuf,
+}
+
 /// A request to [`Vm::supervise`] to stop the VM.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub enum Stop {
     /// Send Ctrl-Alt-Del (guest-init turns it into SIGTERM for the command),
     /// then kill the VMM if the VM hasn't ended within `timeout`.
     Graceful { timeout: Duration },
     /// Kill the VMM now.
     Force,
+    /// Snapshot the VM into the directory `into`, then end it as parked.
+    /// `done` hears whether that worked; a VM that couldn't be parked keeps
+    /// running.
+    Park {
+        into: PathBuf,
+        done: oneshot::Sender<Result<(), Error>>,
+    },
 }
 
 #[derive(Debug)]
@@ -149,6 +182,8 @@ pub struct Vm {
     vmm: Option<Vmm>,
     undo: Vec<Undo>,
     api_socket: PathBuf,
+    /// The jail's root, where Firecracker's own `/` is.
+    jail_root: PathBuf,
     console_log: PathBuf,
     /// The VMM's identity, known once it has started.
     process: Option<ProcessId>,
@@ -287,19 +322,43 @@ impl Vm {
     /// everything done so far is undone first, and the error says why the
     /// VM didn't start, with the tail of its console when there is one.
     pub async fn start(node: &NodeConfig, spec: &VmSpec) -> Result<Vm, Error> {
-        let mut vm = Vm {
-            vmm: None,
-            undo: Vec::new(),
-            api_socket: PathBuf::new(),
-            console_log: spec.console_log.clone(),
-            process: None,
-        };
+        let mut vm = Vm::empty(spec.console_log.clone());
         match vm.start_steps(node, spec).await {
             Ok(()) => Ok(vm),
             Err(e) => {
                 vm.teardown().await;
                 Err(e)
             }
+        }
+    }
+
+    /// Brings up a new VM from a parked VM's snapshot, returning once it
+    /// runs. On failure, everything done so far is undone and the snapshot
+    /// is put back, so the wake can be tried again.
+    pub async fn wake(node: &NodeConfig, spec: &WakeSpec) -> Result<Vm, Error> {
+        let mut vm = Vm::empty(spec.console_log.clone());
+        match vm.wake_steps(node, spec).await {
+            Ok(()) => Ok(vm),
+            Err(e) => {
+                if let Err(back) =
+                    move_files(&vm.jail_root, WAKE_FILES, &spec.snapshot, SNAPSHOT_FILES)
+                {
+                    tracing::warn!("put the snapshot back after a failed wake: {back}");
+                }
+                vm.teardown().await;
+                Err(e)
+            }
+        }
+    }
+
+    fn empty(console_log: PathBuf) -> Vm {
+        Vm {
+            vmm: None,
+            undo: Vec::new(),
+            api_socket: PathBuf::new(),
+            jail_root: PathBuf::new(),
+            console_log,
+            process: None,
         }
     }
 
@@ -312,13 +371,15 @@ impl Vm {
         console_log: PathBuf,
     ) -> Vm {
         let id = host_id(vm_address);
+        let jail_root = jail_dir(node, &id).join("root");
         Vm {
             vmm: Some(Vmm::Adopted {
                 process,
                 cgroup: parent_cgroup().join(&id),
             }),
             undo: undo_steps(node, &id),
-            api_socket: jail_dir(node, &id).join("root/run/firecracker.socket"),
+            api_socket: jail_root.join("run/firecracker.socket"),
+            jail_root,
             console_log,
             process: Some(process),
         }
@@ -347,43 +408,41 @@ impl Vm {
     async fn run_until_ended(&mut self, stops: &mut mpsc::Receiver<Stop>) -> EndReason {
         let client = Client::new(&self.api_socket);
         let console_log = self.console_log.clone();
+        let jail_root = self.jail_root.clone();
         let vmm = self.vmm.as_mut().expect("a started VM has a VMM");
-        // `biased` so a VM that has already ended is recorded as such even
-        // when a stop arrives at the same moment.
-        let stop = tokio::select! {
-            biased;
-            status = vmm.wait() => return vmm_natural_end(vmm, status, &console_log),
-            stop = stops.recv() => stop,
-        };
-        match stop {
-            Some(Stop::Graceful { timeout }) => {
-                if client.send_ctrl_alt_del().await.is_err() {
-                    // Most likely the VM ended on its own just now.
-                    if let Some(status) = vmm.ended() {
-                        return vmm_natural_end(vmm, status, &console_log);
+        loop {
+            // `biased` so a VM that has already ended is recorded as such
+            // even when a stop arrives at the same moment.
+            let stop = tokio::select! {
+                biased;
+                status = vmm.wait() => return vmm_natural_end(vmm, status, &console_log),
+                stop = stops.recv() => stop,
+            };
+            match stop {
+                Some(Stop::Park { into, done }) => {
+                    match park(&client, vmm, &jail_root, &into).await {
+                        Ok(()) => {
+                            let _ = done.send(Ok(()));
+                            return EndReason::Parked;
+                        }
+                        // The snapshot failed and the VM carries on.
+                        Err(Parking::Resumed(e)) => {
+                            let _ = done.send(Err(e));
+                        }
+                        Err(Parking::Lost(e)) => {
+                            let _ = done.send(Err(e));
+                            vmm.kill().await;
+                            return EndReason::Forced;
+                        }
                     }
+                }
+                Some(Stop::Graceful { timeout }) => {
+                    return graceful_stop(&client, vmm, stops, timeout, &console_log).await;
+                }
+                Some(Stop::Force) | None => {
                     vmm.kill().await;
                     return EndReason::Forced;
                 }
-                let deadline = tokio::time::sleep(timeout);
-                tokio::pin!(deadline);
-                loop {
-                    tokio::select! {
-                        biased;
-                        status = vmm.wait() => return graceful_end(status, &console_log),
-                        _ = &mut deadline => break,
-                        stop = stops.recv() => match stop {
-                            Some(Stop::Graceful { .. }) => continue,
-                            Some(Stop::Force) | None => break,
-                        },
-                    }
-                }
-                vmm.kill().await;
-                EndReason::Forced
-            }
-            Some(Stop::Force) | None => {
-                vmm.kill().await;
-                EndReason::Forced
             }
         }
     }
@@ -402,146 +461,11 @@ impl Vm {
     }
 
     async fn start_steps(&mut self, node: &NodeConfig, spec: &VmSpec) -> Result<(), Error> {
-        let id = host_id(spec.vm_address);
-        let [_, _, c, d] = spec.vm_address.octets();
-        let uid = VM_UID_BASE + (u32::from(c) << 8 | u32::from(d));
-        let vm_addr = spec.vm_address.to_string();
-        let node_addr = node.node_address.to_string();
-
-        // 1. The VM's network namespace, with its tap inside.
-        ip(&["netns", "add", &id]).await?;
-        self.undo.push(Undo::netns(&id));
-        let uid_s = uid.to_string();
-        ip_in(&id, &["link", "set", "lo", "up"]).await?;
-        ip_in(
-            &id,
-            &[
-                "tuntap", "add", "dev", "tap0", "mode", "tap", "user", &uid_s, "group", &uid_s,
-            ],
-        )
-        .await?;
-        ip_in(
-            &id,
-            &["addr", "add", &format!("{GUEST_GATEWAY}/30"), "dev", "tap0"],
-        )
-        .await?;
-        ip_in(&id, &["link", "set", "tap0", "up"]).await?;
-
-        // 2. A veth pair to the Node, and 1:1 NAT between the Guest address
-        //    and the VM address inside the namespace.
-        ip(&[
-            "link", "add", &id, "type", "veth", "peer", "name", "veth0", "netns", &id,
-        ])
-        .await?;
-        self.undo.push(Undo::link(&id));
-        ip(&["addr", "add", &format!("{node_addr}/32"), "dev", &id]).await?;
-        ip(&["link", "set", &id, "up"]).await?;
-        ip_in(
-            &id,
-            &["addr", "add", &format!("{vm_addr}/32"), "dev", "veth0"],
-        )
-        .await?;
-        ip_in(&id, &["link", "set", "veth0", "up"]).await?;
-        ip_in(
-            &id,
-            &["route", "add", &format!("{node_addr}/32"), "dev", "veth0"],
-        )
-        .await?;
-        ip_in(
-            &id,
-            &["route", "add", "default", "via", &node_addr, "dev", "veth0"],
-        )
-        .await?;
-        in_netns(&id, &["sysctl", "-qw", "net.ipv4.ip_forward=1"]).await?;
-        nft_in(&id, &nat_ruleset(spec.vm_address)).await?;
-
-        // 3. The Node's route to the VM address. Deleting the veth removes it.
-        ip(&[
-            "route",
-            "add",
-            &format!("{vm_addr}/32"),
-            "dev",
-            &id,
-            "src",
-            &node_addr,
-        ])
-        .await?;
-
-        // 4. jailer, in the namespace and under the VM's cgroup limits.
-        enable_io_accounting();
-        let root = jail_dir(node, &id).join("root");
-        self.undo.push(Undo::jail_dir(node, &id));
-        self.undo.push(Undo::cgroup(&id));
-        std::fs::create_dir_all(&node.jail_base).map_err(|e| err("create jail base dir", e))?;
-        // 0640 from the moment it exists (never briefly at the create-call's
-        // default mode) and root:cirro: console logs hold whatever the VM's
-        // command printed, so a group member can read their own VM's log,
-        // but no one outside the group can (#14).
-        let console = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o640)
-            .open(&self.console_log)
-            .map_err(|e| err("create console log", e))?;
-        std::os::unix::fs::chown(&self.console_log, Some(0), Some(node.cirro_gid))
-            .map_err(|e| err("chown console log", e))?;
-        let memory_max = (u64::from(spec.mem_mib) + VMM_OVERHEAD_MIB) * 1024 * 1024;
-        let cpu_max = format!("cpu.max={} 100000", u32::from(spec.vcpus) * 100_000);
-        let child = Command::new(&node.jailer)
-            .arg("--id")
-            .arg(&id)
-            .arg("--exec-file")
-            .arg(&node.firecracker)
-            .args(["--uid", &uid_s, "--gid", &uid_s])
-            .arg("--chroot-base-dir")
-            .arg(&node.jail_base)
-            .arg("--netns")
-            .arg(Path::new("/run/netns").join(&id))
-            .args(["--cgroup-version", "2", "--parent-cgroup", PARENT_CGROUP])
-            .arg("--cgroup")
-            .arg(format!("memory.max={memory_max}"))
-            .arg("--cgroup")
-            .arg(cpu_max)
-            // No `kill_on_drop`: the VMM outlives the agent (ADR 0002).
-            .stdin(Stdio::null())
-            .stdout(
-                console
-                    .try_clone()
-                    .map_err(|e| err("clone console fd", e))?,
-            )
-            .stderr(console)
-            .spawn()
-            .map_err(|e| err("spawn jailer", e))?;
-        // jailer execs into Firecracker without forking, so the pid and its
-        // start time are Firecracker's from here on.
-        self.process = child.id().and_then(ProcessId::of);
-        if self.process.is_none() {
-            self.vmm = Some(Vmm::Child(child));
-            return Err(Error(
-                "jailer exited before its process could be identified".into(),
-            ));
-        }
-        self.vmm = Some(Vmm::Child(child));
-
-        let api_socket = root.join("run/firecracker.socket");
-        self.api_socket = api_socket.clone();
-        let deadline = Instant::now() + API_SOCKET_TIMEOUT;
-        while !api_socket.exists() {
-            if let Some(status) = self.vmm_exit_status() {
-                return Err(Error(format!(
-                    "jailer exited ({status}) before Firecracker was up; last console lines:\n{}",
-                    console_tail(&self.console_log)
-                )));
-            }
-            if Instant::now() >= deadline {
-                return Err(Error(format!(
-                    "Firecracker's API socket never appeared at {}",
-                    api_socket.display()
-                )));
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        let uid = self
+            .host_steps(node, spec.vm_address, spec.mem_mib, spec.vcpus, false)
+            .await?;
+        let root = self.jail_root.clone();
+        let api_socket = self.api_socket.clone();
 
         // 5. Kernel and rootfs into the jail, then the devices.
         let kernel_in_jail = root.join("vmlinux");
@@ -598,6 +522,191 @@ impl Vm {
         }
     }
 
+    async fn wake_steps(&mut self, node: &NodeConfig, spec: &WakeSpec) -> Result<(), Error> {
+        let uid = self
+            .host_steps(node, spec.vm_address, spec.mem_mib, spec.vcpus, true)
+            .await?;
+        // 5. The snapshot into the jail, owned by this VM's Firecracker. No
+        //    undo is pushed for this: once the VM runs, its files belong to
+        //    the jail and go with it at teardown. Only a wake that fails
+        //    puts them back (see `Vm::wake`).
+        move_files(&spec.snapshot, SNAPSHOT_FILES, &self.jail_root, WAKE_FILES)
+            .map_err(|e| err("move the snapshot into the jail", e))?;
+        for file in WAKE_FILES {
+            std::os::unix::fs::chown(self.jail_root.join(file), Some(uid), Some(uid))
+                .map_err(|e| err(&format!("chown {file} in jail"), e))?;
+        }
+        // 6. Load and resume. The snapshot names the tap, the drive and the
+        //    vsock socket by the same paths the first VM had.
+        let [vmstate, mem, _] = WAKE_FILES;
+        Client::new(&self.api_socket)
+            .load_snapshot(&format!("/{vmstate}"), &format!("/{mem}"))
+            .await
+            .map_err(|e| {
+                Error(format!(
+                    "load the snapshot: {e}; last console lines:\n{}",
+                    console_tail(&self.console_log)
+                ))
+            })
+    }
+
+    /// Steps 1-4 of every VM start, whether booted or woken: the network
+    /// namespace and its links and NAT, the Node's route, and jailer up to
+    /// Firecracker's API socket. Returns the uid Firecracker runs as.
+    async fn host_steps(
+        &mut self,
+        node: &NodeConfig,
+        vm_address: Ipv4Addr,
+        mem_mib: u32,
+        vcpus: u8,
+        append_console: bool,
+    ) -> Result<u32, Error> {
+        let id = host_id(vm_address);
+        let [_, _, c, d] = vm_address.octets();
+        let uid = VM_UID_BASE + (u32::from(c) << 8 | u32::from(d));
+        let vm_addr = vm_address.to_string();
+        let node_addr = node.node_address.to_string();
+
+        // 1. The VM's network namespace, with its tap inside.
+        ip(&["netns", "add", &id]).await?;
+        self.undo.push(Undo::netns(&id));
+        let uid_s = uid.to_string();
+        ip_in(&id, &["link", "set", "lo", "up"]).await?;
+        ip_in(
+            &id,
+            &[
+                "tuntap", "add", "dev", "tap0", "mode", "tap", "user", &uid_s, "group", &uid_s,
+            ],
+        )
+        .await?;
+        ip_in(
+            &id,
+            &["addr", "add", &format!("{GUEST_GATEWAY}/30"), "dev", "tap0"],
+        )
+        .await?;
+        ip_in(&id, &["link", "set", "tap0", "up"]).await?;
+
+        // 2. A veth pair to the Node, and 1:1 NAT between the Guest address
+        //    and the VM address inside the namespace.
+        ip(&[
+            "link", "add", &id, "type", "veth", "peer", "name", "veth0", "netns", &id,
+        ])
+        .await?;
+        self.undo.push(Undo::link(&id));
+        ip(&["addr", "add", &format!("{node_addr}/32"), "dev", &id]).await?;
+        ip(&["link", "set", &id, "up"]).await?;
+        ip_in(
+            &id,
+            &["addr", "add", &format!("{vm_addr}/32"), "dev", "veth0"],
+        )
+        .await?;
+        ip_in(&id, &["link", "set", "veth0", "up"]).await?;
+        ip_in(
+            &id,
+            &["route", "add", &format!("{node_addr}/32"), "dev", "veth0"],
+        )
+        .await?;
+        ip_in(
+            &id,
+            &["route", "add", "default", "via", &node_addr, "dev", "veth0"],
+        )
+        .await?;
+        in_netns(&id, &["sysctl", "-qw", "net.ipv4.ip_forward=1"]).await?;
+        nft_in(&id, &nat_ruleset(vm_address)).await?;
+
+        // 3. The Node's route to the VM address. Deleting the veth removes it.
+        ip(&[
+            "route",
+            "add",
+            &format!("{vm_addr}/32"),
+            "dev",
+            &id,
+            "src",
+            &node_addr,
+        ])
+        .await?;
+
+        // 4. jailer, in the namespace and under the VM's cgroup limits.
+        enable_io_accounting();
+        let root = jail_dir(node, &id).join("root");
+        self.jail_root = root.clone();
+        self.undo.push(Undo::jail_dir(node, &id));
+        self.undo.push(Undo::cgroup(&id));
+        std::fs::create_dir_all(&node.jail_base).map_err(|e| err("create jail base dir", e))?;
+        // 0640 from the moment it exists (never briefly at the create-call's
+        // default mode) and root:cirro: console logs hold whatever the VM's
+        // command printed, so a group member can read their own VM's log,
+        // but no one outside the group can (#14).
+        let console = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(!append_console)
+            .append(append_console)
+            .mode(0o640)
+            .open(&self.console_log)
+            .map_err(|e| err("create console log", e))?;
+        std::os::unix::fs::chown(&self.console_log, Some(0), Some(node.cirro_gid))
+            .map_err(|e| err("chown console log", e))?;
+        let memory_max = (u64::from(mem_mib) + VMM_OVERHEAD_MIB) * 1024 * 1024;
+        let cpu_max = format!("cpu.max={} 100000", u32::from(vcpus) * 100_000);
+        let child = Command::new(&node.jailer)
+            .arg("--id")
+            .arg(&id)
+            .arg("--exec-file")
+            .arg(&node.firecracker)
+            .args(["--uid", &uid_s, "--gid", &uid_s])
+            .arg("--chroot-base-dir")
+            .arg(&node.jail_base)
+            .arg("--netns")
+            .arg(Path::new("/run/netns").join(&id))
+            .args(["--cgroup-version", "2", "--parent-cgroup", PARENT_CGROUP])
+            .arg("--cgroup")
+            .arg(format!("memory.max={memory_max}"))
+            .arg("--cgroup")
+            .arg(cpu_max)
+            // No `kill_on_drop`: the VMM outlives the agent (ADR 0002).
+            .stdin(Stdio::null())
+            .stdout(
+                console
+                    .try_clone()
+                    .map_err(|e| err("clone console fd", e))?,
+            )
+            .stderr(console)
+            .spawn()
+            .map_err(|e| err("spawn jailer", e))?;
+        // jailer execs into Firecracker without forking, so the pid and its
+        // start time are Firecracker's from here on.
+        self.process = child.id().and_then(ProcessId::of);
+        if self.process.is_none() {
+            self.vmm = Some(Vmm::Child(child));
+            return Err(Error(
+                "jailer exited before its process could be identified".into(),
+            ));
+        }
+        self.vmm = Some(Vmm::Child(child));
+
+        let api_socket = root.join("run/firecracker.socket");
+        self.api_socket = api_socket.clone();
+        let deadline = Instant::now() + API_SOCKET_TIMEOUT;
+        while !api_socket.exists() {
+            if let Some(status) = self.vmm_exit_status() {
+                return Err(Error(format!(
+                    "jailer exited ({status}) before Firecracker was up; last console lines:\n{}",
+                    console_tail(&self.console_log)
+                )));
+            }
+            if Instant::now() >= deadline {
+                return Err(Error(format!(
+                    "Firecracker's API socket never appeared at {}",
+                    api_socket.display()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        Ok(uid)
+    }
+
     /// Sends guest-init its config with Firecracker's host-initiated vsock
     /// handshake: connect to the jail's vsock socket, send `CONNECT <port>`,
     /// wait for `OK`, write the JSON, then close. Until guest-init is
@@ -649,6 +758,126 @@ impl Vm {
             console_tail(&self.console_log)
         ))
     }
+}
+
+/// Asks the guest to stop (Ctrl-Alt-Del), and kills the VMM if it hasn't
+/// ended within `timeout` or a forced stop arrives meanwhile.
+async fn graceful_stop(
+    client: &Client,
+    vmm: &mut Vmm,
+    stops: &mut mpsc::Receiver<Stop>,
+    timeout: Duration,
+    console_log: &Path,
+) -> EndReason {
+    if client.send_ctrl_alt_del().await.is_err() {
+        // Most likely the VM ended on its own just now.
+        if let Some(status) = vmm.ended() {
+            return vmm_natural_end(vmm, status, console_log);
+        }
+        vmm.kill().await;
+        return EndReason::Forced;
+    }
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            biased;
+            status = vmm.wait() => return graceful_end(status, console_log),
+            _ = &mut deadline => break,
+            stop = stops.recv() => match stop {
+                Some(Stop::Graceful { .. }) => continue,
+                Some(Stop::Park { done, .. }) => {
+                    let _ = done.send(Err(Error("the VM is stopping".into())));
+                }
+                Some(Stop::Force) | None => break,
+            },
+        }
+    }
+    vmm.kill().await;
+    EndReason::Forced
+}
+
+/// How a park failed.
+enum Parking {
+    /// No snapshot was taken, and the VM runs on.
+    Resumed(Error),
+    /// The VMM is gone but its snapshot didn't make it out of the jail.
+    Lost(Error),
+}
+
+/// Pauses the VM, snapshots it inside the jail, kills its VMM and moves the
+/// snapshot, with the rootfs it belongs to, into `into`. A park that fails
+/// removes `into` and whatever made it there: half a snapshot can't be woken,
+/// and nothing would own it.
+async fn park(
+    client: &Client,
+    vmm: &mut Vmm,
+    jail_root: &Path,
+    into: &Path,
+) -> Result<(), Parking> {
+    let result = park_steps(client, vmm, jail_root, into).await;
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(into);
+    }
+    result
+}
+
+async fn park_steps(
+    client: &Client,
+    vmm: &mut Vmm,
+    jail_root: &Path,
+    into: &Path,
+) -> Result<(), Parking> {
+    // Made first, so a park that can't keep its snapshot never pauses the VM.
+    std::fs::create_dir_all(into)
+        .map_err(|e| Parking::Resumed(err("create the snapshot directory", e)))?;
+    client
+        .pause()
+        .await
+        .map_err(|e| Parking::Resumed(err("pause the VM", e)))?;
+    let [vmstate, mem, _] = PARK_FILES;
+    if let Err(e) = client
+        .create_snapshot(&format!("/{vmstate}"), &format!("/{mem}"))
+        .await
+    {
+        for file in [vmstate, mem] {
+            let _ = std::fs::remove_file(jail_root.join(file));
+        }
+        return match client.resume().await {
+            Ok(()) => Err(Parking::Resumed(err("snapshot the VM", e))),
+            Err(r) => Err(Parking::Lost(Error(format!(
+                "snapshot the VM: {e}; then resuming it failed too ({r}), so it was stopped"
+            )))),
+        };
+    }
+    vmm.kill().await;
+    move_files(jail_root, PARK_FILES, into, SNAPSHOT_FILES).map_err(|e| {
+        Parking::Lost(err(
+            "move the snapshot out of the jail, so the VM was stopped",
+            e,
+        ))
+    })
+}
+
+/// Renames each file `from_names` lists in `from` to the name at the same
+/// position in `to_names`, in `to`. Snapshot and jail directories are both in
+/// the state dir, so these are renames on one filesystem. Tries every file,
+/// and returns the first error.
+fn move_files(
+    from: &Path,
+    from_names: [&str; 3],
+    to: &Path,
+    to_names: [&str; 3],
+) -> std::io::Result<()> {
+    let mut result = Ok(());
+    for (source, dest) in from_names.into_iter().zip(to_names) {
+        if let Err(e) = std::fs::rename(from.join(source), to.join(dest))
+            && result.is_ok()
+        {
+            result = Err(std::io::Error::new(e.kind(), format!("{source}: {e}")));
+        }
+    }
+    result
 }
 
 /// [`natural_end`] for a VMM this agent holds, which also counts an OOM kill

@@ -8,10 +8,14 @@
 //! | `POST /vms`                    | [`RunRequest`]  | `201` [`VmInfo`]         |
 //! | `GET /vms[?all=true]`          |                 | `200` `[`[`VmInfo`]`]`   |
 //! | `POST /vms/{name}/stop`        | [`StopRequest`] | `200` [`VmInfo`] (ended) |
+//! | `POST /vms/{name}/park`        |                 | `200` [`VmInfo`] (parked)|
+//! | `POST /vms/{name}/wake`        |                 | `201` [`VmInfo`]         |
 //! | `GET /vms/{name}/logs?offset=N`|                 | `200` console bytes      |
 //! | `DELETE /vms/{name}`           |                 | `204`                    |
 //!
-//! `GET /vms` lists running VMs; `all=true` adds Ended VMs. The logs
+//! `GET /vms` lists running VMs; `all=true` adds Ended VMs. A parked VM is
+//! an Ended VM whose reason is [`EndReason::Parked`]; waking it starts a new
+//! VM under its name from its snapshot. The logs
 //! response is the console log from byte `offset` on (default 0), as
 //! `text/plain`, with a [`VM_STATE_HEADER`] saying whether the VM is still
 //! running, so a client can follow it by polling from its last offset.
@@ -97,6 +101,8 @@ pub enum EndReason {
     Exited,
     /// The guest crashed, or the VMM died unexpectedly.
     Crashed,
+    /// Snapshotted to disk by a park, to be woken later.
+    Parked,
     /// It was already gone when the agent started again, so how it ended is
     /// unknown.
     #[serde(rename = "agent_down")]
@@ -110,6 +116,7 @@ impl EndReason {
             EndReason::Forced => "forced",
             EndReason::Exited => "exited",
             EndReason::Crashed => "crashed",
+            EndReason::Parked => "parked",
             EndReason::AgentDown => "died while the agent was down",
         }
     }

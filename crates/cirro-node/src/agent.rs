@@ -11,13 +11,17 @@
 //! database once it has started; the agent never stops VMs when it exits,
 //! and a starting agent takes back every VM whose record still matches a
 //! running process before it opens its socket.
+//!
+//! A park ends a VM with [`EndReason::Parked`] and keeps its snapshot in the
+//! state dir under its name; a wake starts a new VM from that snapshot under
+//! the same name, appending to the same console log.
 
 use crate::egress;
 use crate::metrics::{Recorder, RunningVm, Sampler};
 use crate::rootfs_open;
 use crate::state::{Record, Store};
 use crate::subnet::Subnet;
-use crate::vm::{self, GuestConfig, Stop, Vm, VmSpec};
+use crate::vm::{self, GuestConfig, Stop, Vm, VmSpec, WakeSpec};
 use bytes::Bytes;
 use cirro_proto::{
     EndReason, Ended, ErrorBody, MAX_MEM_MIB, MAX_VCPUS, MIN_MEM_MIB, MIN_VCPUS, RunRequest, Stats,
@@ -33,7 +37,7 @@ use nix::sys::stat::{Mode, umask};
 use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::net::Ipv4Addr;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,7 +45,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UnixListener;
 use tokio::net::unix::UCred;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 use tracing::{Instrument, error, info, info_span, warn};
 
@@ -113,6 +117,9 @@ struct Agent {
     subnet: Subnet,
     /// Console logs, one per name, kept with the Ended VM record.
     logs_dir: PathBuf,
+    /// Parked VMs' snapshots, one directory per name. Root-only: they hold
+    /// the guests' memory.
+    parked_dir: PathBuf,
     vms: Mutex<BTreeMap<String, Entry>>,
     store: Mutex<Store>,
     /// Numbers each VM start's console log file.
@@ -125,9 +132,9 @@ struct Agent {
 }
 
 /// Runs the agent until SIGTERM or SIGINT, then removes the socket. VMs,
-/// their records and their console logs stay, and the jail tree and parent
-/// cgroup go only if no VM is left in them. The Node's egress policy is
-/// ensured first, and outlives the agent.
+/// their records, console logs and snapshots stay, and the jail tree, the
+/// parked dir and the parent cgroup go only if nothing is left in them. The
+/// Node's egress policy is ensured first, and outlives the agent.
 pub async fn run(config: Config) -> io::Result<()> {
     // Both refusals below run before the agent changes anything on the
     // Node: a live socket is checked first (the fastest way to tell this
@@ -136,6 +143,13 @@ pub async fn run(config: Config) -> io::Result<()> {
 
     let logs_dir = config.state_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
+    let parked_dir = config.state_dir.join("parked");
+    match std::fs::DirBuilder::new().mode(0o700).create(&parked_dir) {
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
+        _ => {}
+    }
+    // Also when an earlier agent made it: it holds guests' memory.
+    std::fs::set_permissions(&parked_dir, std::fs::Permissions::from_mode(0o700))?;
     let store = Store::open(
         &config.state_dir.join("state.db"),
         &config.subnet.to_string(),
@@ -161,6 +175,7 @@ pub async fn run(config: Config) -> io::Result<()> {
         },
         subnet: config.subnet,
         logs_dir: logs_dir.clone(),
+        parked_dir,
         vms: Mutex::new(BTreeMap::new()),
         store: Mutex::new(store),
         next_log: AtomicU64::new(next_log_number(&logs_dir)),
@@ -305,6 +320,11 @@ impl Agent {
                     Err(e) => Err(e),
                 }
             }
+            (&Method::POST, ["vms", name, "park"]) => self.park_vm(name).await,
+            (&Method::POST, ["vms", name, "wake"]) => {
+                let name = name.to_string();
+                self.wake_vm(name).await
+            }
             (&Method::GET, ["vms", name, "logs"]) => {
                 let offset = query_param(&query, "offset")
                     .map(|o| o.parse::<u64>())
@@ -407,26 +427,25 @@ impl Agent {
                     "the Node agent is shutting down".into(),
                 ));
             }
-            if matches!(
-                vms.get(&run.name),
-                Some(Entry::Starting { .. } | Entry::Running { .. })
-            ) {
-                return Err(ApiError(
-                    StatusCode::CONFLICT,
-                    format!("a VM named {:?} already exists", run.name),
-                ));
+            match vms.get(&run.name) {
+                Some(Entry::Starting { .. } | Entry::Running { .. }) => {
+                    return Err(ApiError(
+                        StatusCode::CONFLICT,
+                        format!("a VM named {:?} already exists", run.name),
+                    ));
+                }
+                Some(Entry::Ended { info, .. }) if is_parked(info) => {
+                    return Err(ApiError(
+                        StatusCode::CONFLICT,
+                        format!(
+                            "VM {:?} is parked: wake it, or rm it to discard its snapshot",
+                            run.name
+                        ),
+                    ));
+                }
+                _ => {}
             }
-            let held: Vec<Ipv4Addr> = vms.values().filter_map(Entry::vm_address).collect();
-            let vm_address = self
-                .subnet
-                .vm_addresses()
-                .find(|a| !held.contains(a))
-                .ok_or_else(|| {
-                    ApiError(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "the Node subnet has no free VM addresses".into(),
-                    )
-                })?;
+            let vm_address = self.free_vm_address(&vms)?;
             // Reusing an Ended VM's name replaces its record once the new VM
             // has started.
             let replaced = match vms.insert(
@@ -458,6 +477,174 @@ impl Agent {
         tokio::spawn(async move { self.start_vm(name, spec, replaced).await }.in_current_span())
             .await
             .unwrap_or_else(|e| Err(internal(format!("starting the VM panicked: {e}"))))
+    }
+
+    /// The lowest VM address no entry in `vms` holds.
+    fn free_vm_address(&self, vms: &BTreeMap<String, Entry>) -> Result<Ipv4Addr, ApiError> {
+        let held: Vec<Ipv4Addr> = vms.values().filter_map(Entry::vm_address).collect();
+        self.subnet
+            .vm_addresses()
+            .find(|a| !held.contains(a))
+            .ok_or_else(|| {
+                ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the Node subnet has no free VM addresses".into(),
+                )
+            })
+    }
+
+    /// Snapshots a running VM and ends it as parked. A VM that can't be
+    /// parked keeps running, and the error says why.
+    async fn park_vm(&self, name: &str) -> Result<ApiResponse, ApiError> {
+        let (stops, mut ended) = self.running(name)?;
+        let (done_tx, done) = oneshot::channel();
+        let park = Stop::Park {
+            into: self.parked_dir.join(name),
+            done: done_tx,
+        };
+        if stops.send(park).await.is_err() {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                format!("VM {name:?} ended before it could be parked"),
+            ));
+        }
+        match done.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return Err(ApiError(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("VM {name:?} couldn't be parked: {e}"),
+                ));
+            }
+            Err(_) => {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    format!("VM {name:?} ended before it could be parked"),
+                ));
+            }
+        }
+        let _ = ended.wait_for(|ended| *ended).await;
+        self.ended_info(name)
+    }
+
+    /// Starts a new VM from a parked VM's snapshot, under its name. A wake
+    /// that fails leaves the VM parked.
+    async fn wake_vm(self: Arc<Self>, name: String) -> Result<ApiResponse, ApiError> {
+        let (spec, parked) = {
+            let mut vms = self.vms.lock().unwrap();
+            if self.shutting_down.load(Ordering::SeqCst) {
+                return Err(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the Node agent is shutting down".into(),
+                ));
+            }
+            let parked = match vms.get(&name) {
+                None => return Err(no_such_vm(&name)),
+                Some(Entry::Ended { info, log }) if is_parked(info) => Replaced {
+                    info: info.clone(),
+                    log: log.clone(),
+                },
+                Some(_) => {
+                    return Err(ApiError(
+                        StatusCode::CONFLICT,
+                        format!("VM {name:?} isn't parked"),
+                    ));
+                }
+            };
+            let vm_address = self.free_vm_address(&vms)?;
+            vms.insert(
+                name.clone(),
+                Entry::Starting {
+                    vm_address,
+                    log: parked.log.clone(),
+                },
+            );
+            let spec = WakeSpec {
+                vm_address,
+                mem_mib: parked.info.mem_mib,
+                vcpus: parked.info.vcpus,
+                snapshot: self.parked_dir.join(&name),
+                console_log: parked.log.clone(),
+            };
+            (spec, parked)
+        };
+        // On its own task, like a start, so it finishes even if the client
+        // goes away.
+        tokio::spawn(async move { self.finish_wake(name, spec, parked).await }.in_current_span())
+            .await
+            .unwrap_or_else(|e| Err(internal(format!("waking the VM panicked: {e}"))))
+    }
+
+    async fn finish_wake(
+        self: Arc<Self>,
+        name: String,
+        spec: WakeSpec,
+        parked: Replaced,
+    ) -> Result<ApiResponse, ApiError> {
+        let put_back = |agent: &Agent, parked: Replaced| {
+            agent.vms.lock().unwrap().insert(
+                name.clone(),
+                Entry::Ended {
+                    info: parked.info,
+                    log: parked.log,
+                },
+            );
+        };
+        let vm = match Vm::wake(&self.node, &spec)
+            .instrument(info_span!("wake", vm = name, address = %spec.vm_address))
+            .await
+        {
+            Ok(vm) => vm,
+            Err(e) => {
+                warn!(vm = name, "failed to wake: {e}");
+                put_back(&self, parked);
+                return Err(ApiError(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("VM {name:?} failed to wake, and is still parked: {e}"),
+                ));
+            }
+        };
+        let info = VmInfo {
+            name: name.clone(),
+            vm_address: Some(spec.vm_address),
+            mem_mib: spec.mem_mib,
+            vcpus: spec.vcpus,
+            started_at: now(),
+            ended: None,
+        };
+        let recorded =
+            self.store
+                .lock()
+                .unwrap()
+                .insert_running(&info, &spec.console_log, vm.process());
+        if let Err(e) = recorded {
+            // The guest has run, so its rootfs may no longer match the
+            // snapshot, which goes with the VM. It ends as forced, not
+            // parked: there is nothing left to wake.
+            vm.destroy().await;
+            let ended = Ended {
+                at: now(),
+                reason: EndReason::Forced,
+            };
+            if let Err(e) = self.store.lock().unwrap().mark_ended(&name, &ended) {
+                error!(vm = name, "record the end: {e}");
+            }
+            self.vms.lock().unwrap().insert(
+                name.clone(),
+                Entry::Ended {
+                    info: ended_info(parked.info, ended),
+                    log: parked.log,
+                },
+            );
+            return Err(internal(format!(
+                "VM {name:?} woke, but recording it failed, so it was stopped and its \
+                 snapshot is lost: {e}"
+            )));
+        }
+        let _ = std::fs::remove_dir(&spec.snapshot);
+        info!(vm = name, address = %spec.vm_address, "VM woke");
+        self.start_supervising(info.clone(), spec.console_log, vm);
+        Ok(json(StatusCode::CREATED, &info))
     }
 
     /// Runs `Vm::start` for a name and VM address already reserved as
@@ -643,26 +830,39 @@ impl Agent {
         }
     }
 
+    /// The way to reach a running VM's supervisor, and to hear it end.
+    fn running(&self, name: &str) -> Result<(mpsc::Sender<Stop>, watch::Receiver<bool>), ApiError> {
+        let vms = self.vms.lock().unwrap();
+        match vms.get(name) {
+            None => Err(no_such_vm(name)),
+            Some(Entry::Starting { .. }) => Err(ApiError(
+                StatusCode::CONFLICT,
+                format!("VM {name:?} is still starting"),
+            )),
+            Some(Entry::Ended { info, .. }) if is_parked(info) => Err(ApiError(
+                StatusCode::CONFLICT,
+                format!("VM {name:?} is parked: wake it first, or rm it to discard its snapshot"),
+            )),
+            Some(Entry::Ended { .. }) => Err(ApiError(
+                StatusCode::CONFLICT,
+                format!("VM {name:?} has already ended"),
+            )),
+            Some(Entry::Running { stops, ended, .. }) => Ok((stops.clone(), ended.clone())),
+        }
+    }
+
+    /// The Ended VM record of `name`, once its supervisor has recorded it.
+    fn ended_info(&self, name: &str) -> Result<ApiResponse, ApiError> {
+        match self.vms.lock().unwrap().get(name) {
+            Some(Entry::Ended { info, .. }) => Ok(json(StatusCode::OK, info)),
+            _ => Err(internal(format!(
+                "VM {name:?} ended, but its record is gone"
+            ))),
+        }
+    }
+
     async fn stop_vm(&self, name: &str, stop: StopRequest) -> Result<ApiResponse, ApiError> {
-        let (stops, mut ended) = {
-            let vms = self.vms.lock().unwrap();
-            match vms.get(name) {
-                None => return Err(no_such_vm(name)),
-                Some(Entry::Starting { .. }) => {
-                    return Err(ApiError(
-                        StatusCode::CONFLICT,
-                        format!("VM {name:?} is still starting"),
-                    ));
-                }
-                Some(Entry::Ended { .. }) => {
-                    return Err(ApiError(
-                        StatusCode::CONFLICT,
-                        format!("VM {name:?} has already ended"),
-                    ));
-                }
-                Some(Entry::Running { stops, ended, .. }) => (stops.clone(), ended.clone()),
-            }
-        };
+        let (stops, mut ended) = self.running(name)?;
         let request = if stop.force {
             Stop::Force
         } else {
@@ -675,12 +875,7 @@ impl Agent {
         // If the supervisor is already gone, the VM is ending anyway.
         let _ = stops.send(request).await;
         let _ = ended.wait_for(|ended| *ended).await;
-        match self.vms.lock().unwrap().get(name) {
-            Some(Entry::Ended { info, .. }) => Ok(json(StatusCode::OK, info)),
-            _ => Err(internal(format!(
-                "VM {name:?} ended, but its record is gone"
-            ))),
-        }
+        self.ended_info(name)
     }
 
     fn logs(&self, name: &str, offset: u64) -> Result<ApiResponse, ApiError> {
@@ -707,7 +902,16 @@ impl Agent {
         let mut vms = self.vms.lock().unwrap();
         match vms.get(name) {
             None => Err(no_such_vm(name)),
-            Some(Entry::Ended { log, .. }) => {
+            Some(Entry::Ended { info, log }) => {
+                if is_parked(info) {
+                    let snapshot = self.parked_dir.join(name);
+                    match std::fs::remove_dir_all(&snapshot) {
+                        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                            return Err(internal(format!("remove the snapshot of {name:?}: {e}")));
+                        }
+                        _ => {}
+                    }
+                }
                 self.store
                     .lock()
                     .unwrap()
@@ -743,8 +947,15 @@ impl Agent {
         // Only succeed once empty, so a jail still in use is never removed.
         let _ = std::fs::remove_dir(self.node.jail_base.join("firecracker"));
         let _ = std::fs::remove_dir(&self.node.jail_base);
+        let _ = std::fs::remove_dir(&self.parked_dir);
         let _ = std::fs::remove_dir(vm::parent_cgroup());
     }
+}
+
+fn is_parked(info: &VmInfo) -> bool {
+    info.ended
+        .as_ref()
+        .is_some_and(|e| e.reason == EndReason::Parked)
 }
 
 /// `info` as an Ended VM's: it holds no VM address any more.
