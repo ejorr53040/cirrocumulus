@@ -80,7 +80,7 @@ enum Command {
     Rm { name: String },
     /// Snapshot a VM to disk and free its RAM
     Park { name: String },
-    /// Restore a parked VM
+    /// Start a parked VM again from its snapshot and print its VM address
     Wake { name: String },
     /// Live terminal dashboard
     Top {
@@ -269,6 +269,8 @@ fn main() -> ExitCode {
                 name,
             } => stop(&cli.socket, &name, force, timeout).await,
             Command::Rm { name } => rm(&cli.socket, &name).await,
+            Command::Park { name } => park(&cli.socket, &name).await,
+            Command::Wake { name } => wake(&cli.socket, &name).await,
             Command::Node(NodeCommand::Install {
                 state_dir,
                 group,
@@ -634,6 +636,35 @@ async fn stop(socket: &Path, name: &str, force: bool, timeout_secs: u64) -> Resu
     )
     .await
     .map(drop)
+}
+
+async fn park(socket: &Path, name: &str) -> Result<(), String> {
+    client::call::<VmInfo>(
+        socket,
+        Method::POST,
+        &format!("/vms/{name}/park"),
+        None::<&()>,
+    )
+    .await
+    .map(drop)
+}
+
+async fn wake(socket: &Path, name: &str) -> Result<(), String> {
+    let vm: VmInfo = client::call(
+        socket,
+        Method::POST,
+        &format!("/vms/{name}/wake"),
+        None::<&()>,
+    )
+    .await?
+    .ok_or("the Node agent answered the wake with no VM")?;
+    match vm.vm_address {
+        Some(address) => {
+            println!("{address}");
+            Ok(())
+        }
+        None => Err("the Node agent answered the wake with no VM address".into()),
+    }
 }
 
 async fn rm(socket: &Path, name: &str) -> Result<(), String> {
