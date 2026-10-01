@@ -32,6 +32,14 @@ impl Store {
     /// VM addresses aren't this Node's to hand out or clean up after.
     pub(crate) fn open(path: &Path, subnet: &str) -> io::Result<Store> {
         let conn = Connection::open(path).map_err(io_error)?;
+        // WAL with `synchronous = NORMAL`: a commit doesn't fsync. Waking
+        // records the VM after it runs, and on btrfs that fsync waits for
+        // the park's snapshot to reach disk too: 30 ms typical, 100 ms+ in
+        // the tail. NORMAL survives the agent crashing; a power cut may
+        // lose the last commits, but nothing fsyncs a snapshot either, so a
+        // parked VM never outlived one.
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
+            .map_err(io_error)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS node (subnet TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS vms (

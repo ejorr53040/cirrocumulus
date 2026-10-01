@@ -88,6 +88,9 @@ const CGROUP_POLL_ATTEMPTS: u32 = 100;
 const CONSOLE_TAIL_LINES: usize = 10;
 /// How long jailer has to bring up Firecracker's API socket.
 const API_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often to look for that socket. Firecracker is up in ~25 ms, and a
+/// wake waits on it, so a coarse poll shows up in every wake's time.
+const API_SOCKET_POLL: Duration = Duration::from_millis(1);
 /// Fixed VMM overhead added to the guest's memory for the cgroup ceiling,
 /// until `cirro bench` measures it.
 const VMM_OVERHEAD_MIB: u64 = 32;
@@ -564,8 +567,9 @@ impl Vm {
     }
 
     /// Steps 1-4 of every VM start, whether booted or woken: the network
-    /// namespace and its links and NAT, the Node's route, and jailer up to
-    /// Firecracker's API socket. Returns the uid Firecracker runs as.
+    /// namespace, jailer in it, then the namespace's links and NAT and the
+    /// Node's route while Firecracker starts, and last Firecracker's API
+    /// socket. Returns the uid Firecracker runs as.
     async fn host_steps(
         &mut self,
         node: &NodeConfig,
@@ -579,68 +583,16 @@ impl Vm {
         let uid = VM_UID_BASE + (u32::from(c) << 8 | u32::from(d));
         let vm_addr = vm_address.to_string();
         let node_addr = node.node_address.to_string();
+        let uid_s = uid.to_string();
 
-        // 1. The VM's network namespace, with its tap inside.
+        // 1. The VM's network namespace.
         ip(&["netns", "add", &id]).await?;
         self.undo.push(Undo::netns(&id));
-        let uid_s = uid.to_string();
-        ip_in(&id, &["link", "set", "lo", "up"]).await?;
-        ip_in(
-            &id,
-            &[
-                "tuntap", "add", "dev", "tap0", "mode", "tap", "user", &uid_s, "group", &uid_s,
-            ],
-        )
-        .await?;
-        ip_in(
-            &id,
-            &["addr", "add", &format!("{GUEST_GATEWAY}/30"), "dev", "tap0"],
-        )
-        .await?;
-        ip_in(&id, &["link", "set", "tap0", "address", TAP_MAC]).await?;
-        ip_in(&id, &["link", "set", "tap0", "up"]).await?;
 
-        // 2. A veth pair to the Node, and 1:1 NAT between the Guest address
-        //    and the VM address inside the namespace.
-        ip(&[
-            "link", "add", &id, "type", "veth", "peer", "name", "veth0", "netns", &id,
-        ])
-        .await?;
-        self.undo.push(Undo::link(&id));
-        ip(&["addr", "add", &format!("{node_addr}/32"), "dev", &id]).await?;
-        ip(&["link", "set", &id, "up"]).await?;
-        ip_in(
-            &id,
-            &["addr", "add", &format!("{vm_addr}/32"), "dev", "veth0"],
-        )
-        .await?;
-        ip_in(&id, &["link", "set", "veth0", "up"]).await?;
-        ip_in(
-            &id,
-            &["route", "add", &format!("{node_addr}/32"), "dev", "veth0"],
-        )
-        .await?;
-        ip_in(
-            &id,
-            &["route", "add", "default", "via", &node_addr, "dev", "veth0"],
-        )
-        .await?;
-        in_netns(&id, &["sysctl", "-qw", "net.ipv4.ip_forward=1"]).await?;
-        nft_in(&id, &nat_ruleset(vm_address)).await?;
-
-        // 3. The Node's route to the VM address. Deleting the veth removes it.
-        ip(&[
-            "route",
-            "add",
-            &format!("{vm_addr}/32"),
-            "dev",
-            &id,
-            "src",
-            &node_addr,
-        ])
-        .await?;
-
-        // 4. jailer, in the namespace and under the VM's cgroup limits.
+        // 2. jailer, in the namespace and under the VM's cgroup limits. It
+        //    needs only the namespace to exist: Firecracker opens the tap at
+        //    boot or snapshot load, not at start, so it starts now and the
+        //    links below are set up while it does.
         enable_io_accounting();
         let root = jail_dir(node, &id).join("root");
         self.jail_root = root.clone();
@@ -699,6 +651,41 @@ impl Vm {
         }
         self.vmm = Some(Vmm::Child(child));
 
+        // 3. The tap inside the namespace, a veth pair to the Node, 1:1 NAT
+        //    between the Guest address and the VM address inside the
+        //    namespace, and the Node's route to the VM address (deleting the
+        //    veth removes it). One `ip -batch` on each side of the veth,
+        //    since every `ip` run costs a fork and exec on the wake path.
+        ip_batch(
+            None,
+            &[
+                format!("link add {id} type veth peer name veth0 netns {id}"),
+                format!("addr add {node_addr}/32 dev {id}"),
+                format!("link set {id} up"),
+                format!("route add {vm_addr}/32 dev {id} src {node_addr}"),
+            ],
+        )
+        .await?;
+        self.undo.push(Undo::link(&id));
+        ip_batch(
+            Some(&id),
+            &[
+                "link set lo up".to_string(),
+                format!("tuntap add dev tap0 mode tap user {uid_s} group {uid_s}"),
+                format!("addr add {GUEST_GATEWAY}/30 dev tap0"),
+                format!("link set tap0 address {TAP_MAC}"),
+                "link set tap0 up".to_string(),
+                format!("addr add {vm_addr}/32 dev veth0"),
+                "link set veth0 up".to_string(),
+                format!("route add {node_addr}/32 dev veth0"),
+                format!("route add default via {node_addr} dev veth0"),
+            ],
+        )
+        .await?;
+        in_netns(&id, &["sysctl", "-qw", "net.ipv4.ip_forward=1"]).await?;
+        nft_in(&id, &nat_ruleset(vm_address)).await?;
+
+        // 4. Firecracker's API socket.
         let api_socket = root.join("run/firecracker.socket");
         self.api_socket = api_socket.clone();
         let deadline = Instant::now() + API_SOCKET_TIMEOUT;
@@ -715,7 +702,7 @@ impl Vm {
                     api_socket.display()
                 )));
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(API_SOCKET_POLL).await;
         }
 
         Ok(uid)
@@ -1140,8 +1127,18 @@ async fn ip(args: &[&str]) -> Result<(), Error> {
     run(Command::new("ip").args(args), None).await
 }
 
-async fn ip_in(netns: &str, args: &[&str]) -> Result<(), Error> {
-    run(Command::new("ip").args(["-n", netns]).args(args), None).await
+/// Runs `ip` commands, one per line, in a single `ip -batch`, in `netns` if
+/// given. `ip` stops at the first command that fails and names it.
+async fn ip_batch(netns: Option<&str>, commands: &[String]) -> Result<(), Error> {
+    let mut cmd = Command::new("ip");
+    if let Some(netns) = netns {
+        cmd.args(["-n", netns]);
+    }
+    run(
+        cmd.args(["-batch", "-"]),
+        Some(&(commands.join("\n") + "\n")),
+    )
+    .await
 }
 
 async fn in_netns(netns: &str, argv: &[&str]) -> Result<(), Error> {
