@@ -213,11 +213,13 @@ jobs:
     container: debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
     timeout-minutes: 20
     steps:
-      - name: Install e2fsprogs and a C linker
+      # mke2fs reads tarballs through libarchive, which it loads at run
+      # time and Debian only recommends, so --no-install-recommends drops it.
+      - name: Install e2fsprogs with libarchive, and a C linker
         run: |
           apt-get update -qq
           apt-get install -qq -y --no-install-recommends \
-            ca-certificates curl e2fsprogs gcc libc6-dev > /dev/null
+            ca-certificates curl e2fsprogs libarchive13t64 gcc libc6-dev > /dev/null
           mke2fs -V
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

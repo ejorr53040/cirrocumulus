@@ -56,7 +56,9 @@ mode and setuid bit from the tar, so the filesystem keeps root-owned `/usr/bin/s
 nginx's own user without the build ever running as root. Unpacking to a directory first
 would need root to keep that ownership. This needs **e2fsprogs 1.47.1 or later**: Arch,
 Fedora and Debian 13 have it, while Ubuntu 24.04 and Debian 12 ship 1.47.0. `cirro node
-install` and the builder both check the version.
+install` and the builder both check the version. `mke2fs` reads the tarball through
+libarchive, which it loads only when needed: on Debian, install `libarchive13t64` too
+if you skip recommended packages.
 
 ## Managing the cache
 
