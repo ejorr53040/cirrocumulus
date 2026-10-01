@@ -62,7 +62,14 @@ fn rootfs() -> &'static Rootfs {
         for sub in ["proc", "sys", "dev", "app"] {
             std::fs::create_dir_all(tree.join(sub)).expect("create rootfs tree");
         }
-        for fixture in ["http_app", "ignore_term", "exit_later", "probe", "whoami"] {
+        for fixture in [
+            "http_app",
+            "ignore_term",
+            "exit_later",
+            "probe",
+            "whoami",
+            "spin",
+        ] {
             let status = std::process::Command::new("rustc")
                 .args(["--target", "x86_64-unknown-linux-musl", "-O", "-o"])
                 .arg(tree.join("app").join(fixture))
@@ -1553,6 +1560,63 @@ fn run_boots_an_image_from_a_registry_and_runs_its_command() {
     agent
         .cirro()
         .args(["stop", "--force", "nginx"])
+        .assert()
+        .success();
+    agent.assert_no_cirro_state();
+}
+
+/// M5: the agent samples every running VM once a second, and `top --once`
+/// prints what each is using.
+#[test]
+fn top_once_shows_a_busy_vm_using_cpu_and_memory() {
+    let Some(agent) = Agent::start(226) else {
+        return;
+    };
+    let address = stdout(
+        agent
+            .run("busy", &rootfs().guest_init, &["/app/spin"])
+            .success(),
+    );
+    // Disk use comes from the io controller, which jailer doesn't turn on.
+    let [_, _, c, d] = address
+        .trim()
+        .parse::<std::net::Ipv4Addr>()
+        .unwrap()
+        .octets();
+    let io_stat = format!("/sys/fs/cgroup/cirro/cirro-{c:02x}{d:02x}/io.stat");
+    assert!(Path::new(&io_stat).exists(), "{io_stat} is missing");
+
+    // A rate needs two samples, a second apart.
+    let deadline = Instant::now() + TIMEOUT;
+    let (cpu, row) = loop {
+        let top = stdout(agent.cirro().args(["top", "--once"]).assert().success());
+        let row = row(&top, "busy")
+            .unwrap_or_else(|| panic!("top doesn't list busy:\n{top}"))
+            .to_string();
+        // `-` until the agent has two samples of the VM.
+        let cpu: f64 = row
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.trim_end_matches('%').parse().ok())
+            .unwrap_or(0.0);
+        if cpu >= 50.0 || Instant::now() > deadline {
+            break (cpu, row);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert!(
+        cpu >= 50.0,
+        "a VM spinning one vCPU shows {cpu}% CPU: {row}"
+    );
+    let memory = row.split_whitespace().nth(2).unwrap_or("");
+    assert!(
+        memory.ends_with('M') && memory != "0M",
+        "a running VM shows no memory: {row}"
+    );
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "busy"])
         .assert()
         .success();
     agent.assert_no_cirro_state();

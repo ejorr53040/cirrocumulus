@@ -13,14 +13,15 @@
 //! running process before it opens its socket.
 
 use crate::egress;
+use crate::metrics::{Recorder, RunningVm, Sampler};
 use crate::rootfs_open;
 use crate::state::{Record, Store};
 use crate::subnet::Subnet;
 use crate::vm::{self, GuestConfig, Stop, Vm, VmSpec};
 use bytes::Bytes;
 use cirro_proto::{
-    EndReason, Ended, ErrorBody, MAX_MEM_MIB, MAX_VCPUS, MIN_MEM_MIB, MIN_VCPUS, RunRequest,
-    StopRequest, VM_STATE_HEADER, VmInfo,
+    EndReason, Ended, ErrorBody, MAX_MEM_MIB, MAX_VCPUS, MIN_MEM_MIB, MIN_VCPUS, RunRequest, Stats,
+    StopRequest, VM_STATE_HEADER, VmInfo, VmStats,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -36,16 +37,20 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UnixListener;
 use tokio::net::unix::UCred;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, watch};
+use tokio::time::MissedTickBehavior;
 use tracing::{Instrument, error, info, info_span, warn};
 
 /// How long a graceful stop waits for the VM to end before killing it,
 /// unless the request says otherwise.
 const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often the agent samples the Node and every running VM.
+const SAMPLE_EVERY: Duration = Duration::from_secs(1);
 
 /// Everything `cirro node agent` is started with.
 pub struct Config {
@@ -115,6 +120,8 @@ struct Agent {
     /// Set once shutdown begins, so no new VM starts while the agent waits for
     /// the starts already under way to finish.
     shutting_down: AtomicBool,
+    /// What the Node and each running VM used, for `GET /stats`.
+    metrics: Mutex<Recorder>,
 }
 
 /// Runs the agent until SIGTERM or SIGINT, then removes the socket. VMs,
@@ -158,8 +165,21 @@ pub async fn run(config: Config) -> io::Result<()> {
         store: Mutex::new(store),
         next_log: AtomicU64::new(next_log_number(&logs_dir)),
         shutting_down: AtomicBool::new(false),
+        metrics: Mutex::new(Recorder::default()),
     });
     agent.reconcile().await?;
+    let sampling = agent.clone();
+    let sampler = tokio::spawn(async move {
+        let sampler = Sampler::new(PathBuf::from("/"));
+        let mut every_second = tokio::time::interval(SAMPLE_EVERY);
+        // After a stall, wait for the next whole second rather than catch
+        // up with samples milliseconds apart, whose rates would be noise.
+        every_second.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            every_second.tick().await;
+            sampling.sample(&sampler);
+        }
+    });
 
     if let Some(dir) = config.socket.parent() {
         std::fs::create_dir_all(dir)?;
@@ -224,6 +244,7 @@ pub async fn run(config: Config) -> io::Result<()> {
     }
 
     info!("shutting down; running VMs stay up");
+    sampler.abort();
     let _ = std::fs::remove_file(&config.socket);
     agent.shutdown().await;
     Ok(())
@@ -268,6 +289,7 @@ impl Agent {
             return json(e.0, &ErrorBody { error: e.1 });
         }
         let result = match (&method, segments.as_slice()) {
+            (&Method::GET, ["stats"]) => Ok(json(StatusCode::OK, &self.stats())),
             (&Method::GET, ["vms"]) => {
                 let all = query_param(&query, "all") == Some("true");
                 Ok(json(StatusCode::OK, &self.list(all)))
@@ -297,6 +319,40 @@ impl Agent {
             )),
         };
         result.unwrap_or_else(|ApiError(status, error)| json(status, &ErrorBody { error }))
+    }
+
+    /// Samples the Node and every running VM, for [`Agent::stats`].
+    fn sample(&self, sampler: &Sampler) {
+        let running: Vec<RunningVm> = self
+            .list(false)
+            .into_iter()
+            .filter_map(|info| {
+                Some(RunningVm {
+                    id: vm::host_id(info.vm_address?),
+                    name: info.name,
+                })
+            })
+            .collect();
+        // The kernel's files are read under neither the VM table's lock
+        // nor the metrics one.
+        let at = Instant::now();
+        let readings = sampler.read(&running);
+        self.metrics.lock().unwrap().record(at, readings);
+    }
+
+    fn stats(&self) -> Stats {
+        let running = self.list(false);
+        let metrics = self.metrics.lock().unwrap();
+        Stats {
+            node: metrics.node(),
+            vms: running
+                .into_iter()
+                .map(|info| VmStats {
+                    history: metrics.vm(&info.name),
+                    info,
+                })
+                .collect(),
+        }
     }
 
     fn list(&self, all: bool) -> Vec<VmInfo> {

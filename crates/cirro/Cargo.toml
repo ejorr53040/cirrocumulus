@@ -17,6 +17,7 @@ bytes.workspace = true
 cirro-image.workspace = true
 cirro-node.workspace = true
 cirro-proto.workspace = true
+cirro-tui.workspace = true
 clap.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
