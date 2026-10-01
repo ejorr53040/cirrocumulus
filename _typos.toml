@@ -4,7 +4,14 @@
 [files]
 # Internal planning docs are gitignored; lockfiles are generated; the vendored
 # Alpine signing keys are base64 that happens to contain "words".
-extend-exclude = ["Cargo.lock", "BUILD_PATHWAY.md", "RESEARCH*.md", "*.rsa.pub"]
+# scripts/demo/record-top.sh embeds the wizard skill's shared library as is.
+extend-exclude = [
+    "Cargo.lock",
+    "BUILD_PATHWAY.md",
+    "RESEARCH*.md",
+    "*.rsa.pub",
+    "scripts/demo/record-top.sh",
+]
 
 [default.extend-words]
 # `carrer_quiz.db` is the upstream uvm-career-quiz app's own database
