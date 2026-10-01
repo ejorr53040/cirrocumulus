@@ -344,6 +344,7 @@ impl Agent {
         let running = self.list(false);
         let metrics = self.metrics.lock().unwrap();
         Stats {
+            now: now(),
             node: metrics.node(),
             vms: running
                 .into_iter()

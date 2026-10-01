@@ -259,6 +259,7 @@ fn main() -> ExitCode {
             }
             Command::Run(args) => run(&cli.socket, args).await,
             Command::Top { once: true } => top_once(&cli.socket).await,
+            Command::Top { once: false } => top(&cli.socket).await,
             Command::Image(command) => image_command(command).await,
             Command::Ps { all } => ps(&cli.socket, all).await,
             Command::Logs { follow, name } => logs(&cli.socket, &name, follow).await,
@@ -462,6 +463,82 @@ fn image_cache_dir() -> Result<PathBuf, String> {
     Ok(base.join("cirro").join("images"))
 }
 
+/// The live dashboard, until `q`. The stats refresh once a second, as
+/// often as the agent samples.
+async fn top(socket: &Path) -> Result<(), String> {
+    let mut terminal = ratatui::try_init().map_err(|e| format!("setting up the terminal: {e}"))?;
+    let result = top_loop(socket, &mut terminal).await;
+    ratatui::restore();
+    result
+}
+
+async fn top_loop(socket: &Path, terminal: &mut ratatui::DefaultTerminal) -> Result<(), String> {
+    use ratatui::crossterm::event::{self, Event, KeyEventKind};
+    let mut dashboard = cirro_tui::Dashboard::default();
+    let mut next_refresh = std::time::Instant::now();
+    let mut refresh_failed = false;
+    // Stops run in the background (a graceful one can take its whole
+    // timeout) and report back here.
+    let (stopped, mut stop_results) = tokio::sync::mpsc::unbounded_channel();
+    loop {
+        if std::time::Instant::now() >= next_refresh {
+            match client::call::<Stats>(socket, Method::GET, "/stats", None::<&()>).await {
+                Ok(stats) => {
+                    dashboard.set_stats(stats.unwrap_or_default());
+                    if std::mem::take(&mut refresh_failed) {
+                        dashboard.clear_status();
+                    }
+                }
+                Err(e) => {
+                    refresh_failed = true;
+                    dashboard.set_status(e);
+                }
+            }
+            next_refresh = std::time::Instant::now() + Duration::from_secs(1);
+        }
+        while let Ok((name, result)) = stop_results.try_recv() {
+            dashboard.set_status(match result {
+                Ok(()) => format!("stopped {name}"),
+                Err(e) => format!("stopping {name}: {e}"),
+            });
+        }
+        terminal
+            .draw(|frame| dashboard.draw(frame))
+            .map_err(|e| format!("drawing the dashboard: {e}"))?;
+        let wait = next_refresh.saturating_duration_since(std::time::Instant::now());
+        if !event::poll(wait).map_err(|e| format!("reading the terminal: {e}"))? {
+            continue;
+        }
+        let Event::Key(key) = event::read().map_err(|e| format!("reading the terminal: {e}"))?
+        else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match dashboard.key(key.code) {
+            cirro_tui::Action::None => {}
+            cirro_tui::Action::Quit => return Ok(()),
+            cirro_tui::Action::ShowLog(name) => {
+                let path = format!("/vms/{name}/logs?offset=0");
+                match client::send(socket, Method::GET, &path, None::<&()>).await {
+                    Ok((_, log)) => dashboard.set_log(&name, &String::from_utf8_lossy(&log)),
+                    Err(e) => dashboard.set_status(e),
+                }
+            }
+            cirro_tui::Action::Stop(name) => {
+                dashboard.set_status(format!("stopping {name}…"));
+                let socket = socket.to_path_buf();
+                let stopped = stopped.clone();
+                tokio::spawn(async move {
+                    let result = stop(&socket, &name, false, 10).await;
+                    let _ = stopped.send((name, result));
+                });
+            }
+        }
+    }
+}
+
 async fn top_once(socket: &Path) -> Result<(), String> {
     let stats: Stats = client::call(socket, Method::GET, "/stats", None::<&()>)
         .await?
@@ -491,7 +568,7 @@ async fn ps(socket: &Path, all: bool) -> Result<(), String> {
             .vm_address
             .map_or_else(|| "-".to_string(), |a| a.to_string());
         let uptime = match vm.ended {
-            None => format_duration(now.saturating_sub(vm.started_at)),
+            None => cirro_tui::duration(now.saturating_sub(vm.started_at)),
             Some(_) => "-".to_string(),
         };
         let mut row = format!(
@@ -508,7 +585,7 @@ async fn ps(socket: &Path, all: bool) -> Result<(), String> {
                 Some(ended) => row.push_str(&format!(
                     "  {} {} ago",
                     ended.reason.as_str(),
-                    format_duration(now.saturating_sub(ended.at))
+                    cirro_tui::duration(now.saturating_sub(ended.at))
                 )),
             }
         }
@@ -610,15 +687,6 @@ fn format_mem(mib: u32) -> String {
         format!("{}G", mib / 1024)
     } else {
         format!("{mib}M")
-    }
-}
-
-fn format_duration(secs: u64) -> String {
-    match secs {
-        s if s < 60 => format!("{s}s"),
-        s if s < 3600 => format!("{}m", s / 60),
-        s if s < 86_400 => format!("{}h", s / 3600),
-        s => format!("{}d", s / 86_400),
     }
 }
 

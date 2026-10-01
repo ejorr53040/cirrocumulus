@@ -1,6 +1,10 @@
 //! `cirro top`: the terminal dashboard.
 
-use cirro_proto::Stats;
+mod dashboard;
+
+pub use dashboard::{Action, Dashboard};
+
+use cirro_proto::{Stats, VmRates};
 use std::fmt::Write;
 
 /// `stats` as plain text, for `cirro top --once`: a line for the Node,
@@ -22,30 +26,56 @@ pub fn snapshot(stats: &Stats) -> String {
         }
         None => out.push_str("NODE  (sampling)\n"),
     }
-    let _ = writeln!(
-        out,
-        "{:<32} {:>7} {:>7} {:>9} {:>9} {:>9} {:>9}",
-        "NAME", "CPU", "MEM", "NET IN", "NET OUT", "DISK R", "DISK W"
+    row(
+        &mut out,
+        [
+            "NAME", "CPU", "MEM", "NET IN", "NET OUT", "DISK R", "DISK W",
+        ]
+        .map(String::from),
     );
     for vm in &stats.vms {
-        let row = match vm.history.last() {
-            Some(r) => [
-                format!("{:.1}%", r.cpu_percent),
-                bytes(r.memory_bytes),
-                per_sec(r.rx_per_sec),
-                per_sec(r.tx_per_sec),
-                per_sec(r.io_read_per_sec),
-                per_sec(r.io_write_per_sec),
-            ],
-            None => std::array::from_fn(|_| "-".to_string()),
-        };
-        let _ = writeln!(
-            out,
-            "{:<32} {:>7} {:>7} {:>9} {:>9} {:>9} {:>9}",
-            vm.info.name, row[0], row[1], row[2], row[3], row[4], row[5]
+        let [cpu, mem, rx, tx, read, write] = rate_cells(vm.history.last());
+        row(
+            &mut out,
+            [vm.info.name.clone(), cpu, mem, rx, tx, read, write],
         );
     }
     out
+}
+
+/// A VM's latest rates as table cells: CPU, memory, network in and out,
+/// disk read and write. All `-` until the agent has two samples of it.
+pub(crate) fn rate_cells(rates: Option<&VmRates>) -> [String; 6] {
+    match rates {
+        Some(r) => [
+            format!("{:.1}%", r.cpu_percent),
+            bytes(r.memory_bytes),
+            per_sec(r.rx_per_sec),
+            per_sec(r.tx_per_sec),
+            per_sec(r.io_read_per_sec),
+            per_sec(r.io_write_per_sec),
+        ],
+        None => std::array::from_fn(|_| "-".to_string()),
+    }
+}
+
+/// `secs` in its largest whole unit: `45s`, `12m`, `3h`, `2d`.
+pub fn duration(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
+}
+
+/// One line of the `--once` table: a name, then six right-aligned cells.
+fn row(out: &mut String, [name, cells @ ..]: [String; 7]) {
+    let _ = write!(out, "{name:<32}");
+    for (cell, width) in cells.iter().zip([7, 7, 9, 9, 9, 9]) {
+        let _ = write!(out, " {cell:>width$}");
+    }
+    out.push('\n');
 }
 
 /// `n` bytes in the largest unit that keeps it at least 1: `512B`, `140M`,
@@ -65,7 +95,7 @@ pub fn bytes(n: u64) -> String {
     }
 }
 
-fn per_sec(n: u64) -> String {
+pub(crate) fn per_sec(n: u64) -> String {
     format!("{}/s", bytes(n))
 }
 
@@ -91,6 +121,7 @@ mod tests {
     #[test]
     fn the_snapshot_shows_the_latest_rates_and_a_dash_before_there_are_any() {
         let stats = Stats {
+            now: 0,
             node: vec![NodeRates {
                 cpu_percent: 12.34,
                 memory_used_bytes: 3 << 30,

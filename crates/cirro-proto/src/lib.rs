@@ -135,6 +135,10 @@ pub struct ErrorBody {
 /// second, for the last minute.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Stats {
+    /// Seconds since the Unix epoch on the Node's clock, as VMs'
+    /// `started_at` are, so uptimes don't depend on the CLI's clock.
+    #[serde(default)]
+    pub now: u64,
     /// Oldest first; empty until the agent has two samples.
     pub node: Vec<NodeRates>,
     pub vms: Vec<VmStats>,
