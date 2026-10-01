@@ -540,14 +540,28 @@ impl Agent {
             }
             let parked = match vms.get(&name) {
                 None => return Err(no_such_vm(&name)),
+                Some(Entry::Ended { info, .. })
+                    if is_parked(info) && !self.parked_dir.join(&name).is_dir() =>
+                {
+                    return Err(ApiError(StatusCode::CONFLICT, snapshot_gone(&name)));
+                }
                 Some(Entry::Ended { info, log }) if is_parked(info) => Replaced {
                     info: info.clone(),
                     log: log.clone(),
                 },
+                Some(Entry::Ended { .. }) => {
+                    return Err(ApiError(
+                        StatusCode::CONFLICT,
+                        format!(
+                            "VM {name:?} isn't parked; it has ended, and `cirro run` starts \
+                             a new VM under its name"
+                        ),
+                    ));
+                }
                 Some(_) => {
                     return Err(ApiError(
                         StatusCode::CONFLICT,
-                        format!("VM {name:?} isn't parked"),
+                        format!("VM {name:?} isn't parked; it's running"),
                     ));
                 }
             };
@@ -734,8 +748,12 @@ impl Agent {
     async fn reconcile(self: &Arc<Self>) -> io::Result<()> {
         let records = self.store.lock().unwrap().load()?;
         self.remove_unrecorded_logs(&records)?;
+        self.remove_unowned_snapshots(&records)?;
         for Record { info, log, process } in records {
             let name = info.name.clone();
+            if is_parked(&info) && !self.parked_dir.join(&name).is_dir() {
+                warn!(vm = name, "{}", snapshot_gone(&name));
+            }
             let entry = if info.ended.is_some() {
                 Entry::Ended { info, log }
             } else {
@@ -751,6 +769,10 @@ impl Agent {
                 if process.is_running() {
                     info!(vm = name, "re-adopted a running VM");
                     let vm = Vm::adopt(&self.node, vm_address, process, log.clone());
+                    // Firecracker accepts this for a VM that already runs.
+                    if let Err(e) = vm.resume().await {
+                        warn!(vm = name, "{e}");
+                    }
                     self.start_supervising(info, log, vm);
                     continue;
                 }
@@ -779,6 +801,34 @@ impl Agent {
         for entry in std::fs::read_dir(&self.logs_dir)?.flatten() {
             if !recorded.contains(&entry.file_name().as_os_str()) {
                 let _ = std::fs::remove_file(entry.path());
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes whatever in the parked dir no parked VM's record owns: a
+    /// snapshot left by a park the agent died part-way through, before the
+    /// VM was recorded as parked, or one whose record is gone. Either holds a
+    /// guest's memory that nothing could wake or remove.
+    fn remove_unowned_snapshots(&self, records: &[Record]) -> io::Result<()> {
+        let parked: Vec<&str> = records
+            .iter()
+            .filter(|r| is_parked(&r.info))
+            .map(|r| r.info.name.as_str())
+            .collect();
+        for entry in std::fs::read_dir(&self.parked_dir)?.flatten() {
+            if parked.iter().any(|name| entry.file_name() == **name) {
+                continue;
+            }
+            let path = entry.path();
+            warn!(path = %path.display(), "removing a snapshot no parked VM owns");
+            let removed = if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            if let Err(e) = removed {
+                warn!(path = %path.display(), "remove it: {e}");
             }
         }
         Ok(())
@@ -845,7 +895,9 @@ impl Agent {
             )),
             Some(Entry::Ended { .. }) => Err(ApiError(
                 StatusCode::CONFLICT,
-                format!("VM {name:?} has already ended"),
+                format!(
+                    "VM {name:?} has already ended; `cirro run` starts a new VM under its name"
+                ),
             )),
             Some(Entry::Running { stops, ended, .. }) => Ok((stops.clone(), ended.clone())),
         }
@@ -1093,8 +1145,18 @@ fn internal(message: String) -> ApiError {
     ApiError(StatusCode::INTERNAL_SERVER_ERROR, message)
 }
 
+fn snapshot_gone(name: &str) -> String {
+    format!(
+        "VM {name:?} is parked, but its snapshot is gone, so it can't be woken; \
+         `cirro rm {name}` removes it"
+    )
+}
+
 fn no_such_vm(name: &str) -> ApiError {
-    ApiError(StatusCode::NOT_FOUND, format!("no VM named {name:?}"))
+    ApiError(
+        StatusCode::NOT_FOUND,
+        format!("no VM named {name:?}; `cirro ps -a` lists them all"),
+    )
 }
 
 async fn read_json<T: serde::de::DeserializeOwned>(req: Request<Incoming>) -> Result<T, ApiError> {

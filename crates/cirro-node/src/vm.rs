@@ -47,6 +47,10 @@ use tokio::sync::{mpsc, oneshot};
 pub const GUEST_ADDRESS: Ipv4Addr = Ipv4Addr::new(172, 16, 0, 2);
 /// The guest's gateway: the tap's address inside the VM's namespace.
 const GUEST_GATEWAY: Ipv4Addr = Ipv4Addr::new(172, 16, 0, 1);
+/// The tap's MAC, the same in every namespace like the Guest address (ADR
+/// 0005): a woken guest still has its gateway's MAC in its ARP cache, and
+/// frames it sends to a new tap with a different MAC are dropped.
+const TAP_MAC: &str = "06:00:ac:10:00:01";
 
 /// What a parked VM's snapshot directory holds: the device state, the guest
 /// memory and the rootfs as the guest left it, which belong together.
@@ -385,6 +389,15 @@ impl Vm {
         }
     }
 
+    /// Lets the guest's vCPUs run again, for a VM taken back with `adopt`: an
+    /// agent that died part-way through a park can leave its VM paused.
+    pub async fn resume(&self) -> Result<(), Error> {
+        Client::new(&self.api_socket)
+            .resume()
+            .await
+            .map_err(|e| err("resume the VM", e))
+    }
+
     /// The VMM's identity, for recording it: after `start` succeeds, or on a
     /// VM taken back with `adopt`.
     pub fn process(&self) -> ProcessId {
@@ -584,6 +597,7 @@ impl Vm {
             &["addr", "add", &format!("{GUEST_GATEWAY}/30"), "dev", "tap0"],
         )
         .await?;
+        ip_in(&id, &["link", "set", "tap0", "address", TAP_MAC]).await?;
         ip_in(&id, &["link", "set", "tap0", "up"]).await?;
 
         // 2. A veth pair to the Node, and 1:1 NAT between the Guest address

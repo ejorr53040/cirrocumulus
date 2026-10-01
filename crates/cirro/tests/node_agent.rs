@@ -70,6 +70,7 @@ fn rootfs() -> &'static Rootfs {
             "whoami",
             "spin",
             "counter",
+            "dialer",
         ] {
             let status = std::process::Command::new("rustc")
                 .args(["--target", "x86_64-unknown-linux-musl", "-O", "-o"])
@@ -1708,6 +1709,207 @@ fn a_parked_vm_wakes_where_it_left_off_and_rm_leaves_nothing() {
         row(&ps, "counter").is_none(),
         "rm left counter listed:\n{ps}"
     );
+    agent.assert_no_cirro_state();
+    agent.assert_no_snapshots();
+}
+
+/// M6: parked VMs are records like any Ended VM, so they outlive the agent
+/// and wake afterwards. A snapshot no record owns, as a park interrupted by
+/// a dying agent could leave, is removed when the agent starts again.
+#[test]
+fn parked_vms_survive_an_agent_restart_and_unowned_snapshots_are_removed() {
+    let Some(mut agent) = Agent::start(224) else {
+        return;
+    };
+    let mut kept_count = 0;
+    for name in ["kept", "orphan"] {
+        let (address, _) = vm_address(&stdout(
+            agent
+                .run(name, &rootfs().guest_init, &["/app/counter"])
+                .success(),
+        ));
+        wait_for_http(&address, HTTP_PORT);
+        let answered = count(&http_get(&address, HTTP_PORT).expect("ask the counter"));
+        if name == "kept" {
+            kept_count = answered;
+        }
+        agent.cirro().args(["park", name]).assert().success();
+    }
+
+    // Forget `orphan`'s record while the agent is down: the state dir is
+    // ours, so a changed copy of the database can be moved over the agent's.
+    agent.stop_agent();
+    let db = agent.state_dir.join("state.db");
+    let changed = agent.state_dir.join("state.db.changed");
+    std::fs::copy(&db, &changed).expect("copy the database");
+    rusqlite::Connection::open(&changed)
+        .and_then(|conn| conn.execute("DELETE FROM vms WHERE name = 'orphan'", []))
+        .expect("forget orphan");
+    std::fs::rename(&changed, &db).expect("install the changed database");
+    agent.spawn().expect("start the agent again");
+
+    let ps = agent.ps(true);
+    let kept = row(&ps, "kept").unwrap_or_else(|| panic!("kept was lost:\n{ps}"));
+    assert!(
+        kept.contains("parked"),
+        "kept isn't parked any more: {kept}"
+    );
+    assert!(row(&ps, "orphan").is_none(), "{ps}");
+
+    let (address, _) = vm_address(&stdout(
+        agent.cirro().args(["wake", "kept"]).assert().success(),
+    ));
+    let after = count(&wait_for_http(&address, HTTP_PORT));
+    assert_eq!(after, kept_count + 1, "kept didn't carry on counting");
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "kept"])
+        .assert()
+        .success();
+    agent.cirro().args(["rm", "kept"]).assert().success();
+    agent.assert_no_cirro_state();
+    agent.assert_no_snapshots();
+}
+
+/// M6: a woken guest's own connections get out at once, before anything has
+/// connected in to it. Its network config, gateway MAC included, is the one
+/// it was parked with, while every link on the host side is new.
+#[test]
+fn a_woken_vm_reaches_the_internet_before_anything_reaches_it() {
+    let internet: SocketAddr = "1.1.1.1:443".parse().unwrap();
+    if !host_reaches(internet) {
+        eprintln!("skipping: this host can't reach {internet}, so VM egress can't be judged");
+        return;
+    }
+    let Some(agent) = Agent::start(223) else {
+        return;
+    };
+    agent
+        .run(
+            "dialer",
+            &rootfs().guest_init,
+            &["/app/dialer", "1.1.1.1:443"],
+        )
+        .success();
+    wait_for_log(&agent, "dialer", "OPEN");
+
+    agent.cirro().args(["park", "dialer"]).assert().success();
+    agent.cirro().args(["wake", "dialer"]).assert().success();
+    let woke = Instant::now();
+    // Read after the wake, so it may hold the woken guest's first lines too;
+    // only lines after it count, which errs towards a slower first dial.
+    let parked_log = stdout(agent.cirro().args(["logs", "dialer"]).assert().success());
+    let opened = loop {
+        let log = stdout(agent.cirro().args(["logs", "dialer"]).assert().success());
+        if log[parked_log.len()..].contains("OPEN") {
+            break woke.elapsed();
+        }
+        assert!(
+            woke.elapsed() < TIMEOUT,
+            "the woken VM never reached {internet}:\n{}",
+            &log[parked_log.len()..]
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    eprintln!("first connection out after wake: {opened:?}");
+    assert!(
+        opened < Duration::from_secs(2),
+        "the woken VM took {opened:?} to reach {internet}"
+    );
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "dialer"])
+        .assert()
+        .success();
+    agent.cirro().args(["rm", "dialer"]).assert().success();
+    agent.assert_no_cirro_state();
+}
+
+/// M6: park, wake, stop and run each refuse a VM in the wrong state, say
+/// what to do instead, and leave the VM as it was.
+#[test]
+fn park_wake_stop_and_run_refuse_vms_in_the_wrong_state() {
+    let Some(agent) = Agent::start(222) else {
+        return;
+    };
+    let refused = |args: &[&str], expected: &str| {
+        let err = stderr(agent.cirro().args(args).assert().failure());
+        assert!(
+            err.contains(expected),
+            "`cirro {}` should say {expected:?}, got: {err}",
+            args.join(" ")
+        );
+    };
+    refused(&["park", "web"], "`cirro ps -a` lists");
+    refused(&["wake", "web"], "`cirro ps -a` lists");
+
+    agent
+        .run("web", &rootfs().guest_init, &["/app/counter"])
+        .success();
+    refused(&["wake", "web"], "isn't parked; it's running");
+
+    agent.cirro().args(["park", "web"]).assert().success();
+    refused(&["park", "web"], "wake it first");
+    refused(&["stop", "web"], "wake it first");
+    let err = stderr(
+        agent
+            .run("web", &rootfs().guest_init, &["/app/counter"])
+            .failure(),
+    );
+    assert!(err.contains("is parked"), "run over a parked name: {err}");
+    let ps = agent.ps(true);
+    assert!(
+        row(&ps, "web").is_some_and(|r| r.contains("parked")),
+        "a refusal changed the parked VM:\n{ps}"
+    );
+
+    agent.cirro().args(["wake", "web"]).assert().success();
+    agent
+        .cirro()
+        .args(["stop", "--force", "web"])
+        .assert()
+        .success();
+    refused(&["park", "web"], "`cirro run` starts");
+    refused(&["wake", "web"], "`cirro run` starts");
+
+    agent.cirro().args(["rm", "web"]).assert().success();
+    agent.assert_no_cirro_state();
+}
+
+/// M6: a parked VM whose snapshot has gone can't be woken, and says so,
+/// pointing at `rm`.
+#[test]
+fn a_parked_vm_whose_snapshot_is_gone_says_so_and_can_be_removed() {
+    let Some(mut agent) = Agent::start(221) else {
+        return;
+    };
+    agent
+        .run("lost", &rootfs().guest_init, &["/app/counter"])
+        .success();
+    agent.cirro().args(["park", "lost"]).assert().success();
+
+    // Hide the snapshot while the agent is down. The parked dir is root's,
+    // but renaming it within the state dir, which is ours, needs no more.
+    agent.stop_agent();
+    let parked = agent.state_dir.join("parked");
+    let hidden = agent.state_dir.join("parked.hidden");
+    std::fs::rename(&parked, &hidden).expect("hide the parked dir");
+    agent.spawn().expect("start the agent again");
+
+    let err = stderr(agent.cirro().args(["wake", "lost"]).assert().failure());
+    assert!(
+        err.contains("snapshot is gone") && err.contains("rm"),
+        "wake should say the snapshot is gone and how to remove the VM, got: {err}"
+    );
+    agent.cirro().args(["rm", "lost"]).assert().success();
+
+    // Put the snapshot back with no record left to own it: the next start
+    // removes it.
+    agent.stop_agent();
+    std::fs::rename(&hidden, &parked).expect("put the parked dir back");
+    agent.spawn().expect("start the agent again");
     agent.assert_no_cirro_state();
     agent.assert_no_snapshots();
 }
