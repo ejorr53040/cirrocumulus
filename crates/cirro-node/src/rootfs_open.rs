@@ -28,6 +28,9 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+/// The running process's own binary, even once its path names another file.
+const SELF_EXE: &str = "/proc/self/exe";
+
 /// Why [`open_as`] failed: whether the helper ran and refused `path` itself
 /// (the caller's request was bad) or the credential-drop mechanism broke
 /// (not the caller's fault), so the agent can answer with the right HTTP
@@ -45,13 +48,16 @@ pub(crate) enum Error {
 pub(crate) fn open_as(uid: u32, gid: u32, path: &Path) -> Result<std::fs::File, Error> {
     let (parent_sock, child_sock) = std::os::unix::net::UnixStream::pair()
         .map_err(|e| Error::Failed(format!("open a socketpair: {e}")))?;
-    let exe = std::env::current_exe()
-        .map_err(|e| Error::Failed(format!("find the cirro binary: {e}")))?;
-
     let target_uid = Uid::from_raw(uid);
     let target_gid = Gid::from_raw(gid);
-    let mut cmd = Command::new(exe);
-    cmd.arg("__open-rootfs")
+    // The running binary, not whatever is at its path now: a rebuild or an
+    // upgrade replaces that file under a running agent, and the path then
+    // names a new binary, or nothing. The forked child's `/proc/self/exe` is
+    // the agent's own, and a process may always follow its own link, even
+    // after dropping to the caller's uid.
+    let mut cmd = Command::new(SELF_EXE);
+    cmd.arg0("cirro")
+        .arg("__open-rootfs")
         .arg(uid.to_string())
         .arg(gid.to_string())
         .arg(path)
