@@ -1621,3 +1621,36 @@ fn top_once_shows_a_busy_vm_using_cpu_and_memory() {
         .success();
     agent.assert_no_cirro_state();
 }
+
+/// Replacing the agent's binary on disk, as a rebuild or an upgrade does,
+/// doesn't stop the running agent starting VMs: it opens each rootfs through
+/// a helper that runs the agent's own binary, which must be the one running,
+/// not whatever is at its path now.
+#[test]
+fn a_running_agent_still_starts_vms_after_its_binary_is_replaced() {
+    let Some(agent) = Agent::start(218) else {
+        return;
+    };
+    // A new file at the same path, as `cargo build` or a package upgrade
+    // leaves it: the running agent's binary is now a deleted inode.
+    let path = test_agent_path();
+    let replacement = path.with_extension(format!("replacement-{}", std::process::id()));
+    std::fs::copy(&path, &replacement).expect("copy the agent binary");
+    if let Err(e) = std::fs::rename(&replacement, &path) {
+        let _ = std::fs::remove_file(&replacement);
+        panic!("replace the agent binary: {e}");
+    }
+
+    let address = stdout(
+        agent
+            .run("web", &rootfs().guest_init, &["/app/http_app"])
+            .success(),
+    );
+    assert!(wait_for_http(address.trim(), HTTP_PORT).contains("hello from cirro"));
+    agent
+        .cirro()
+        .args(["stop", "--force", "web"])
+        .assert()
+        .success();
+    agent.assert_no_cirro_state();
+}
