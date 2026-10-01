@@ -1518,3 +1518,42 @@ fn run_rejects_an_env_workdir_or_command_the_guest_cant_use() {
     );
     agent.assert_no_cirro_state();
 }
+
+/// `nginx:alpine` pinned, so the test boots the same image every time.
+const NGINX: &str =
+    "nginx:alpine@sha256:df221db836e1754089190208cee7eeda94f233197056426eda74a43ab1abeac2";
+
+/// M4's exit: the CLI pulls an OCI image and builds its rootfs as the
+/// caller, and the VM runs the image's own entrypoint and command. Needs
+/// network on the first run; the image cache lives in the target dir, so
+/// later runs make one manifest request.
+#[test]
+fn run_boots_an_image_from_a_registry_and_runs_its_command() {
+    let Some(agent) = Agent::start(227) else {
+        return;
+    };
+    let cache = Path::new(env!("CARGO_TARGET_TMPDIR")).join("image-cache");
+
+    let address = stdout(
+        agent
+            .cirro()
+            .env("XDG_CACHE_HOME", &cache)
+            .args(["run", "--name", "nginx", NGINX])
+            .assert()
+            .success(),
+    )
+    .trim()
+    .to_string();
+
+    let response = wait_for_http(&address, 80);
+    assert!(
+        response.contains("Welcome to nginx!"),
+        "unexpected response from nginx: {response:?}"
+    );
+    agent
+        .cirro()
+        .args(["stop", "--force", "nginx"])
+        .assert()
+        .success();
+    agent.assert_no_cirro_state();
+}

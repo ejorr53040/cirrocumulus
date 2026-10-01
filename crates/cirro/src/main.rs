@@ -1,6 +1,8 @@
 mod client;
 mod open_rootfs;
 
+use cirro_image::ImageCache;
+use cirro_image::run_config::merge_env;
 use cirro_node::agent;
 use cirro_node::release::ReleaseBinaries;
 use cirro_node::subnet::Subnet;
@@ -13,14 +15,10 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The compiled `guest-init` binary (musl static, RESEARCH.md M2), embedded
-/// so `cirro` ships as one self-contained binary -- rootfs building (M4)
-/// writes these bytes out as a new guest's `/init` rather than needing a
-/// separately-installed copy lying around. `build.rs` builds guest-init as
-/// part of building `cirro` itself, so this path always exists by the time
-/// this file is compiled.
-///
-/// Unused outside tests until M4 has a rootfs builder to write it out.
-#[allow(dead_code)]
+/// so `cirro` ships as one self-contained binary: building a rootfs from an
+/// image writes these bytes out as the guest's `/init`. `build.rs` builds
+/// guest-init as part of building `cirro` itself, so this path always
+/// exists by the time this file is compiled.
 pub(crate) static GUEST_INIT_BINARY: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../target/guest-init-embed/x86_64-unknown-linux-musl/release/guest-init"
@@ -48,7 +46,7 @@ enum Command {
     /// Manage the control plane
     #[command(subcommand)]
     Server(ServerCommand),
-    /// Boot a VM from a rootfs image and print its VM address
+    /// Boot a VM from an OCI image or a rootfs and print its VM address
     Run(RunArgs),
     /// List VMs
     Ps {
@@ -116,10 +114,13 @@ struct RunArgs {
     /// Run the command as this numeric user and group [default: 0:0]
     #[arg(short, long, value_name = "UID:GID", value_parser = parse_user)]
     user: Option<User>,
-    /// An ext4 rootfs with guest-init as /init
-    rootfs: PathBuf,
-    /// The command to run in the VM, and its arguments
-    #[arg(last = true, required = true)]
+    /// An image (nginx:alpine, ghcr.io/owner/app@sha256:...), or the path
+    /// of an ext4 rootfs with guest-init as /init
+    #[arg(value_name = "IMAGE|ROOTFS")]
+    image: String,
+    /// The command to run in the VM, and its arguments [default: the
+    /// image's]. A rootfs has no default, so needs one.
+    #[arg(last = true)]
     command: Vec<String>,
 }
 
@@ -314,17 +315,41 @@ fn command_path(matches: &clap::ArgMatches) -> String {
 }
 
 async fn run(socket: &Path, args: RunArgs) -> Result<(), String> {
-    let rootfs = std::fs::canonicalize(&args.rootfs)
-        .map_err(|e| format!("rootfs {}: {e}", args.rootfs.display()))?;
+    let (rootfs, command, env, workdir, user) = match rootfs_or_image(&args.image)? {
+        Some(rootfs) => {
+            if args.command.is_empty() {
+                return Err(format!(
+                    "{} is a rootfs, which has no command of its own: give one after `--`",
+                    args.image
+                ));
+            }
+            (rootfs, args.command, args.env, args.workdir, args.user)
+        }
+        None => {
+            let image = ImageCache::new(image_cache_dir()?)
+                .pull(&args.image, GUEST_INIT_BINARY)
+                .await
+                .map_err(|e| e.to_string())?;
+            let config = image.config;
+            let user = config.user.map(|(uid, gid)| User { uid, gid });
+            (
+                image.rootfs,
+                config.command(&args.command),
+                merge_env(&config.env, &args.env),
+                args.workdir.or(config.workdir),
+                args.user.or(user),
+            )
+        }
+    };
     let request = RunRequest {
         name: args.name,
         rootfs,
         mem_mib: args.mem,
         vcpus: args.vcpus,
-        command: args.command,
-        env: args.env,
-        workdir: args.workdir,
-        user: args.user,
+        command,
+        env,
+        workdir,
+        user,
     };
     let vm: VmInfo = client::call(socket, Method::POST, "/vms", Some(&request))
         .await?
@@ -334,6 +359,40 @@ async fn run(socket: &Path, args: RunArgs) -> Result<(), String> {
         .ok_or("the Node agent returned no VM address")?;
     println!("{address}");
     Ok(())
+}
+
+/// The rootfs `arg` names, or `None` if it's an image reference. Anything
+/// at that path but a directory is a rootfs, even a device: the agent
+/// refuses what isn't a regular file (#14), so the path must reach it. An
+/// argument written as a path is never an image.
+fn rootfs_or_image(arg: &str) -> Result<Option<PathBuf>, String> {
+    let looks_like_path =
+        ["/", "./", "../"].iter().any(|p| arg.starts_with(p)) || arg.ends_with(".ext4");
+    match std::fs::metadata(arg) {
+        Ok(meta) if meta.is_dir() => {
+            if looks_like_path {
+                Err(format!("{arg} is a directory, not a rootfs"))
+            } else {
+                Ok(None)
+            }
+        }
+        Ok(_) => std::fs::canonicalize(arg)
+            .map(Some)
+            .map_err(|e| format!("rootfs {arg}: {e}")),
+        Err(e) if looks_like_path => Err(format!("no rootfs at {arg}: {e}")),
+        Err(_) => Ok(None),
+    }
+}
+
+/// `$XDG_CACHE_HOME/cirro/images`, or `~/.cache/cirro/images`.
+fn image_cache_dir() -> Result<PathBuf, String> {
+    let base = match std::env::var_os("XDG_CACHE_HOME").filter(|d| !d.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(".cache"))
+            .ok_or("neither XDG_CACHE_HOME nor HOME is set, so there's nowhere to cache images")?,
+    };
+    Ok(base.join("cirro").join("images"))
 }
 
 async fn ps(socket: &Path, all: bool) -> Result<(), String> {

@@ -9,6 +9,14 @@ repository.workspace = true
 serde = { workspace = true, features = ["derive"] }
 flate2.workspace = true
 tar.workspace = true
+oci-client.workspace = true
+rustls.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+
+[dev-dependencies]
+sha2.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

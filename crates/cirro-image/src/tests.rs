@@ -303,3 +303,6 @@ fn a_hardlink_to_a_whited_out_file_fails_the_build() {
 
     assert!(e.0.contains("isn't a file in the image"), "{e}");
 }
+
+mod pull;
+mod registry;
