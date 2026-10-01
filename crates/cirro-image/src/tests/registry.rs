@@ -28,6 +28,9 @@ struct Content {
     blobs: HashMap<String, Vec<u8>>,
     /// `GET <path>` of every request, in order.
     requests: Vec<String>,
+    /// When set, every request whose path contains `.0` gets status `.1`
+    /// and an error envelope with code `.2`.
+    failure: Option<(String, u16, String)>,
 }
 
 pub(super) struct Registry {
@@ -39,6 +42,8 @@ pub(super) struct Registry {
 pub(super) struct Image {
     pub(super) layers: Vec<Vec<u8>>,
     pub(super) config: serde_json::Value,
+    /// The media type the manifest gives every layer.
+    pub(super) layer_media_type: &'static str,
 }
 
 impl Image {
@@ -52,6 +57,15 @@ impl Image {
                 "config": config,
                 "rootfs": {"type": "layers", "diff_ids": []},
             }),
+            layer_media_type: LAYER_GZIP,
+        }
+    }
+
+    /// The same image, with its layers listed as zstd-compressed.
+    pub(super) fn zstd(self) -> Self {
+        Image {
+            layer_media_type: "application/vnd.oci.image.layer.v1.tar+zstd",
+            ..self
         }
     }
 }
@@ -82,7 +96,7 @@ impl Registry {
             .layers
             .iter()
             .map(|l| {
-                serde_json::json!({"mediaType": LAYER_GZIP, "digest": self.put_blob(l), "size": l.len()})
+                serde_json::json!({"mediaType": image.layer_media_type, "digest": self.put_blob(l), "size": l.len()})
             })
             .collect();
         let manifest = serde_json::json!({
@@ -94,18 +108,19 @@ impl Registry {
         self.put_manifest(repo, MANIFEST, serde_json::to_vec(&manifest).unwrap())
     }
 
-    /// Stores an index over `images` (architecture, manifest digest) and
-    /// tags it; returns the index's digest.
+    /// Stores an index over `images` (`os/architecture`, manifest digest)
+    /// and tags it; returns the index's digest.
     pub(super) fn tag_index(&self, repo: &str, tag: &str, images: &[(&str, String)]) -> String {
         let manifests: Vec<serde_json::Value> = images
             .iter()
-            .map(|(arch, digest)| {
+            .map(|(platform, digest)| {
+                let (os, arch) = platform.split_once('/').unwrap();
                 let size = self.content.lock().unwrap().manifests[&format!("{repo}/{digest}")]
                     .1
                     .len();
                 serde_json::json!({
                     "mediaType": MANIFEST, "digest": digest, "size": size,
-                    "platform": {"architecture": arch, "os": "linux"},
+                    "platform": {"architecture": arch, "os": os},
                 })
             })
             .collect();
@@ -121,6 +136,18 @@ impl Registry {
         let mut content = self.content.lock().unwrap();
         let manifest = content.manifests[&format!("{repo}/{digest}")].clone();
         content.manifests.insert(format!("{repo}/{tag}"), manifest);
+    }
+
+    /// Answers every manifest request from now on with HTTP `status` and an
+    /// OCI error envelope with `code` (`UNAUTHORIZED`, `TOOMANYREQUESTS`).
+    pub(super) fn fail_manifests(&self, status: u16, code: &str) {
+        self.fail_requests("/manifests/", status, code);
+    }
+
+    /// Like [`Registry::fail_manifests`], for requests whose path contains
+    /// `part`.
+    pub(super) fn fail_requests(&self, part: &str, status: u16, code: &str) {
+        self.content.lock().unwrap().failure = Some((part.to_string(), status, code.to_string()));
     }
 
     /// Replaces the bytes served for blob `digest`, keeping its digest.
@@ -171,6 +198,22 @@ fn serve(stream: TcpStream, content: &Mutex<Content>) {
         .to_string();
     let mut content = content.lock().unwrap();
     content.requests.push(path.clone());
+    if let Some((_, status, code)) = content
+        .failure
+        .clone()
+        .filter(|(part, _, _)| path.contains(part.as_str()))
+    {
+        drop(content);
+        let body = format!(r#"{{"errors":[{{"code":"{code}","message":"{code}"}}]}}"#);
+        let mut stream = &stream;
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        return;
+    }
     let found = if path == "/v2/" {
         Some(("application/json", b"{}".to_vec(), None))
     } else if let Some((repo, reference)) = path

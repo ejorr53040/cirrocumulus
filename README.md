@@ -8,10 +8,11 @@
 Every workload gets its own Firecracker microVM, locked down with jailer.
 Manage everything from your terminal.
 
-> Pre-alpha: the single-node VM lifecycle (`node install`, `run`, `ps`, `logs`,
-> `stop`, `rm`, `node uninstall`) works. `ssh`, `park`, `wake`, `top`, `bench`,
-> `db` and the multi-node control plane (`server`, `node join`) are listed in
-> `--help` but exit with "not yet implemented".
+> Pre-alpha: the single-node VM lifecycle (`node install`, `run` from an OCI
+> image or a rootfs, `image`, `ps`, `logs`, `stop`, `rm`, `node uninstall`)
+> works. `ssh`, `park`, `wake`, `top`, `bench`, `db` and the multi-node control
+> plane (`server`, `node join`) are listed in `--help` but exit with "not yet
+> implemented".
 
 ## Install
 
@@ -33,12 +34,19 @@ state dir, and installs and starts the Node agent as a systemd unit:
 sudo cirro node install
 ```
 
-Then boot a VM from an ext4 rootfs with `guest-init` as its `/init`
-(`scripts/apps/uvm-career-quiz/build_rootfs.sh` shows how to build one):
+Then boot a VM from an OCI image, and reach it at the address it prints:
 
 ```sh
-cirro run --name web --mem 256M --vcpus 1 rootfs.ext4 -- /entrypoint
+cirro run --name web nginx:alpine
+curl http://10.77.0.2/
 ```
+
+The CLI pulls the image and builds its rootfs as you, not as root, and caches it
+in `~/.cache/cirro/images`. [A Firecracker rootfs from a Docker
+image](docs/rootfs-from-an-image.md) explains how, and its limits: public
+`linux/amd64` images only, for now. `cirro run` also boots an ext4 rootfs you
+built yourself, given a path and a command:
+`cirro run --name web ./rootfs.ext4 -- /entrypoint`.
 
 `cirro run` talks to the Node agent over its socket (`/run/cirro/agent.sock`
 by default, `--socket`/`$CIRRO_SOCKET` to override) and prints the VM's
@@ -48,7 +56,11 @@ address on success.
 
 ```sh
 cirro run --name <name> [--mem 256M] [--vcpus 1] [-e KEY=VALUE]... [-w DIR] [-u UID:GID] \
-          <rootfs> -- <command> [args...]
+          <image> [-- <command> [args...]]
+cirro run --name <name> [flags...] <rootfs> -- <command> [args...]
+cirro image pull <image>          # pull and build ahead of time
+cirro image ls                    # cached images
+cirro image rm <image|digest>
 cirro ps [--all]                  # list VMs (--all includes Ended VMs)
 cirro logs [--follow] <name>      # a VM's console log
 cirro stop [--force] [--timeout <secs>] <name>

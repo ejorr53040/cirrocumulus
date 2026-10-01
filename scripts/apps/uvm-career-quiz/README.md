@@ -7,11 +7,12 @@ reach it over real TCP/IP, log in, load an authenticated page, then ask it to
 shut down and confirm it does so cleanly.
 
 This is a shell-script proof, the same way `scripts/step0/` proved Firecracker
-+ jailer worked before any Rust got written for it. It doesn't use
-`cirro-node`/`cirro-image` (M3/M4) — those aren't built yet — so there's no
-OCI image pulling, no chunked storage, no jailer/cgroups isolation here, and
-the packaging (Alpine + `apk.static`, not a Dockerfile) is one-off for this
-app rather than the general pipeline M4 will build.
++ jailer worked before any Rust got written for it. It predates
+`cirro-node`/`cirro-image` (M3/M4), so there's no OCI image pulling, no
+jailer/cgroups isolation here, and the packaging (Alpine + `apk.static`, not a
+Dockerfile) is one-off for this app. It's kept as the pre-M4 proof: today,
+`cirro run <image>` builds a rootfs from any public OCI image instead (see
+[docs/rootfs-from-an-image.md](../../../docs/rootfs-from-an-image.md)).
 
 ## Why Alpine + `apk.static`, not Docker
 
