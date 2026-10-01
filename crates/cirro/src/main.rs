@@ -12,7 +12,7 @@ use hyper::Method;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The compiled `guest-init` binary (musl static, RESEARCH.md M2), embedded
 /// so `cirro` ships as one self-contained binary: building a rootfs from an
@@ -76,7 +76,7 @@ enum Command {
         timeout: u64,
         name: String,
     },
-    /// Delete an Ended VM's record and console log
+    /// Delete an Ended VM's record and console log, or a parked VM's snapshot
     Rm { name: String },
     /// Snapshot a VM to disk and free its RAM
     Park { name: String },
@@ -88,8 +88,8 @@ enum Command {
         #[arg(long)]
         once: bool,
     },
-    /// Measure boot, park and wake times on this node
-    Bench,
+    /// Time boot, park and wake on this Node, with a throwaway VM per run
+    Bench(BenchArgs),
     /// Manage an app's SQLite database
     #[command(subcommand)]
     Db(DbCommand),
@@ -127,6 +127,27 @@ struct RunArgs {
     image: String,
     /// The command to run in the VM, and its arguments [default: the
     /// image's]. A rootfs has no default, so needs one.
+    #[arg(last = true)]
+    command: Vec<String>,
+}
+
+#[derive(Args)]
+struct BenchArgs {
+    /// How many times to boot, park and wake a VM
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..))]
+    runs: u32,
+    /// Guest memory, e.g. 256M or 1G
+    #[arg(long, default_value = "256M", value_parser = parse_mem_mib)]
+    mem: u32,
+    /// Guest vCPUs
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8)
+        .range(i64::from(cirro_proto::MIN_VCPUS)..=i64::from(cirro_proto::MAX_VCPUS)))]
+    vcpus: u8,
+    /// An image, or the path of an ext4 rootfs with guest-init as /init
+    #[arg(value_name = "IMAGE|ROOTFS")]
+    image: String,
+    /// The command each VM runs, and its arguments [default: the image's].
+    /// A rootfs has no default, so needs one.
     #[arg(last = true)]
     command: Vec<String>,
 }
@@ -258,6 +279,7 @@ fn main() -> ExitCode {
                 .map_err(|e| format!("node agent: {e}"))
             }
             Command::Run(args) => run(&cli.socket, args).await,
+            Command::Bench(args) => bench(&cli.socket, args).await,
             Command::Top { once: true } => top_once(&cli.socket).await,
             Command::Top { once: false } => top(&cli.socket).await,
             Command::Image(command) => image_command(command).await,
@@ -343,42 +365,19 @@ fn command_path(matches: &clap::ArgMatches) -> String {
 }
 
 async fn run(socket: &Path, args: RunArgs) -> Result<(), String> {
-    let (rootfs, command, env, workdir, user) = match rootfs_or_image(&args.image)? {
-        Some(rootfs) => {
-            if args.command.is_empty() {
-                return Err(format!(
-                    "{} is a rootfs, which has no command of its own: give one after `--`",
-                    args.image
-                ));
-            }
-            (rootfs, args.command, args.env, args.workdir, args.user)
-        }
-        None => {
-            let image = ImageCache::new(image_cache_dir()?)
-                .pull(&args.image, GUEST_INIT_BINARY)
-                .await
-                .map_err(|e| e.to_string())?;
-            let config = image.config;
-            let user = config.user.map(|(uid, gid)| User { uid, gid });
-            (
-                image.rootfs,
-                config.command(&args.command),
-                merge_env(&config.env, &args.env),
-                args.workdir.or(config.workdir),
-                args.user.or(user),
-            )
-        }
-    };
-    let request = RunRequest {
-        name: args.name,
-        rootfs,
-        mem_mib: args.mem,
-        vcpus: args.vcpus,
-        command,
-        env,
-        workdir,
-        user,
-    };
+    let request = run_request(
+        args.name,
+        args.mem,
+        args.vcpus,
+        &args.image,
+        Guest {
+            command: args.command,
+            env: args.env,
+            workdir: args.workdir,
+            user: args.user,
+        },
+    )
+    .await?;
     let vm: VmInfo = client::call(socket, Method::POST, "/vms", Some(&request))
         .await?
         .ok_or("the Node agent returned no VM")?;
@@ -387,6 +386,159 @@ async fn run(socket: &Path, args: RunArgs) -> Result<(), String> {
         .ok_or("the Node agent returned no VM address")?;
     println!("{address}");
     Ok(())
+}
+
+/// What the CLI asked the guest to run, before an image's defaults fill in
+/// what it left out.
+struct Guest {
+    command: Vec<String>,
+    env: Vec<String>,
+    workdir: Option<String>,
+    user: Option<User>,
+}
+
+/// The request that boots `image` (an image reference or a rootfs path):
+/// pulls and builds an image first, and fills in its command, env, workdir
+/// and user wherever `guest` leaves them out.
+async fn run_request(
+    name: String,
+    mem_mib: u32,
+    vcpus: u8,
+    image: &str,
+    guest: Guest,
+) -> Result<RunRequest, String> {
+    let (rootfs, command, env, workdir, user) = match rootfs_or_image(image)? {
+        Some(rootfs) => {
+            if guest.command.is_empty() {
+                return Err(format!(
+                    "{image} is a rootfs, which has no command of its own: give one after `--`"
+                ));
+            }
+            (rootfs, guest.command, guest.env, guest.workdir, guest.user)
+        }
+        None => {
+            let pulled = ImageCache::new(image_cache_dir()?)
+                .pull(image, GUEST_INIT_BINARY)
+                .await
+                .map_err(|e| e.to_string())?;
+            let config = pulled.config;
+            let user = config.user.map(|(uid, gid)| User { uid, gid });
+            (
+                pulled.rootfs,
+                config.command(&guest.command),
+                merge_env(&config.env, &guest.env),
+                guest.workdir.or(config.workdir),
+                guest.user.or(user),
+            )
+        }
+    };
+    Ok(RunRequest {
+        name,
+        rootfs,
+        mem_mib,
+        vcpus,
+        command,
+        env,
+        workdir,
+        user,
+    })
+}
+
+/// Boots, parks, wakes and removes a VM `args.runs` times, one at a time,
+/// and prints each operation's p50 and p99 as this client sees them: the
+/// whole request, so a boot includes the agent's grace period.
+async fn bench(socket: &Path, args: BenchArgs) -> Result<(), String> {
+    let template = run_request(
+        String::new(),
+        args.mem,
+        args.vcpus,
+        &args.image,
+        Guest {
+            command: args.command,
+            env: Vec::new(),
+            workdir: None,
+            user: None,
+        },
+    )
+    .await?;
+    let mut times: [Vec<Duration>; BENCHED.len()] = Default::default();
+    let mut failed = None;
+    for i in 0..args.runs {
+        let name = format!("bench-{}-{i}", std::process::id());
+        let result = bench_once(socket, &template, &name).await;
+        // Whatever happened, the throwaway VM goes. A running one is stopped
+        // first; a parked or ended one only needs removing.
+        let _ = stop(socket, &name, true, 0).await;
+        if let Err(e) = rm(socket, &name).await {
+            eprintln!("cirro: couldn't remove the bench VM {name:?}, so remove it yourself: {e}");
+        }
+        match result {
+            Ok(took) => {
+                for (all, took) in times.iter_mut().zip(took) {
+                    all.push(took);
+                }
+            }
+            Err(e) => {
+                failed = Some(format!("run {} of {} failed: {e}", i + 1, args.runs));
+                break;
+            }
+        }
+    }
+    // What finished is still worth seeing when a later run failed.
+    if !times[0].is_empty() {
+        print_bench(times);
+    }
+    failed.map_or(Ok(()), Err)
+}
+
+/// What `cirro bench` times, in the order each run does them.
+const BENCHED: [&str; 3] = ["boot", "park", "wake"];
+
+/// One row per operation: how many runs, and their p50 and p99.
+fn print_bench(times: [Vec<Duration>; BENCHED.len()]) {
+    println!(
+        "{:<10} {:>5} {:>10} {:>10}",
+        "OPERATION", "RUNS", "P50", "P99"
+    );
+    for (operation, mut all) in BENCHED.into_iter().zip(times) {
+        all.sort();
+        let ms = |d: Duration| format!("{:.1}ms", d.as_secs_f64() * 1000.0);
+        println!(
+            "{:<10} {:>5} {:>10} {:>10}",
+            operation,
+            all.len(),
+            ms(nearest_rank(&all, 50)),
+            ms(nearest_rank(&all, 99)),
+        );
+    }
+}
+
+/// How long one boot, park and wake of `name` took, in [`BENCHED`] order.
+async fn bench_once(
+    socket: &Path,
+    template: &RunRequest,
+    name: &str,
+) -> Result<[Duration; BENCHED.len()], String> {
+    let request = RunRequest {
+        name: name.to_string(),
+        ..template.clone()
+    };
+    let timed = |path: String, body: Option<RunRequest>| async move {
+        let started = Instant::now();
+        client::call::<VmInfo>(socket, Method::POST, &path, body.as_ref()).await?;
+        Ok::<_, String>(started.elapsed())
+    };
+    let boot = timed("/vms".into(), Some(request)).await?;
+    let park = timed(format!("/vms/{name}/park"), None).await?;
+    let wake = timed(format!("/vms/{name}/wake"), None).await?;
+    Ok([boot, park, wake])
+}
+
+/// The `p`th percentile of `sorted` (ascending, not empty), by nearest
+/// rank: the smallest value at least `p`% of the values are no more than.
+fn nearest_rank(sorted: &[Duration], p: usize) -> Duration {
+    let rank = (p * sorted.len()).div_ceil(100).max(1);
+    sorted[rank - 1]
 }
 
 /// The rootfs `arg` names, or `None` if it's an image reference. Anything
@@ -723,7 +875,22 @@ fn format_mem(mib: u32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::GUEST_INIT_BINARY;
+    use super::{GUEST_INIT_BINARY, nearest_rank};
+    use std::time::Duration;
+
+    #[test]
+    fn percentiles_are_by_nearest_rank() {
+        let ms = Duration::from_millis;
+        assert_eq!(nearest_rank(&[ms(7)], 50), ms(7));
+        assert_eq!(nearest_rank(&[ms(7)], 99), ms(7));
+        // Ranks ceil(1.5) = 2 and ceil(2.97) = 3.
+        let three = [ms(10), ms(20), ms(30)];
+        assert_eq!(nearest_rank(&three, 50), ms(20));
+        assert_eq!(nearest_rank(&three, 99), ms(30));
+        let hundred: Vec<Duration> = (1..=100).map(ms).collect();
+        assert_eq!(nearest_rank(&hundred, 50), ms(50));
+        assert_eq!(nearest_rank(&hundred, 99), ms(99));
+    }
 
     #[test]
     fn embeds_a_real_guest_init_elf_binary() {

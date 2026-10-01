@@ -1913,3 +1913,40 @@ fn a_parked_vm_whose_snapshot_is_gone_says_so_and_can_be_removed() {
     agent.assert_no_cirro_state();
     agent.assert_no_snapshots();
 }
+
+/// M6's exit: `cirro bench` boots, parks, wakes and removes a throwaway VM
+/// over and over, and prints each operation's p50 and p99 as the CLI sees
+/// them, leaving nothing behind.
+#[test]
+fn bench_times_boot_park_and_wake_and_leaves_nothing() {
+    let Some(mut agent) = Agent::start(220) else {
+        return;
+    };
+    let output = stdout(
+        agent
+            .cirro()
+            .args(["bench", "--runs", "3"])
+            .arg(&rootfs().guest_init)
+            .args(["--", "/app/counter"])
+            .assert()
+            .success(),
+    );
+    for operation in ["boot", "park", "wake"] {
+        let row = row(&output, operation)
+            .unwrap_or_else(|| panic!("bench doesn't report {operation}:\n{output}"));
+        let fields: Vec<&str> = row.split_whitespace().collect();
+        let millis = |field: &str| -> f64 {
+            field
+                .strip_suffix("ms")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("not a time in ms: {field:?} in {row:?}"))
+        };
+        assert_eq!(fields.get(1), Some(&"3"), "runs column: {row}");
+        let (p50, p99) = (millis(fields[2]), millis(fields[3]));
+        assert!(p50 > 0.0 && p99 >= p50, "{operation}: p50 {p50}, p99 {p99}");
+    }
+    let ps = agent.ps(true);
+    assert_eq!(ps.lines().count(), 1, "bench left VMs behind:\n{ps}");
+    agent.assert_no_cirro_state();
+    agent.assert_no_snapshots();
+}

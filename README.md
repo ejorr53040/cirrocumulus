@@ -67,11 +67,41 @@ cirro ps [--all]                  # list VMs (--all includes Ended VMs)
 cirro top [--once]                # live CPU, memory, disk and network use
 cirro logs [--follow] <name>      # a VM's console log
 cirro stop [--force] [--timeout <secs>] <name>
-cirro rm <name>                   # delete an Ended VM's record and log
+cirro rm <name>                   # delete an Ended VM's record and log, or a parked VM's snapshot
+cirro park <name>                 # snapshot a VM to disk and free its RAM
+cirro wake <name>                 # start it again from its snapshot; prints its VM address
+cirro bench [--runs 10] <image|rootfs> [-- <command>]   # time boot, park and wake
 cirro node uninstall [--force]    # reverse `node install`
 ```
 
 Run `cirro --help` or `cirro <command> --help` for the full flag list.
+
+## Park and wake
+
+`cirro park` pauses a VM, writes a full Firecracker snapshot of its memory and
+devices, and ends it, freeing its RAM; the snapshot and the VM's rootfs stay in
+the state dir. `cirro wake` starts a new VM under the same name from that
+snapshot, so the guest carries on where it was rather than booting again. It may
+get a different VM address: every guest has the same Guest address inside its
+own namespace ([ADR 0003](docs/adr/0003-fixed-guest-address.md)), and the same
+tap MAC ([ADR 0005](docs/adr/0005-fixed-tap-mac.md)).
+
+`cirro bench --runs 50` on an i9-13900H laptop (20 threads, 16 GiB, NVMe,
+btrfs, Linux 7.2), with a 256 MiB guest running the test suite's `counter`
+HTTP server, timing each request as the CLI sees it. A boot includes the 2 s
+the agent waits to see a new VM stay up, so the boot itself is about 1.1 s;
+park and wake have no such wait.
+
+| Operation | p50 | p99 |
+| --- | ---: | ---: |
+| boot | 3155 ms | 3773 ms |
+| park | 274 ms | 463 ms |
+| wake | 158 ms | 409 ms |
+
+Wake misses the goal of a 100 ms p99. Firecracker's own log put one wake's
+snapshot load at about 17 ms, so most of the time is likely the host-side setup
+around it (network namespace, veth, NAT and jailer, each a separate
+process, then moving the snapshot into the jail); profiling it is the next step.
 
 ## Development
 
