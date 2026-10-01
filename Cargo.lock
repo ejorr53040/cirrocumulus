@@ -241,6 +241,9 @@ version = "0.1.0"
 [[package]]
 name = "cirro-tui"
 version = "0.1.0"
+dependencies = [
+ "cirro-proto",
+]
 
 [[package]]
 name = "cirrocumulus"
@@ -251,6 +254,7 @@ dependencies = [
  "cirro-image",
  "cirro-node",
  "cirro-proto",
+ "cirro-tui",
  "clap",
  "http-body-util",
  "hyper",

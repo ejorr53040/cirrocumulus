@@ -130,3 +130,42 @@ pub struct ErrorBody {
     /// Human-readable, printed by the CLI as-is.
     pub error: String,
 }
+
+/// `GET /stats`: what the Node and each running VM used, a sample a
+/// second, for the last minute.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Stats {
+    /// Oldest first; empty until the agent has two samples.
+    pub node: Vec<NodeRates>,
+    pub vms: Vec<VmStats>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VmStats {
+    pub info: VmInfo,
+    /// Oldest first; empty until the agent has two samples of this VM.
+    pub history: Vec<VmRates>,
+}
+
+/// What the Node used per second between two samples, and its memory now.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct NodeRates {
+    /// Percent of all its cores together.
+    pub cpu_percent: f64,
+    pub memory_used_bytes: u64,
+    pub memory_total_bytes: u64,
+    pub rx_per_sec: u64,
+    pub tx_per_sec: u64,
+}
+
+/// What a VM used per second between two samples, and its memory now.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct VmRates {
+    /// Percent of one core: a VM keeping two vCPUs busy reads 200.
+    pub cpu_percent: f64,
+    pub memory_bytes: u64,
+    pub io_read_per_sec: u64,
+    pub io_write_per_sec: u64,
+    pub rx_per_sec: u64,
+    pub tx_per_sec: u64,
+}

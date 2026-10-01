@@ -258,10 +258,27 @@ pub fn host_id(vm_address: Ipv4Addr) -> String {
     format!("cirro-{c:02x}{d:02x}")
 }
 
+/// Turns on the io controller for VMs' cgroups, so each has an `io.stat`
+/// for `cirro top`. jailer turns on only what it limits (cpu and memory);
+/// this adds to that. Only metrics depend on it, so failing is a warning.
+fn enable_io_accounting() {
+    let parent = parent_cgroup();
+    let result = std::fs::create_dir_all(&parent)
+        .and_then(|()| std::fs::write(parent.join("cgroup.subtree_control"), "+io"));
+    if let Err(e) = result {
+        tracing::warn!("turn on the io controller under {}: {e}", parent.display());
+    }
+}
+
 /// The cgroup jailer creates every VM's own cgroup under. jailer creates
 /// it on first use; the Node agent removes it once it's empty.
 pub fn parent_cgroup() -> PathBuf {
-    Path::new("/sys/fs/cgroup").join(PARENT_CGROUP)
+    parent_cgroup_under(Path::new("/"))
+}
+
+/// [`parent_cgroup`] in a filesystem tree rooted at `root`.
+pub(crate) fn parent_cgroup_under(root: &Path) -> PathBuf {
+    root.join("sys/fs/cgroup").join(PARENT_CGROUP)
 }
 
 impl Vm {
@@ -451,6 +468,7 @@ impl Vm {
         .await?;
 
         // 4. jailer, in the namespace and under the VM's cgroup limits.
+        enable_io_accounting();
         let root = jail_dir(node, &id).join("root");
         self.undo.push(Undo::jail_dir(node, &id));
         self.undo.push(Undo::cgroup(&id));
@@ -822,7 +840,7 @@ pub fn host_state_owners(node: &NodeConfig) -> BTreeSet<u16> {
 }
 
 /// The inverse of [`host_id`]: the low 16 bits of the VM address.
-fn parse_host_id(name: &str) -> Option<u16> {
+pub(crate) fn parse_host_id(name: &str) -> Option<u16> {
     let hex = name.strip_prefix("cirro-")?;
     if hex.len() != 4 {
         return None;

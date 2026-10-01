@@ -6,7 +6,7 @@ use cirro_image::run_config::merge_env;
 use cirro_node::agent;
 use cirro_node::release::ReleaseBinaries;
 use cirro_node::subnet::Subnet;
-use cirro_proto::{RunRequest, StopRequest, User, VM_STATE_HEADER, VmInfo};
+use cirro_proto::{RunRequest, Stats, StopRequest, User, VM_STATE_HEADER, VmInfo};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use hyper::Method;
 use std::io::{self, Write};
@@ -83,7 +83,11 @@ enum Command {
     /// Restore a parked VM
     Wake { name: String },
     /// Live terminal dashboard
-    Top,
+    Top {
+        /// Print one snapshot as text and exit
+        #[arg(long)]
+        once: bool,
+    },
     /// Measure boot, park and wake times on this node
     Bench,
     /// Manage an app's SQLite database
@@ -254,6 +258,7 @@ fn main() -> ExitCode {
                 .map_err(|e| format!("node agent: {e}"))
             }
             Command::Run(args) => run(&cli.socket, args).await,
+            Command::Top { once: true } => top_once(&cli.socket).await,
             Command::Image(command) => image_command(command).await,
             Command::Ps { all } => ps(&cli.socket, all).await,
             Command::Logs { follow, name } => logs(&cli.socket, &name, follow).await,
@@ -455,6 +460,14 @@ fn image_cache_dir() -> Result<PathBuf, String> {
             .ok_or("neither XDG_CACHE_HOME nor HOME is set, so there's nowhere to cache images")?,
     };
     Ok(base.join("cirro").join("images"))
+}
+
+async fn top_once(socket: &Path) -> Result<(), String> {
+    let stats: Stats = client::call(socket, Method::GET, "/stats", None::<&()>)
+        .await?
+        .unwrap_or_default();
+    print!("{}", cirro_tui::snapshot(&stats));
+    Ok(())
 }
 
 async fn ps(socket: &Path, all: bool) -> Result<(), String> {

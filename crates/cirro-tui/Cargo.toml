@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+cirro-proto.workspace = true
 
 [lints]
 workspace = true
