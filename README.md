@@ -9,10 +9,10 @@ Every workload gets its own Firecracker microVM, locked down with jailer.
 Manage everything from your terminal.
 
 > Pre-alpha: the single-node VM lifecycle (`node install`, `run` from an OCI
-> image or a rootfs, `image`, `ps`, `logs`, `stop`, `rm`, `node uninstall`)
-> works. `ssh`, `park`, `wake`, `top`, `bench`, `db` and the multi-node control
-> plane (`server`, `node join`) are listed in `--help` but exit with "not yet
-> implemented".
+> image or a rootfs, `image`, `ps`, `top`, `logs`, `stop`, `rm`,
+> `node uninstall`) works. `ssh`, `park`, `wake`, `bench`, `db` and the
+> multi-node control plane (`server`, `node join`) are listed in `--help` but
+> exit with "not yet implemented".
 
 ## Install
 
@@ -62,6 +62,7 @@ cirro image pull <image>          # pull and build ahead of time
 cirro image ls                    # cached images
 cirro image rm <image|digest>
 cirro ps [--all]                  # list VMs (--all includes Ended VMs)
+cirro top [--once]                # live CPU, memory, disk and network use
 cirro logs [--follow] <name>      # a VM's console log
 cirro stop [--force] [--timeout <secs>] <name>
 cirro rm <name>                   # delete an Ended VM's record and log

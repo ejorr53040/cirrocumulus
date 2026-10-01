@@ -28,6 +28,7 @@ tracing = "0.1"
 tar = "0.4"
 flate2 = "1"
 sha2 = "0.11"
+ratatui = "0.30"
 oci-client = { version = "0.18", default-features = false, features = ["rustls-tls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"] }
