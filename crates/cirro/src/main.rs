@@ -48,6 +48,9 @@ enum Command {
     Server(ServerCommand),
     /// Boot a VM from an OCI image or a rootfs and print its VM address
     Run(RunArgs),
+    /// Pull, list and remove cached images
+    #[command(subcommand)]
+    Image(ImageCommand),
     /// List VMs
     Ps {
         /// Also list Ended VMs, with when and why they ended
@@ -183,6 +186,22 @@ enum NodeCommand {
 }
 
 #[derive(Subcommand)]
+enum ImageCommand {
+    /// Pull an image and build its rootfs, ready for `cirro run`
+    Pull {
+        /// e.g. nginx:alpine or ghcr.io/owner/app@sha256:...
+        image: String,
+    },
+    /// List cached images
+    Ls,
+    /// Remove a cached image
+    Rm {
+        /// A reference it was pulled as, or its digest or the start of one
+        image: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum ServerCommand {
     /// Create the CA, state database and admin token
     Init,
@@ -235,6 +254,7 @@ fn main() -> ExitCode {
                 .map_err(|e| format!("node agent: {e}"))
             }
             Command::Run(args) => run(&cli.socket, args).await,
+            Command::Image(command) => image_command(command).await,
             Command::Ps { all } => ps(&cli.socket, all).await,
             Command::Logs { follow, name } => logs(&cli.socket, &name, follow).await,
             Command::Stop {
@@ -382,6 +402,48 @@ fn rootfs_or_image(arg: &str) -> Result<Option<PathBuf>, String> {
         Err(e) if looks_like_path => Err(format!("no rootfs at {arg}: {e}")),
         Err(_) => Ok(None),
     }
+}
+
+async fn image_command(command: ImageCommand) -> Result<(), String> {
+    let cache = ImageCache::new(image_cache_dir()?);
+    match command {
+        ImageCommand::Pull { image } => {
+            let pulled = cache
+                .pull(&image, GUEST_INIT_BINARY)
+                .await
+                .map_err(|e| e.to_string())?;
+            println!("{}", pulled.digest);
+        }
+        ImageCommand::Ls => {
+            println!("{:<40} {:<19} {:>5}", "REFERENCE", "DIGEST", "SIZE");
+            for image in cache.list().map_err(|e| e.to_string())? {
+                let size = std::fs::metadata(&image.rootfs).map_or(0, |m| m.len());
+                let size = format_mem(u32::try_from(size >> 20).unwrap_or(u32::MAX));
+                let digest: String = image.digest.chars().take("sha256:".len() + 12).collect();
+                let references: Vec<&str> = match image.references.as_slice() {
+                    [] => vec!["-"],
+                    references => references.iter().map(|r| short_reference(r)).collect(),
+                };
+                for reference in references {
+                    println!("{reference:<40} {digest:<19} {size:>5}");
+                }
+            }
+        }
+        ImageCommand::Rm { image } => {
+            let removed = cache.remove(&image).map_err(|e| e.to_string())?;
+            println!("{}", removed.digest);
+        }
+    }
+    Ok(())
+}
+
+/// `reference` as people write it: `nginx:alpine`, not
+/// `docker.io/library/nginx:alpine`.
+fn short_reference(reference: &str) -> &str {
+    reference
+        .strip_prefix("docker.io/library/")
+        .or_else(|| reference.strip_prefix("docker.io/"))
+        .unwrap_or(reference)
 }
 
 /// `$XDG_CACHE_HOME/cirro/images`, or `~/.cache/cirro/images`.
