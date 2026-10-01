@@ -1,9 +1,11 @@
 //! A typed client over the Firecracker API, spoken over its Unix domain
 //! socket -- Firecracker has no SDK of its own, so this *is* the client
-//! (RESEARCH.md M3). Mirrors the `PUT` sequence
+//! (RESEARCH.md M3). A boot mirrors the `PUT` sequence
 //! `scripts/step0/run_plain.sh`'s curl calls already proved works by hand:
 //! `/machine-config` -> `/boot-source` -> `/drives/rootfs` ->
-//! `/actions {InstanceStart}`.
+//! `/actions {InstanceStart}`. A park pauses the VM (`PATCH /vm`) and
+//! writes a snapshot (`/snapshot/create`); a wake loads one into a fresh
+//! Firecracker (`/snapshot/load`).
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
@@ -31,9 +33,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Connect(e) => write!(f, "connect to firecracker API socket: {e}"),
-            Error::Request { path, status, body } => {
-                write!(f, "PUT {path} -> {status}: {body}")
-            }
+            Error::Request { path, status, body } => write!(f, "{path} -> {status}: {body}"),
         }
     }
 }
@@ -72,11 +72,16 @@ impl Client {
     /// Sends one `PUT` request with a JSON body to a path on the API, per
     /// <https://github.com/firecracker-microvm/firecracker/blob/main/docs/api_requests/actions.md>.
     pub async fn put(&self, path: &str, body: serde_json::Value) -> Result<(), Error> {
+        self.send(Method::PUT, path, body).await
+    }
+
+    /// Sends one request with a JSON body, `PUT` or `PATCH`.
+    async fn send(&self, method: Method, path: &str, body: serde_json::Value) -> Result<(), Error> {
         let uri: hyper::Uri = UnixUri::new(&self.socket_path, path).into();
         let body_bytes = serde_json::to_vec(&body).expect("serialize request body");
 
         let request = Request::builder()
-            .method(Method::PUT)
+            .method(method.clone())
             .uri(uri)
             .header("content-type", "application/json")
             .body(Full::new(Bytes::from(body_bytes)))
@@ -100,7 +105,7 @@ impl Client {
             .map(|c| c.to_bytes())
             .unwrap_or_default();
         Err(Error::Request {
-            path: path.to_string(),
+            path: format!("{method} {path}"),
             status,
             body: String::from_utf8_lossy(&body_bytes).into_owned(),
         })
@@ -141,6 +146,54 @@ impl Client {
         self.put(
             "/actions",
             serde_json::json!({"action_type": "SendCtrlAltDel"}),
+        )
+        .await
+    }
+
+    /// Pauses the guest's vCPUs, as a snapshot needs. Post-boot only.
+    pub async fn pause(&self) -> Result<(), Error> {
+        self.set_vm_state("Paused").await
+    }
+
+    /// Lets a paused guest's vCPUs run again (Firecracker's `Resumed`
+    /// state; nothing to do with waking a parked VM).
+    pub async fn resume(&self) -> Result<(), Error> {
+        self.set_vm_state("Resumed").await
+    }
+
+    async fn set_vm_state(&self, state: &str) -> Result<(), Error> {
+        self.send(Method::PATCH, "/vm", serde_json::json!({ "state": state }))
+            .await
+    }
+
+    /// Writes a full snapshot of a paused VM: its device state to `vmstate`
+    /// and its guest memory to `mem` (paths as Firecracker sees them, so
+    /// inside the jail).
+    pub async fn create_snapshot(&self, vmstate: &str, mem: &str) -> Result<(), Error> {
+        self.put(
+            "/snapshot/create",
+            serde_json::json!({
+                "snapshot_type": "Full",
+                "snapshot_path": vmstate,
+                "mem_file_path": mem,
+            }),
+        )
+        .await
+    }
+
+    /// Restores a snapshot [`Client::create_snapshot`] wrote into this fresh
+    /// Firecracker, which must have had no other configuration, and resumes
+    /// it. The memory file is mapped private, so the guest's writes never
+    /// reach it. Every device the snapshot names must be where it was: the
+    /// drive's file, the tap, the vsock socket's directory.
+    pub async fn load_snapshot(&self, vmstate: &str, mem: &str) -> Result<(), Error> {
+        self.put(
+            "/snapshot/load",
+            serde_json::json!({
+                "snapshot_path": vmstate,
+                "mem_backend": { "backend_type": "File", "backend_path": mem },
+                "resume_vm": true,
+            }),
         )
         .await
     }
