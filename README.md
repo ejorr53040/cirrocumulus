@@ -11,10 +11,10 @@ Every workload gets its own Firecracker microVM, locked down with jailer.
 Manage everything from your terminal.
 
 > Pre-alpha: the single-node VM lifecycle (`node install`, `run` from an OCI
-> image or a rootfs, `image`, `ps`, `top`, `logs`, `stop`, `rm`,
-> `node uninstall`) works. `ssh`, `park`, `wake`, `bench`, `db` and the
-> multi-node control plane (`server`, `node join`) are listed in `--help` but
-> exit with "not yet implemented".
+> image or a rootfs, `image`, `ps`, `top`, `logs`, `stop`, `rm`, `park`,
+> `wake`, `bench`, `node uninstall`) works. `ssh`, `db` and the multi-node
+> control plane (`server`, `node join`) are listed in `--help` but exit with
+> "not yet implemented".
 
 ## Install
 
@@ -94,14 +94,16 @@ park and wake have no such wait.
 
 | Operation | p50 | p99 |
 | --- | ---: | ---: |
-| boot | 3155 ms | 3773 ms |
-| park | 274 ms | 463 ms |
-| wake | 158 ms | 409 ms |
+| boot | 2916 ms | 2947 ms |
+| park | 274 ms | 1854 ms |
+| wake | 43 ms | 54 ms |
 
-Wake misses the goal of a 100 ms p99. Firecracker's own log put one wake's
-snapshot load at about 17 ms, so most of the time is likely the host-side setup
-around it (network namespace, veth, NAT and jailer, each a separate
-process, then moving the snapshot into the jail); profiling it is the next step.
+Wake meets the goal of a 100 ms p99. Of a typical wake, loading and resuming
+the snapshot is about 10 ms; the rest is the host side: the VM's network
+namespace and links (two `ip -batch` runs, `sysctl` and `nft`) while jailer
+starts Firecracker alongside them, then recording the VM. Park's tail is
+writing 256 MiB of guest memory to disk, which this run's btrfs sometimes
+held up for over a second.
 
 ## Development
 
