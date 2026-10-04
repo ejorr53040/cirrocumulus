@@ -52,30 +52,12 @@ impl Store {
                  end_reason TEXT,
                  log        TEXT NOT NULL,
                  route_host TEXT,
-                 route_port INTEGER
+                 route_port INTEGER,
+                 route_idle_park INTEGER
              )",
         )
         .map_err(io_error)?;
-        // Databases from before routes (M7) lack their columns. Both are
-        // added in one transaction, so a crash can't leave one without the
-        // other.
-        let has_routes: bool = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('vms') WHERE name = 'route_host'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(io_error)?
-            > 0;
-        if !has_routes {
-            conn.execute_batch(
-                "BEGIN;
-                 ALTER TABLE vms ADD COLUMN route_host TEXT;
-                 ALTER TABLE vms ADD COLUMN route_port INTEGER;
-                 COMMIT;",
-            )
-            .map_err(io_error)?;
-        }
+        add_missing_columns(&conn)?;
         let stored: Option<String> = conn
             .query_row("SELECT subnet FROM node", [], |row| row.get(0))
             .optional()
@@ -102,7 +84,7 @@ impl Store {
             .conn
             .prepare(
                 "SELECT name, vm_address, pid, pid_start, mem_mib, vcpus, started_at,
-                        ended_at, end_reason, log, route_host, route_port
+                        ended_at, end_reason, log, route_host, route_port, route_idle_park
                  FROM vms ORDER BY name",
             )
             .map_err(io_error)?;
@@ -116,6 +98,7 @@ impl Store {
                 let log: String = row.get(9)?;
                 let route_host: Option<String> = row.get(10)?;
                 let route_port: Option<u16> = row.get(11)?;
+                let idle_park_secs: Option<u32> = row.get(12)?;
                 Ok(Record {
                     info: VmInfo {
                         name: row.get(0)?,
@@ -129,9 +112,11 @@ impl Store {
                                 reason: parse_reason(&reason)?,
                             })
                         }),
-                        route: route_host
-                            .zip(route_port)
-                            .map(|(host, port)| Route { host, port }),
+                        route: route_host.zip(route_port).map(|(host, port)| Route {
+                            host,
+                            port,
+                            idle_park_secs,
+                        }),
                     },
                     log: PathBuf::from(log),
                     process: pid.zip(pid_start).map(|(pid, start_time)| ProcessId {
@@ -156,8 +141,8 @@ impl Store {
             .execute(
                 "INSERT OR REPLACE INTO vms
                      (name, vm_address, pid, pid_start, mem_mib, vcpus, started_at, log,
-                      route_host, route_port)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                      route_host, route_port, route_idle_park)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     info.name,
                     info.vm_address.map(|a| a.to_string()),
@@ -169,6 +154,7 @@ impl Store {
                     log.to_string_lossy(),
                     info.route.as_ref().map(|r| &r.host),
                     info.route.as_ref().map(|r| r.port),
+                    info.route.as_ref().and_then(|r| r.idle_park_secs),
                 ],
             )
             .map(drop)
@@ -195,6 +181,34 @@ impl Store {
             .map(drop)
             .map_err(io_error)
     }
+}
+
+/// Adds the columns a database made by an older agent lacks, in one
+/// transaction, so a crash can't leave some added and others not.
+fn add_missing_columns(conn: &Connection) -> io::Result<()> {
+    // Added after the table's first release, in the order they came.
+    const ADDED: [(&str, &str); 3] = [
+        ("route_host", "TEXT"),
+        ("route_port", "INTEGER"),
+        ("route_idle_park", "INTEGER"),
+    ];
+    let mut statement = conn
+        .prepare("SELECT name FROM pragma_table_info('vms')")
+        .map_err(io_error)?;
+    let present: Vec<String> = statement
+        .query_map([], |row| row.get(0))
+        .and_then(|rows| rows.collect())
+        .map_err(io_error)?;
+    let alters: String = ADDED
+        .iter()
+        .filter(|(name, _)| !present.iter().any(|p| p == name))
+        .map(|(name, kind)| format!("ALTER TABLE vms ADD COLUMN {name} {kind};"))
+        .collect();
+    if alters.is_empty() {
+        return Ok(());
+    }
+    conn.execute_batch(&format!("BEGIN; {alters} COMMIT;"))
+        .map_err(io_error)
 }
 
 /// SQLite integers are signed; every number stored here (times, ticks) is
