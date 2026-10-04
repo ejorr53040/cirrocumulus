@@ -273,6 +273,14 @@ dependencies = [
 [[package]]
 name = "cirro-edge"
 version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "cirro-image"
@@ -293,6 +301,7 @@ name = "cirro-node"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "cirro-edge",
  "cirro-proto",
  "futures-util",
  "http-body-util",

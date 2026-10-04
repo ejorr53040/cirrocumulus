@@ -6,10 +6,11 @@ use cirro_image::run_config::merge_env;
 use cirro_node::agent;
 use cirro_node::release::ReleaseBinaries;
 use cirro_node::subnet::Subnet;
-use cirro_proto::{RunRequest, Stats, StopRequest, User, VM_STATE_HEADER, VmInfo};
+use cirro_proto::{Route, RunRequest, Stats, StopRequest, User, VM_STATE_HEADER, VmInfo};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use hyper::Method;
 use std::io::{self, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -121,6 +122,13 @@ struct RunArgs {
     /// Run the command as this numeric user and group [default: 0:0]
     #[arg(short, long, value_name = "UID:GID", value_parser = parse_user)]
     user: Option<User>,
+    /// Make the VM an App: the Node's edge sends requests for this hostname
+    /// to it
+    #[arg(long, requires = "port")]
+    host: Option<String>,
+    /// The port the App listens on inside the VM
+    #[arg(long, requires = "host")]
+    port: Option<u16>,
     /// An image (nginx:alpine, ghcr.io/owner/app@sha256:...), or the path
     /// of an ext4 rootfs with guest-init as /init
     #[arg(value_name = "IMAGE|ROOTFS")]
@@ -207,6 +215,10 @@ enum NodeCommand {
         /// The guest kernel every VM boots
         #[arg(long)]
         kernel: PathBuf,
+        /// Serve the HTTP edge, which routes requests to Apps by hostname,
+        /// on this address (e.g. 0.0.0.0:80)
+        #[arg(long, value_name = "ADDRESS:PORT")]
+        http: Option<SocketAddr>,
     },
 }
 
@@ -264,6 +276,7 @@ fn main() -> ExitCode {
                 firecracker,
                 jailer,
                 kernel,
+                http,
             }) => {
                 init_agent_logging();
                 agent::run(agent::Config {
@@ -274,6 +287,7 @@ fn main() -> ExitCode {
                     firecracker,
                     jailer,
                     kernel,
+                    http,
                 })
                 .await
                 .map_err(|e| format!("node agent: {e}"))
@@ -365,6 +379,10 @@ fn command_path(matches: &clap::ArgMatches) -> String {
 }
 
 async fn run(socket: &Path, args: RunArgs) -> Result<(), String> {
+    let route = args
+        .host
+        .zip(args.port)
+        .map(|(host, port)| Route { host, port });
     let request = run_request(
         args.name,
         args.mem,
@@ -376,6 +394,7 @@ async fn run(socket: &Path, args: RunArgs) -> Result<(), String> {
             workdir: args.workdir,
             user: args.user,
         },
+        route,
     )
     .await?;
     let vm: VmInfo = client::call(socket, Method::POST, "/vms", Some(&request))
@@ -406,6 +425,7 @@ async fn run_request(
     vcpus: u8,
     image: &str,
     guest: Guest,
+    route: Option<Route>,
 ) -> Result<RunRequest, String> {
     let (rootfs, command, env, workdir, user) = match rootfs_or_image(image)? {
         Some(rootfs) => {
@@ -441,6 +461,7 @@ async fn run_request(
         env,
         workdir,
         user,
+        route,
     })
 }
 
@@ -459,6 +480,7 @@ async fn bench(socket: &Path, args: BenchArgs) -> Result<(), String> {
             workdir: None,
             user: None,
         },
+        None,
     )
     .await?;
     let mut times: [Vec<Duration>; BENCHED.len()] = Default::default();
@@ -710,8 +732,8 @@ async fn ps(socket: &Path, all: bool) -> Result<(), String> {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let mut header = format!(
-        "{:<32} {:<15} {:>7} {:>5} {:>7}",
-        "NAME", "VM ADDRESS", "MEMORY", "VCPUS", "UPTIME"
+        "{:<32} {:<15} {:>7} {:>5} {:>7}  {:<24}",
+        "NAME", "VM ADDRESS", "MEMORY", "VCPUS", "UPTIME", "HOST"
     );
     if all {
         header.push_str("  STATUS");
@@ -725,13 +747,15 @@ async fn ps(socket: &Path, all: bool) -> Result<(), String> {
             None => cirro_tui::duration(now.saturating_sub(vm.started_at)),
             Some(_) => "-".to_string(),
         };
+        let host = vm.route.as_ref().map_or("-", |r| r.host.as_str());
         let mut row = format!(
-            "{:<32} {:<15} {:>7} {:>5} {:>7}",
+            "{:<32} {:<15} {:>7} {:>5} {:>7}  {:<24}",
             vm.name,
             address,
             format_mem(vm.mem_mib),
             vm.vcpus,
             uptime,
+            host,
         );
         if all {
             match vm.ended {
