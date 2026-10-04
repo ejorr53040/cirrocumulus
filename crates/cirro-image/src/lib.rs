@@ -186,6 +186,11 @@ impl Flattened {
         }
     }
 
+    /// Every path in the final tree, relative to its root, in order.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.tree.keys().map(String::as_str)
+    }
+
     /// The contents of the regular file at `path` in the final tree, if
     /// there is one. `path` may start with `/`.
     pub fn read(&self, path: &str) -> Option<Vec<u8>> {

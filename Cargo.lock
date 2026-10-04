@@ -349,6 +349,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cirro-guest-init"
+version = "0.1.0"
+dependencies = [
+ "nix 0.31.3",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cirro-image"
 version = "0.1.0"
 dependencies = [
@@ -408,6 +417,7 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "bytes",
+ "cirro-guest-init",
  "cirro-image",
  "cirro-node",
  "cirro-proto",
@@ -1085,15 +1095,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "guest-init"
-version = "0.1.0"
-dependencies = [
- "nix 0.31.3",
- "serde",
- "serde_json",
 ]
 
 [[package]]

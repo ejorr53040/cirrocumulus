@@ -1,0 +1,76 @@
+# Builds `cirro` for a version tag (v0.1.0, ...) and publishes it, with its
+# SHA-256, as a GitHub release whose notes are that version's CHANGELOG.md
+# section. Pushing the tag is the only step a person takes.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    name: Build and publish
+    # The oldest supported runner, so the binary needs only glibc 2.35+.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install && rustup show active-toolchain
+      - name: The tag matches the crate's version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "cirrocumulus") | .version')
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG doesn't match the crate's version $version"
+            exit 1
+          fi
+      - name: Build
+        run: cargo build --release --locked -p cirrocumulus
+      - name: Package
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          name="cirro-$TAG-x86_64-linux-gnu"
+          mkdir -p "dist/$name"
+          cp target/release/cirro LICENSE README.md CHANGELOG.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      - name: Release notes from CHANGELOG.md
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          # The section for this version, "## [X.Y.Z] - date", up to the
+          # next heading, without the link definitions at the file's end.
+          awk -v heading="## [${TAG#v}]" '
+            /^## / { if (found) exit; if (index($0, heading) == 1) { found = 1; next } }
+            found && !/^\[[^]]*\]: / { print }
+          ' CHANGELOG.md > dist/notes.md
+          if [ ! -s dist/notes.md ]; then
+            echo "::error::CHANGELOG.md has no section for ${TAG#v}"
+            exit 1
+          fi
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" --verify-tag --title "Cirrocumulus $TAG" \
+            --notes-file dist/notes.md dist/*.tar.gz dist/*.sha256
