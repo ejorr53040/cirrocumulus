@@ -20,10 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// image writes these bytes out as the guest's `/init`. `build.rs` builds
 /// guest-init as part of building `cirro` itself, so this path always
 /// exists by the time this file is compiled.
-pub(crate) static GUEST_INIT_BINARY: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../target/guest-init-embed/x86_64-unknown-linux-musl/release/guest-init"
-));
+pub(crate) static GUEST_INIT_BINARY: &[u8] = include_bytes!(env!("CIRRO_GUEST_INIT"));
 
 /// Where the CLI finds the Node agent unless told otherwise.
 const DEFAULT_SOCKET: &str = "/run/cirro/agent.sock";

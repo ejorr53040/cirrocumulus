@@ -1,5 +1,6 @@
 [package]
 name = "cirro-tui"
+description = "The `cirro top` terminal dashboard of Cirrocumulus, built with ratatui."
 edition.workspace = true
 version.workspace = true
 license.workspace = true

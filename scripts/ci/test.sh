@@ -34,9 +34,6 @@ plan_py='
 import json, sys
 
 HERMETIC_TESTS = {"cli"}
-# Dependencies cargo metadata cannot see: cirro'"'"'s build.rs compiles
-# guest-init and embeds the binary, so a guest-init change must retest cirro.
-EMBEDS = {"guest-init": ["cirrocumulus"]}
 
 meta = json.load(sys.stdin)
 wanted_dirs = set(sys.argv[1:])
@@ -44,7 +41,7 @@ by_name = {p["name"]: p for p in meta["packages"]}
 crate_dir = {p["name"]: p["manifest_path"].split("/crates/")[1].split("/")[0]
              for p in meta["packages"]}
 
-dependents = {name: set(EMBEDS.get(name, [])) for name in by_name}
+dependents = {name: set() for name in by_name}
 for p in meta["packages"]:
     for d in p["dependencies"]:
         if d.get("path") and d["name"] in dependents:

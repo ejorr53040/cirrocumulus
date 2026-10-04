@@ -1,0 +1,14 @@
+[book]
+title = "Cirrocumulus"
+description = "A Firecracker mini cloud in Rust: docs, threat model and design decisions."
+authors = ["Cirrocumulus contributors"]
+language = "en"
+src = "."
+
+[build]
+build-dir = "../target/book"
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/ejorr53040/cirrocumulus"
+edit-url-template = "https://github.com/ejorr53040/cirrocumulus/edit/main/docs/{path}"

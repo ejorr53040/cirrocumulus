@@ -33,7 +33,7 @@ CHILD_APP_BIN="$BUILD_DIR/child_app"
 GRANDCHILD_SRC="$HERE/fixtures/grandchild.rs"
 GRANDCHILD_BIN="$BUILD_DIR/grandchild"
 
-cargo build --release --target "$TARGET" -p guest-init \
+cargo build --release --target "$TARGET" -p cirro-guest-init \
     --manifest-path "$REPO_ROOT/Cargo.toml"
 
 GUEST_INIT_BIN="$REPO_ROOT/target/$TARGET/release/guest-init"
