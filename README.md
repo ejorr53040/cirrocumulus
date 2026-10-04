@@ -98,12 +98,18 @@ park and wake have no such wait.
 | park | 274 ms | 1854 ms |
 | wake | 43 ms | 54 ms |
 
-Wake meets the goal of a 100 ms p99. Of a typical wake, loading and resuming
-the snapshot is about 10 ms; the rest is the host side: the VM's network
-namespace and links (two `ip -batch` runs, `sysctl` and `nft`) while jailer
-starts Firecracker alongside them, then recording the VM. Park's tail is
-writing 256 MiB of guest memory to disk, which this run's btrfs sometimes
-held up for over a second.
+Wake meets the goal of a 100 ms p99. A profiled wake (p50 of 20) spent about
+10 ms loading and resuming the snapshot in Firecracker; the rest is the host
+side. Firecracker takes about 25 ms to start under jailer, and the VM's network
+namespace and links (two `ip -batch` runs, `sysctl` and `nft`) are set up
+while it does, so that start is most of a wake. Then come moving the snapshot
+into the jail (under 1 ms), recording the VM, which doesn't wait for the disk
+([ADR 0006](docs/adr/0006-state-commits-dont-fsync.md)), and the CLI's round
+trip to the agent (a few ms).
+
+Park's tail is writing 256 MiB of guest memory to disk: on this btrfs it
+sometimes took over a second, and did so before these wake changes too (981 ms
+p99 over 10 runs of the earlier build).
 
 ## Development
 
