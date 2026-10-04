@@ -300,6 +300,7 @@ mod tests {
             vcpus: 1,
             started_at: 0,
             ended: None,
+            route: None,
         };
         let process = ProcessId::of(std::process::id()).expect("this test process exists");
         store
@@ -331,6 +332,7 @@ mod tests {
             vcpus: 1,
             started_at: 0,
             ended: None,
+            route: None,
         };
         // This test process is real and running, so `ProcessId::is_running`
         // sees a genuinely live process -- exactly what a running VM's

@@ -35,6 +35,13 @@ use std::time::{Duration, Instant};
 const HTTP_PORT: u16 = 8080;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The port the agent on Node subnet `10.77.<octet>.0/24` serves its HTTP
+/// edge on, on 127.0.0.1: one per agent, so tests running at once don't
+/// share an edge.
+fn edge_port(octet: u8) -> u16 {
+    18000 + u16::from(octet)
+}
+
 /// The Node subnet octets of the agents currently running in this process.
 static LIVE_OCTETS: std::sync::Mutex<std::collections::BTreeSet<u8>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
@@ -209,6 +216,7 @@ impl Agent {
             .arg(&self.socket)
             .args(["--socket-group", &self.socket_group])
             .args(["--subnet", &format!("10.77.{octet}.0/24")])
+            .args(["--http", &format!("127.0.0.1:{}", edge_port(octet))])
             .arg("--firecracker")
             .arg(repo.join("firecracker"))
             .arg("--jailer")
@@ -1981,5 +1989,105 @@ fn a_running_agent_still_starts_vms_after_its_binary_is_replaced() {
         .args(["stop", "--force", "web"])
         .assert()
         .success();
+    agent.assert_no_cirro_state();
+}
+
+/// `GET /` through the agent's HTTP edge, asking for `host`.
+fn edge_get(agent: &Agent, host: &str) -> std::io::Result<String> {
+    let mut stream = TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], edge_port(agent.octet))),
+        Duration::from_secs(1),
+    )?;
+    stream.set_read_timeout(Some(TIMEOUT))?;
+    write!(
+        stream,
+        "GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
+}
+
+/// Retries `edge_get` until the App answers with a 200: `run` returns a
+/// moment before the fixture is listening.
+fn wait_for_edge(agent: &Agent, host: &str) -> String {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let result = edge_get(agent, host);
+        match &result {
+            Ok(response) if response.starts_with("HTTP/1.1 200") => return response.clone(),
+            _ => assert!(
+                Instant::now() < deadline,
+                "{host} never answered through the edge within {TIMEOUT:?}: {result:?}"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// `cirro run --name <name> --host <host> --port 8080 <rootfs> -- <command...>`.
+fn run_app(agent: &Agent, name: &str, host: &str, command: &[&str]) -> assert_cmd::assert::Assert {
+    agent
+        .cirro()
+        .args(["run", "--name", name, "--host", host, "--port"])
+        .arg(HTTP_PORT.to_string())
+        .arg(&rootfs().guest_init)
+        .arg("--")
+        .args(command)
+        .assert()
+}
+
+/// M7: an App is a VM with a route, and the Node's edge sends requests for
+/// the route's hostname to it. The route outlives an agent restart; one
+/// whose VM has ended answers 503 until `rm` removes it.
+#[test]
+fn the_edge_routes_requests_by_hostname_to_the_apps_vm() {
+    let Some(mut agent) = Agent::start(216) else {
+        return;
+    };
+    run_app(&agent, "tally", "counter.test", &["/app/counter"]).success();
+    let before = count(&wait_for_edge(&agent, "counter.test"));
+
+    let unknown = edge_get(&agent, "nobody.test").expect("ask the edge for an unknown host");
+    assert!(
+        unknown.starts_with("HTTP/1.1 404"),
+        "an unknown host should get a 404: {unknown:?}"
+    );
+    let taken = stderr(run_app(&agent, "other", "counter.test", &["/app/counter"]).failure());
+    assert!(
+        taken.contains("counter.test") && taken.contains("tally"),
+        "a second App can't take a hostname, and should be told who has it: {taken}"
+    );
+    let ps = agent.ps(true);
+    assert!(
+        row(&ps, "other").is_none(),
+        "the refused App is listed:\n{ps}"
+    );
+
+    agent.restart();
+    let after = count(&wait_for_edge(&agent, "counter.test"));
+    assert!(
+        after > before,
+        "the route went to a different VM after a restart"
+    );
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "tally"])
+        .assert()
+        .success();
+    let ended = edge_get(&agent, "counter.test").expect("ask the edge for an ended App");
+    assert!(
+        ended.starts_with("HTTP/1.1 503"),
+        "an App whose VM ended should get a 503: {ended:?}"
+    );
+    // An ended App keeps its hostname until it's removed.
+    run_app(&agent, "other", "counter.test", &["/app/counter"]).failure();
+    agent.cirro().args(["rm", "tally"]).assert().success();
+    let gone = edge_get(&agent, "counter.test").expect("ask the edge for a removed App");
+    assert!(
+        gone.starts_with("HTTP/1.1 404"),
+        "a removed App's hostname should get a 404: {gone:?}"
+    );
     agent.assert_no_cirro_state();
 }
