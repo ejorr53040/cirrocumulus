@@ -1,0 +1,27 @@
+[package]
+name = "cirrocumulus-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+cirro-guest-init = { path = "../crates/guest-init" }
+cirro-image = { path = "../crates/cirro-image" }
+
+[[bin]]
+name = "guest_init_config"
+path = "fuzz_targets/guest_init_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "image_layer"
+path = "fuzz_targets/image_layer.rs"
+test = false
+doc = false
+bench = false

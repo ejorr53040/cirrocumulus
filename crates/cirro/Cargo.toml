@@ -3,6 +3,8 @@ name = "cirrocumulus"
 description = "Cirrocumulus: a Firecracker mini cloud in Rust. Each workload runs in a jailed microVM, managed from the `cirro` CLI and terminal dashboard."
 keywords = ["firecracker", "microvm", "self-hosted", "cloud", "tui"]
 categories = ["command-line-utilities", "os::linux-apis", "network-programming"]
+readme = "../../README.md"
+homepage = "https://github.com/ejorr53040/cirrocumulus"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -14,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 bytes.workspace = true
+cirro-guest-init.workspace = true
 cirro-image.workspace = true
 cirro-node.workspace = true
 cirro-proto.workspace = true
@@ -38,3 +41,7 @@ rusqlite.workspace = true
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-machete]
+# Used by build.rs through its `links` metadata, not by any code.
+ignored = ["cirro-guest-init"]

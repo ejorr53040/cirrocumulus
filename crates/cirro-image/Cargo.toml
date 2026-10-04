@@ -1,5 +1,6 @@
 [package]
 name = "cirro-image"
+description = "OCI image to Firecracker rootfs, for Cirrocumulus: pull, flatten and build an ext4 image without root."
 edition.workspace = true
 version.workspace = true
 license.workspace = true
