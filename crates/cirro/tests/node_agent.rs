@@ -135,6 +135,8 @@ struct Agent {
     socket_group: String,
     state_dir: PathBuf,
     socket: PathBuf,
+    /// More `cirro node agent` arguments, for tests that need them.
+    extra_args: Vec<String>,
 }
 
 impl Agent {
@@ -144,7 +146,20 @@ impl Agent {
         Agent::start_with_socket_group(octet, &getgid().as_raw().to_string())
     }
 
+    /// Like [`Agent::start`], with more `cirro node agent` arguments.
+    fn start_with_args(octet: u8, args: &[&str]) -> Option<Agent> {
+        Agent::start_with(
+            octet,
+            &getgid().as_raw().to_string(),
+            args.iter().map(|a| a.to_string()).collect(),
+        )
+    }
+
     fn start_with_socket_group(octet: u8, socket_group: &str) -> Option<Agent> {
+        Agent::start_with(octet, socket_group, Vec::new())
+    }
+
+    fn start_with(octet: u8, socket_group: &str, extra_args: Vec<String>) -> Option<Agent> {
         if !Path::new("/dev/kvm").exists() {
             eprintln!("skipping: /dev/kvm not present");
             return None;
@@ -178,6 +193,7 @@ impl Agent {
             socket_group: socket_group.to_string(),
             state_dir,
             socket,
+            extra_args,
         };
         agent.spawn().expect("start the Node agent");
         Some(agent)
@@ -228,7 +244,8 @@ impl Agent {
             .arg("--jailer")
             .arg(repo.join("jailer"))
             .arg("--kernel")
-            .arg(latest_kernel());
+            .arg(latest_kernel())
+            .args(&self.extra_args);
         cmd
     }
 
@@ -2359,6 +2376,163 @@ fn the_tls_edge_serves_apps_with_certificates_from_the_nodes_ca() {
         after > before,
         "the HTTPS route went somewhere else after a restart"
     );
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "tally"])
+        .assert()
+        .success();
+    agent.cirro().args(["rm", "tally"]).assert().success();
+    agent.assert_no_cirro_state();
+}
+
+/// Pebble, Let's Encrypt's ACME test server, with its mock DNS answering
+/// 127.0.0.1 for every name, so it validates HTTP-01 challenges against
+/// the agent's own edge. Built with `go install` into the test agent's
+/// directory; the test skips without it.
+struct Pebble {
+    servers: Vec<Child>,
+    /// Pebble's own TLS certificate's CA, which the agent must trust.
+    minica: PathBuf,
+    directory: String,
+    management: String,
+    config: PathBuf,
+}
+
+impl Pebble {
+    /// Pebble on ports derived from `octet`, validating HTTP-01 against
+    /// the edge of the agent on that octet.
+    fn start(octet: u8) -> Option<Pebble> {
+        let bin = home().join(".local/lib/cirro-test/go");
+        let source = std::fs::read_dir(home().join("go/pkg/mod/github.com/letsencrypt/pebble"))
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .max();
+        let (Some(source), true) = (source, bin.join("pebble").exists()) else {
+            eprintln!(
+                "skipping: no Pebble -- `GOBIN={} go install \
+                 github.com/letsencrypt/pebble/v2/cmd/pebble{{,-challtestsrv}}@latest`",
+                bin.display()
+            );
+            return None;
+        };
+        let port = |base: u16| (base + u16::from(octet)).to_string();
+        let dns = format!("127.0.0.1:{}", port(20000));
+        let challtestsrv = std::process::Command::new(bin.join("pebble-challtestsrv"))
+            .args(["-defaultIPv4", "127.0.0.1", "-defaultIPv6", ""])
+            .args(["-dnsserver", &dns])
+            .args(["-management", &format!("127.0.0.1:{}", port(20300))])
+            .args(["-http01", "", "-https01", "", "-tlsalpn01", "", "-doh", ""])
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("start pebble-challtestsrv");
+        let certs = source.join("test/certs");
+        let listen = format!("127.0.0.1:{}", port(20600));
+        let management = format!("127.0.0.1:{}", port(20900));
+        let config = serde_json::json!({ "pebble": {
+            "listenAddress": listen,
+            "managementListenAddress": management,
+            "certificate": certs.join("localhost/cert.pem"),
+            "privateKey": certs.join("localhost/key.pem"),
+            "httpPort": edge_port(octet),
+            "tlsPort": tls_edge_port(octet),
+            "ocspResponderURL": "",
+            "externalAccountBindingRequired": false,
+        }});
+        let config_path =
+            std::env::temp_dir().join(format!("cirro-pebble-{}-{octet}.json", std::process::id()));
+        std::fs::write(&config_path, config.to_string()).expect("write Pebble's config");
+        let pebble = std::process::Command::new(bin.join("pebble"))
+            .arg("-config")
+            .arg(&config_path)
+            .args(["-dnsserver", &dns])
+            .env("PEBBLE_VA_NOSLEEP", "1")
+            .env("PEBBLE_WFE_NONCEREJECT", "0")
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("start pebble");
+        let pebble = Pebble {
+            servers: vec![challtestsrv, pebble],
+            minica: certs.join("pebble.minica.pem"),
+            directory: format!("https://localhost:{}/dir", port(20600)),
+            management: format!("https://localhost:{}", port(20900)),
+            config: config_path,
+        };
+        let deadline = Instant::now() + TIMEOUT;
+        while TcpStream::connect(&listen).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "Pebble never listened on {listen}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Some(pebble)
+    }
+
+    /// The root the certificates Pebble issues chain to, written to `path`.
+    fn write_root(&self, path: &Path) {
+        let status = std::process::Command::new("curl")
+            .args(["--silent", "--fail", "--cacert"])
+            .arg(&self.minica)
+            .arg(format!("{}/roots/0", self.management))
+            .arg("--output")
+            .arg(path)
+            .status()
+            .expect("run curl");
+        assert!(status.success(), "fetching Pebble's root failed");
+    }
+}
+
+impl Drop for Pebble {
+    fn drop(&mut self) {
+        for server in &mut self.servers {
+            let _ = server.kill();
+            let _ = server.wait();
+        }
+        let _ = std::fs::remove_file(&self.config);
+    }
+}
+
+/// M7: with ACME on, an App whose hostname is public gets its certificate
+/// from the ACME CA, which validates the hostname over HTTP-01 through the
+/// Node's own edge, and is served with it.
+#[test]
+fn an_app_with_a_public_hostname_is_served_with_an_acme_certificate() {
+    let Some(pebble) = Pebble::start(211) else {
+        return;
+    };
+    let minica = pebble.minica.to_string_lossy().into_owned();
+    let Some(agent) = Agent::start_with_args(
+        211,
+        &[
+            "--acme-email",
+            "ops@cirro-test.dev",
+            "--acme-directory",
+            &pebble.directory,
+            "--acme-root",
+            &minica,
+        ],
+    ) else {
+        return;
+    };
+    run_app(&agent, "tally", "app.cirro-test.dev", &["/app/counter"]).success();
+    wait_for_edge(&agent, "app.cirro-test.dev");
+    let root = agent.state_dir.join("pebble-root.pem");
+    pebble.write_root(&root);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let answer = loop {
+        match tls_get(&agent, "app.cirro-test.dev", &root) {
+            Ok(answer) => break answer,
+            Err(e) => assert!(
+                Instant::now() < deadline,
+                "the App was never served with a certificate from the ACME CA: {e}"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    count(&answer);
 
     agent
         .cirro()

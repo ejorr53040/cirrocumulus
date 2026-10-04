@@ -190,6 +190,16 @@ enum NodeCommand {
         /// Use this guest kernel instead of fetching the pinned release
         #[arg(long, requires = "firecracker", requires = "jailer")]
         kernel: Option<PathBuf>,
+        /// Serve the HTTP edge on this address (e.g. 0.0.0.0:80)
+        #[arg(long, value_name = "ADDRESS:PORT")]
+        http: Option<SocketAddr>,
+        /// Serve the HTTPS edge on this address (e.g. 0.0.0.0:443)
+        #[arg(long, value_name = "ADDRESS:PORT")]
+        https: Option<SocketAddr>,
+        /// Get public hostnames' certificates from Let's Encrypt, with this
+        /// contact address, agreeing to its terms of service
+        #[arg(long, requires = "https", requires = "http")]
+        acme_email: Option<String>,
     },
     /// Reverse `install`: refuses while a VM is running unless `--force`
     Uninstall {
@@ -231,6 +241,23 @@ enum NodeCommand {
         /// certificates from the Node's own CA (`cirro node ca`)
         #[arg(long, value_name = "ADDRESS:PORT")]
         https: Option<SocketAddr>,
+        /// Get public hostnames' certificates from an ACME CA (Let's
+        /// Encrypt unless --acme-directory says otherwise), with this
+        /// contact address, agreeing to the CA's terms of service. Needs
+        /// the HTTP edge on port 80.
+        #[arg(long, requires = "https", requires = "http")]
+        acme_email: Option<String>,
+        /// The ACME CA's directory URL
+        #[arg(
+            long,
+            requires = "acme_email",
+            default_value = "https://acme-v02.api.letsencrypt.org/directory"
+        )]
+        acme_directory: String,
+        /// Trust this CA certificate (PEM) for the ACME directory, e.g. a
+        /// test CA's
+        #[arg(long, requires = "acme_email")]
+        acme_root: Option<PathBuf>,
     },
 }
 
@@ -290,6 +317,9 @@ fn main() -> ExitCode {
                 kernel,
                 http,
                 https,
+                acme_email,
+                acme_directory,
+                acme_root,
             }) => {
                 init_agent_logging();
                 agent::run(agent::Config {
@@ -302,6 +332,11 @@ fn main() -> ExitCode {
                     kernel,
                     http,
                     https,
+                    acme: acme_email.map(|email| agent::AcmeConfig {
+                        directory: acme_directory,
+                        email,
+                        root: acme_root,
+                    }),
                 })
                 .await
                 .map_err(|e| format!("node agent: {e}"))
@@ -329,6 +364,9 @@ fn main() -> ExitCode {
                 firecracker,
                 jailer,
                 kernel,
+                http,
+                https,
+                acme_email,
             }) => cirro_image::check_mke2fs()
                 .map_err(|e| io::Error::other(e.0))
                 .and_then(|()| {
@@ -338,6 +376,11 @@ fn main() -> ExitCode {
                         group,
                         subnet,
                         unit_name,
+                        edge: cirro_node::install::EdgeConfig {
+                            http,
+                            https,
+                            acme_email,
+                        },
                         // `requires` on all three CLI args above guarantees this is
                         // never a partial combination.
                         release_override: match (firecracker, jailer, kernel) {

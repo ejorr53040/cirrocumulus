@@ -69,7 +69,8 @@ impl Install {
             .arg("--jailer")
             .arg(repo.join("jailer"))
             .arg("--kernel")
-            .arg(latest_kernel());
+            .arg(latest_kernel())
+            .args(["--http", "127.0.0.1:18299", "--https", "127.0.0.1:19299"]);
         cmd
     }
 
@@ -148,6 +149,10 @@ fn install_creates_a_group_state_dir_and_enabled_unit_and_is_idempotent() {
     assert!(
         unit_contents.contains(&install.state_dir.display().to_string()),
         "unit doesn't reference the state dir: {unit_contents}"
+    );
+    assert!(
+        unit_contents.contains("--http 127.0.0.1:18299 --https 127.0.0.1:19299"),
+        "unit doesn't start the agent's edge where install was told: {unit_contents}"
     );
 
     // Re-running install with the same arguments is a no-op: it succeeds
