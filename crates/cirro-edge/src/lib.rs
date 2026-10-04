@@ -2,6 +2,8 @@
 //! whose route names the request's `Host` (ADR 0007). It knows nothing of
 //! VMs: a [`Router`], the Node agent, says where a hostname goes.
 
+pub mod acme;
+mod fs;
 pub mod tls;
 
 use bytes::Bytes;
@@ -65,6 +67,14 @@ impl std::fmt::Debug for Lease {
 pub trait Router: Send + Sync + 'static {
     /// `host` is in lowercase, without a port or a trailing dot.
     fn resolve(&self, host: &str) -> impl Future<Output = Resolution> + Send;
+
+    /// The answer to an ACME HTTP-01 challenge for `token`, while one is
+    /// under way: the HTTP edge serves it at
+    /// `/.well-known/acme-challenge/<token>` for any hostname.
+    fn acme_challenge(&self, token: &str) -> Option<String> {
+        let _ = token;
+        None
+    }
 }
 
 type Body = BoxBody<Bytes, hyper::Error>;
@@ -169,6 +179,15 @@ async fn handle<R: Router>(
             "the request names no host\n".into(),
         );
     };
+    if let Scheme::Http = scheme
+        && let Some(token) = req
+            .uri()
+            .path()
+            .strip_prefix("/.well-known/acme-challenge/")
+        && let Some(answer) = router.acme_challenge(token)
+    {
+        return text(StatusCode::OK, answer);
+    }
     // A connection's certificate was chosen for one hostname; a request on
     // it for another would borrow that certificate (RFC 9110 15.5.20).
     if let Scheme::Https { sni } = scheme
