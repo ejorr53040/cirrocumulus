@@ -129,6 +129,11 @@ struct RunArgs {
     /// The port the App listens on inside the VM
     #[arg(long, requires = "host")]
     port: Option<u16>,
+    /// Park the App once no request has come through the edge for this
+    /// many seconds; the next request wakes it
+    #[arg(long, value_name = "SECS", requires = "host",
+        value_parser = clap::value_parser!(u32).range(1..))]
+    idle_park: Option<u32>,
     /// An image (nginx:alpine, ghcr.io/owner/app@sha256:...), or the path
     /// of an ext4 rootfs with guest-init as /init
     #[arg(value_name = "IMAGE|ROOTFS")]
@@ -379,10 +384,11 @@ fn command_path(matches: &clap::ArgMatches) -> String {
 }
 
 async fn run(socket: &Path, args: RunArgs) -> Result<(), String> {
-    let route = args
-        .host
-        .zip(args.port)
-        .map(|(host, port)| Route { host, port });
+    let route = args.host.zip(args.port).map(|(host, port)| Route {
+        host,
+        port,
+        idle_park_secs: args.idle_park,
+    });
     let request = run_request(
         args.name,
         args.mem,

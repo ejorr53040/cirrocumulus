@@ -1994,6 +1994,11 @@ fn a_running_agent_still_starts_vms_after_its_binary_is_replaced() {
 
 /// `GET /` through the agent's HTTP edge, asking for `host`.
 fn edge_get(agent: &Agent, host: &str) -> std::io::Result<String> {
+    edge_get_path(agent, host, "/")
+}
+
+/// `GET <path>` through the agent's HTTP edge, asking for `host`.
+fn edge_get_path(agent: &Agent, host: &str, path: &str) -> std::io::Result<String> {
     let mut stream = TcpStream::connect_timeout(
         &SocketAddr::from(([127, 0, 0, 1], edge_port(agent.octet))),
         Duration::from_secs(1),
@@ -2001,7 +2006,7 @@ fn edge_get(agent: &Agent, host: &str) -> std::io::Result<String> {
     stream.set_read_timeout(Some(TIMEOUT))?;
     write!(
         stream,
-        "GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
     )?;
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
@@ -2193,6 +2198,77 @@ fn requests_for_an_app_that_cant_wake_get_a_503_saying_why() {
     agent.stop_agent();
     std::fs::rename(&hidden, &parked).expect("put the parked dir back");
     agent.spawn().expect("start the agent again");
+    agent.assert_no_cirro_state();
+    agent.assert_no_snapshots();
+}
+
+/// M7: an App run with `--idle-park` is parked once no request has come
+/// for that long and none is in flight, freeing everything it held, and the
+/// next request wakes it. The woken guest's kernel reseeds its RNG (VMGenID), so wakes of one
+/// snapshot never share random numbers.
+#[test]
+fn an_idle_app_is_parked_and_the_next_request_wakes_it_reseeded() {
+    let Some(mut agent) = Agent::start(213) else {
+        return;
+    };
+    let printed = stdout(
+        agent
+            .cirro()
+            .args(["run", "--name", "tally", "--host", "idle.test", "--port"])
+            .arg(HTTP_PORT.to_string())
+            .args(["--idle-park", "2"])
+            .arg(&rootfs().guest_init)
+            .args(["--", "/app/counter"])
+            .assert()
+            .success(),
+    );
+    let (_, host) = vm_address(&printed);
+    let before = count(&wait_for_edge(&agent, "idle.test"));
+
+    // A request still in flight past the idle time keeps the App running.
+    let slow = std::thread::scope(|scope| {
+        let slow = scope.spawn(|| edge_get_path(&agent, "idle.test", "/slow"));
+        std::thread::sleep(Duration::from_secs(3));
+        let ps = agent.ps(true);
+        assert!(
+            row(&ps, "tally").is_some_and(|r| r.contains("running")),
+            "the App was parked with a request in flight:\n{ps}"
+        );
+        slow.join()
+            .unwrap()
+            .expect("the slow request through the edge")
+    });
+    assert_eq!(count(&slow), before + 1, "the slow request wasn't answered");
+
+    let deadline = Instant::now() + TIMEOUT;
+    while !row(&agent.ps(true), "tally").is_some_and(|r| r.contains("parked")) {
+        assert!(
+            Instant::now() < deadline,
+            "the idle App wasn't parked within {TIMEOUT:?}:\n{}",
+            agent.ps(true)
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        host_state_of(213, host).is_empty(),
+        "an idle-parked App still holds host state: {:?}",
+        host_state_of(213, host)
+    );
+
+    let after = count(&edge_get(&agent, "idle.test").expect("ask the edge for the idle App"));
+    assert_eq!(after, before + 2, "the woken App didn't carry on counting");
+    let logs = stdout(agent.cirro().args(["logs", "tally"]).assert().success());
+    assert!(
+        logs.contains("crng reseeded due to virtual machine fork"),
+        "the woken guest's kernel didn't reseed its RNG:\n{logs}"
+    );
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "tally"])
+        .assert()
+        .success();
+    agent.cirro().args(["rm", "tally"]).assert().success();
     agent.assert_no_cirro_state();
     agent.assert_no_snapshots();
 }

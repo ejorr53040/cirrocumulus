@@ -73,6 +73,10 @@ pub struct Route {
     /// A DNS name in lowercase, without a trailing dot.
     pub host: String,
     pub port: u16,
+    /// Park the App once no request has come through the edge for this
+    /// many seconds; never when unset.
+    #[serde(default)]
+    pub idle_park_secs: Option<u32>,
 }
 
 /// A numeric user and group inside the guest.
