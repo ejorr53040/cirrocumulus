@@ -22,14 +22,35 @@ use tracing::{debug, warn};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where requests for a hostname go.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Resolution {
-    /// Proxy to the App's VM at this address.
-    Upstream(SocketAddr),
+    /// Proxy to the App's VM at this address, holding the lease until the
+    /// response has been sent.
+    Upstream(SocketAddr, Lease),
     /// No App has this hostname: 404.
     NotFound,
     /// The App exists but can't take requests now: 503, saying why.
     Unavailable(String),
+}
+
+/// Whatever a [`Router`] wants held while a request it routed is in flight:
+/// dropped once the response has been sent, or the request has failed.
+pub struct Lease {
+    _held: Box<dyn Send + Sync>,
+}
+
+impl Lease {
+    pub fn new(held: impl Send + Sync + 'static) -> Lease {
+        Lease {
+            _held: Box::new(held),
+        }
+    }
+}
+
+impl std::fmt::Debug for Lease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Lease")
+    }
 }
 
 /// Says where requests for a hostname go.
@@ -82,16 +103,18 @@ async fn handle<R: Router>(req: Request<Incoming>, router: &R, peer: SocketAddr)
             format!("no App on this Node has the hostname {host}\n"),
         ),
         Resolution::Unavailable(why) => text(StatusCode::SERVICE_UNAVAILABLE, format!("{why}\n")),
-        Resolution::Upstream(upstream) => match proxy(req, &host, upstream, peer).await {
-            Ok(response) => response,
-            Err(e) => {
-                warn!(host, %upstream, "proxy: {e}");
-                text(
-                    StatusCode::BAD_GATEWAY,
-                    format!("the App at {host} didn't answer: {e}\n"),
-                )
+        Resolution::Upstream(upstream, lease) => {
+            match proxy(req, &host, upstream, peer, lease).await {
+                Ok(response) => response,
+                Err(e) => {
+                    warn!(host, %upstream, "proxy: {e}");
+                    text(
+                        StatusCode::BAD_GATEWAY,
+                        format!("the App at {host} didn't answer: {e}\n"),
+                    )
+                }
             }
-        },
+        }
     }
 }
 
@@ -117,6 +140,7 @@ async fn proxy(
     host: &str,
     upstream: SocketAddr,
     peer: SocketAddr,
+    lease: Lease,
 ) -> Result<Response<Body>, String> {
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, connect(upstream))
         .await
@@ -162,6 +186,13 @@ async fn proxy(
         .map_err(|e| format!("send the request: {e}"))?;
     let (mut parts, body) = response.into_parts();
     remove_hop_by_hop(&mut parts.headers);
+    // The body owns the lease, so it lasts until the body is sent or
+    // dropped.
+    let body = body.map_frame(move |frame| {
+        // Named, so the closure captures the lease rather than ignoring it.
+        let _held = &lease;
+        frame
+    });
     Ok(Response::from_parts(parts, body.boxed()))
 }
 
