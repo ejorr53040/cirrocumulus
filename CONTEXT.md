@@ -36,8 +36,12 @@ The bootable ext4 filesystem a VM runs on, with guest-init as `/init`: built fro
 _Avoid_: disk image, root disk
 
 **App**:
-A named, long-lived workload that owns a route (hostname → port) and has at most one VM at a time.
+A named, long-lived workload that owns a Route and has at most one VM at a time. On a single Node it is a VM started with a Route; the Route stays with the name through park, wake and the VM ending, until `rm` or a new `run` under the name, which brings its own Route or none.
 _Avoid_: service, deployment
+
+**Route**:
+A hostname and the port inside the App's VM that requests for it go to. A hostname belongs to at most one App on a Node.
+_Avoid_: ingress, virtual host, mapping
 
 **Park / wake**:
 Snapshot a VM to disk and end it, freeing its RAM / start a new VM under the same name from that snapshot. Parking an App parks its VM.
@@ -60,3 +64,7 @@ _Avoid_: VM IP, host address
 **Guest address**:
 The fixed address the guest operating system configures on its own interface, identical inside every VM.
 _Avoid_: internal IP, VM IP
+
+**Edge**:
+The HTTP(S) reverse proxy in the Node agent that receives requests from outside the Node and sends each to the App whose Route names its hostname.
+_Avoid_: router (except the `Router` trait the edge asks), load balancer, ingress controller
