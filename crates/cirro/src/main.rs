@@ -202,6 +202,9 @@ enum NodeCommand {
     },
     /// Join this node to a cluster
     Join { token: String },
+    /// Print the CA certificate the HTTPS edge's certificates come from,
+    /// for clients to trust
+    Ca,
     /// Run the Node agent in the foreground (as root)
     Agent {
         /// Where the agent keeps jails and console logs
@@ -224,6 +227,10 @@ enum NodeCommand {
         /// on this address (e.g. 0.0.0.0:80)
         #[arg(long, value_name = "ADDRESS:PORT")]
         http: Option<SocketAddr>,
+        /// Serve the HTTPS edge on this address (e.g. 0.0.0.0:443), with
+        /// certificates from the Node's own CA (`cirro node ca`)
+        #[arg(long, value_name = "ADDRESS:PORT")]
+        https: Option<SocketAddr>,
     },
 }
 
@@ -282,6 +289,7 @@ fn main() -> ExitCode {
                 jailer,
                 kernel,
                 http,
+                https,
             }) => {
                 init_agent_logging();
                 agent::run(agent::Config {
@@ -293,6 +301,7 @@ fn main() -> ExitCode {
                     jailer,
                     kernel,
                     http,
+                    https,
                 })
                 .await
                 .map_err(|e| format!("node agent: {e}"))
@@ -344,6 +353,7 @@ fn main() -> ExitCode {
                     })
                 })
                 .map_err(|e| format!("node install: {e}")),
+            Command::Node(NodeCommand::Ca) => node_ca(&cli.socket).await,
             Command::Node(NodeCommand::Uninstall { state_dir, force }) => {
                 cirro_node::install::uninstall(&state_dir, force)
                     .map_err(|e| format!("node uninstall: {e}"))
@@ -727,6 +737,13 @@ async fn top_once(socket: &Path) -> Result<(), String> {
         .unwrap_or_default();
     print!("{}", cirro_tui::snapshot(&stats));
     Ok(())
+}
+
+async fn node_ca(socket: &Path) -> Result<(), String> {
+    let (_, pem) = client::send(socket, Method::GET, "/ca", None::<&()>).await?;
+    std::io::stdout()
+        .write_all(&pem)
+        .map_err(|e| format!("write the CA: {e}"))
 }
 
 async fn ps(socket: &Path, all: bool) -> Result<(), String> {
