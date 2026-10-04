@@ -2091,3 +2091,108 @@ fn the_edge_routes_requests_by_hostname_to_the_apps_vm() {
     );
     agent.assert_no_cirro_state();
 }
+
+/// M7: a request for a parked App is held while the App wakes, then
+/// answered. Requests that arrive together share one wake: every answer
+/// comes from the same woken guest, which carries on counting.
+#[test]
+fn requests_for_a_parked_app_wake_it_once_and_are_all_answered() {
+    let Some(mut agent) = Agent::start(215) else {
+        return;
+    };
+    run_app(&agent, "tally", "parked.test", &["/app/counter"]).success();
+    let before = count(&wait_for_edge(&agent, "parked.test"));
+    agent.cirro().args(["park", "tally"]).assert().success();
+
+    let responses: Vec<String> = std::thread::scope(|scope| {
+        let requests: Vec<_> = (0..4)
+            .map(|_| scope.spawn(|| edge_get(&agent, "parked.test")))
+            .collect();
+        requests
+            .into_iter()
+            .map(|r| r.join().unwrap().expect("ask the edge for a parked App"))
+            .collect()
+    });
+    let mut counts: Vec<u64> = responses
+        .iter()
+        .map(|response| {
+            assert!(
+                response.starts_with("HTTP/1.1 200"),
+                "a request for a parked App should be answered once it wakes: {response:?}"
+            );
+            count(response)
+        })
+        .collect();
+    counts.sort_unstable();
+    assert_eq!(
+        counts,
+        (before + 1..=before + 4).collect::<Vec<_>>(),
+        "the requests weren't all answered by the one woken guest"
+    );
+    let ps = agent.ps(false);
+    assert!(
+        row(&ps, "tally").is_some(),
+        "the woken App isn't running:\n{ps}"
+    );
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "tally"])
+        .assert()
+        .success();
+    agent.cirro().args(["rm", "tally"]).assert().success();
+    agent.assert_no_cirro_state();
+    agent.assert_no_snapshots();
+}
+
+/// M7: requests for an App that can't be woken are answered at once with a
+/// 503 that says why, rather than held, and none of them tries again.
+#[test]
+fn requests_for_an_app_that_cant_wake_get_a_503_saying_why() {
+    let Some(mut agent) = Agent::start(214) else {
+        return;
+    };
+    run_app(&agent, "lost", "lost.test", &["/app/counter"]).success();
+    wait_for_edge(&agent, "lost.test");
+    agent.cirro().args(["park", "lost"]).assert().success();
+    // As in the M6 test: the parked dir is root's, but renaming it within
+    // the state dir, which is ours, hides the snapshot.
+    agent.stop_agent();
+    let parked = agent.state_dir.join("parked");
+    let hidden = agent.state_dir.join("parked.hidden");
+    std::fs::rename(&parked, &hidden).expect("hide the parked dir");
+    agent.spawn().expect("start the agent again");
+
+    let asked = Instant::now();
+    let responses: Vec<String> = std::thread::scope(|scope| {
+        let requests: Vec<_> = (0..3)
+            .map(|_| scope.spawn(|| edge_get(&agent, "lost.test")))
+            .collect();
+        requests
+            .into_iter()
+            .map(|r| {
+                r.join()
+                    .unwrap()
+                    .expect("ask the edge for an App that can't wake")
+            })
+            .collect()
+    });
+    for response in &responses {
+        assert!(
+            response.starts_with("HTTP/1.1 503") && response.contains("snapshot is gone"),
+            "a request for an App that can't wake should get a 503 saying why: {response:?}"
+        );
+    }
+    assert!(
+        asked.elapsed() < Duration::from_secs(5),
+        "the requests were held for {:?} for an App that can't wake",
+        asked.elapsed()
+    );
+
+    agent.cirro().args(["rm", "lost"]).assert().success();
+    agent.stop_agent();
+    std::fs::rename(&hidden, &parked).expect("put the parked dir back");
+    agent.spawn().expect("start the agent again");
+    agent.assert_no_cirro_state();
+    agent.assert_no_snapshots();
+}
