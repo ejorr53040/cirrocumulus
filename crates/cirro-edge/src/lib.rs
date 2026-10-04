@@ -2,6 +2,8 @@
 //! whose route names the request's `Host` (ADR 0007). It knows nothing of
 //! VMs: a [`Router`], the Node agent, says where a hostname goes.
 
+pub mod tls;
+
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
@@ -15,8 +17,14 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::ServerConfig;
 use tracing::{debug, warn};
+
+/// How long a client has to finish its TLS handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the edge waits to connect to an App's VM before answering 502.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -64,6 +72,20 @@ type Body = BoxBody<Bytes, hyper::Error>;
 /// Serves HTTP on `listener` until the task is dropped, sending each
 /// request where `router` says.
 pub async fn serve<R: Router>(listener: TcpListener, router: Arc<R>) {
+    accept(listener, router, None).await
+}
+
+/// Serves HTTPS on `listener` with `config` until the task is dropped,
+/// sending each request where `router` says.
+pub async fn serve_tls<R: Router>(
+    listener: TcpListener,
+    router: Arc<R>,
+    config: Arc<ServerConfig>,
+) {
+    accept(listener, router, Some(TlsAcceptor::from(config))).await
+}
+
+async fn accept<R: Router>(listener: TcpListener, router: Arc<R>, tls: Option<TlsAcceptor>) {
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(conn) => conn,
@@ -75,28 +97,88 @@ pub async fn serve<R: Router>(listener: TcpListener, router: Arc<R>) {
             }
         };
         let router = router.clone();
+        let tls = tls.clone();
         tokio::spawn(async move {
-            let service = service_fn(move |req| {
-                let router = router.clone();
-                async move { Ok::<_, hyper::Error>(handle(req, router.as_ref(), peer).await) }
-            });
-            if let Err(e) = http1::Builder::new()
-                .serve_connection(TokioIo::new(stream), service)
-                .await
-            {
-                debug!("edge connection from {peer}: {e}");
+            let Some(tls) = tls else {
+                return serve_connection(stream, router, peer, Scheme::Http).await;
+            };
+            match tokio::time::timeout(HANDSHAKE_TIMEOUT, tls.accept(stream)).await {
+                Ok(Ok(stream)) => {
+                    // The resolver only answers a client with an SNI name.
+                    let sni = stream.get_ref().1.server_name().unwrap_or_default();
+                    let scheme = Scheme::Https {
+                        sni: sni.trim_end_matches('.').to_ascii_lowercase(),
+                    };
+                    serve_connection(stream, router, peer, scheme).await
+                }
+                Ok(Err(e)) => debug!("TLS handshake with {peer}: {e}"),
+                Err(_) => debug!("TLS handshake with {peer} timed out"),
             }
         });
     }
 }
 
-async fn handle<R: Router>(req: Request<Incoming>, router: &R, peer: SocketAddr) -> Response<Body> {
+/// What a client connection arrived over.
+#[derive(Clone)]
+enum Scheme {
+    Http,
+    /// With the hostname the client named in its TLS handshake, which its
+    /// certificate was chosen for.
+    Https {
+        sni: String,
+    },
+}
+
+impl Scheme {
+    /// Its `X-Forwarded-Proto` value.
+    fn proto(&self) -> &'static str {
+        match self {
+            Scheme::Http => "http",
+            Scheme::Https { .. } => "https",
+        }
+    }
+}
+
+/// Serves the requests on one client connection.
+async fn serve_connection<R, S>(stream: S, router: Arc<R>, peer: SocketAddr, scheme: Scheme)
+where
+    R: Router,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let service = service_fn(move |req| {
+        let (router, scheme) = (router.clone(), scheme.clone());
+        async move { Ok::<_, hyper::Error>(handle(req, router.as_ref(), peer, &scheme).await) }
+    });
+    if let Err(e) = http1::Builder::new()
+        .serve_connection(TokioIo::new(stream), service)
+        .await
+    {
+        debug!("edge connection from {peer}: {e}");
+    }
+}
+
+async fn handle<R: Router>(
+    req: Request<Incoming>,
+    router: &R,
+    peer: SocketAddr,
+    scheme: &Scheme,
+) -> Response<Body> {
     let Some(host) = host_of(&req) else {
         return text(
             StatusCode::BAD_REQUEST,
             "the request names no host\n".into(),
         );
     };
+    // A connection's certificate was chosen for one hostname; a request on
+    // it for another would borrow that certificate (RFC 9110 15.5.20).
+    if let Scheme::Https { sni } = scheme
+        && *sni != host
+    {
+        return text(
+            StatusCode::MISDIRECTED_REQUEST,
+            format!("this connection is for {sni}, not {host}; connect again for {host}\n"),
+        );
+    }
     match router.resolve(&host).await {
         Resolution::NotFound => text(
             StatusCode::NOT_FOUND,
@@ -104,7 +186,7 @@ async fn handle<R: Router>(req: Request<Incoming>, router: &R, peer: SocketAddr)
         ),
         Resolution::Unavailable(why) => text(StatusCode::SERVICE_UNAVAILABLE, format!("{why}\n")),
         Resolution::Upstream(upstream, lease) => {
-            match proxy(req, &host, upstream, peer, lease).await {
+            match proxy(req, &host, upstream, peer, scheme.proto(), lease).await {
                 Ok(response) => response,
                 Err(e) => {
                     warn!(host, %upstream, "proxy: {e}");
@@ -140,6 +222,7 @@ async fn proxy(
     host: &str,
     upstream: SocketAddr,
     peer: SocketAddr,
+    proto: &'static str,
     lease: Lease,
 ) -> Result<Response<Body>, String> {
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, connect(upstream))
@@ -177,7 +260,7 @@ async fn proxy(
     }
     parts.headers.insert(
         HeaderName::from_static("x-forwarded-proto"),
-        HeaderValue::from_static("http"),
+        HeaderValue::from_static(proto),
     );
 
     let response = sender

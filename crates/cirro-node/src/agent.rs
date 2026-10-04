@@ -23,6 +23,7 @@ use crate::state::{Record, Store};
 use crate::subnet::Subnet;
 use crate::vm::{self, GuestConfig, Stop, Vm, VmSpec, WakeSpec};
 use bytes::Bytes;
+use cirro_edge::tls::NodeCa;
 use cirro_edge::{Lease, Resolution, Router};
 use cirro_proto::{
     EndReason, Ended, ErrorBody, MAX_MEM_MIB, MAX_VCPUS, MIN_MEM_MIB, MIN_VCPUS, Route, RunRequest,
@@ -78,6 +79,9 @@ pub struct Config {
     pub kernel: PathBuf,
     /// Where the HTTP edge listens, if anywhere.
     pub http: Option<SocketAddr>,
+    /// Where the HTTPS edge listens, if anywhere. Its certificates come
+    /// from a CA of the Node's own, kept in the state dir.
+    pub https: Option<SocketAddr>,
 }
 
 /// One name's record in the registry. Every VM start gets its own console
@@ -221,6 +225,8 @@ struct Agent {
     settled: Notify,
     /// Why each App's last wake failed, for requests that were held for it.
     wake_failures: Mutex<BTreeMap<String, String>>,
+    /// The CA the HTTPS edge's certificates come from, when there is one.
+    ca: Option<Arc<NodeCa>>,
 }
 
 /// Tells requests held for a start, wake or park that it has finished,
@@ -266,6 +272,10 @@ pub async fn run(config: Config) -> io::Result<()> {
     egress::ensure_node_policy(&config.subnet.to_string(), egress_iface.as_deref())
         .map_err(|e| io::Error::other(format!("apply the Node's egress policy: {e}")))?;
     let gid = resolve_group(&config.socket_group)?;
+    let ca = match config.https {
+        Some(_) => Some(Arc::new(NodeCa::load_or_create(&config.state_dir)?)),
+        None => None,
+    };
     let agent = Arc::new(Agent {
         node: vm::NodeConfig {
             firecracker: config.firecracker,
@@ -285,6 +295,7 @@ pub async fn run(config: Config) -> io::Result<()> {
         metrics: Mutex::new(Recorder::default()),
         settled: Notify::new(),
         wake_failures: Mutex::new(BTreeMap::new()),
+        ca,
     });
     agent.reconcile().await?;
     let idle_parker = tokio::spawn(agent.clone().park_idle_apps());
@@ -302,6 +313,25 @@ pub async fn run(config: Config) -> io::Result<()> {
             )))
         }
         None => None,
+    };
+    // `agent.ca` is set exactly when `config.https` is.
+    let tls_edge = match (config.https, &agent.ca) {
+        (Some(address), Some(ca)) => {
+            let listener = TcpListener::bind(address)
+                .await
+                .map_err(|e| io::Error::other(format!("listen for HTTPS on {address}: {e}")))?;
+            let routes = agent.clone();
+            let tls = cirro_edge::tls::server_config(ca.clone(), move |host| {
+                app_with_host(&routes.vms.lock().unwrap(), host).is_some()
+            })?;
+            info!(%address, "HTTPS edge listening");
+            Some(tokio::spawn(cirro_edge::serve_tls(
+                listener,
+                Arc::new(Edge(agent.clone())),
+                tls,
+            )))
+        }
+        _ => None,
     };
     let sampling = agent.clone();
     let sampler = tokio::spawn(async move {
@@ -381,7 +411,7 @@ pub async fn run(config: Config) -> io::Result<()> {
     info!("shutting down; running VMs stay up");
     sampler.abort();
     idle_parker.abort();
-    if let Some(edge) = edge {
+    for edge in [edge, tls_edge].into_iter().flatten() {
         edge.abort();
     }
     let _ = std::fs::remove_file(&config.socket);
@@ -429,6 +459,7 @@ impl Agent {
         }
         let result = match (&method, segments.as_slice()) {
             (&Method::GET, ["stats"]) => Ok(json(StatusCode::OK, &self.stats())),
+            (&Method::GET, ["ca"]) => self.ca_pem(),
             (&Method::GET, ["vms"]) => {
                 let all = query_param(&query, "all") == Some("true");
                 Ok(json(StatusCode::OK, &self.list(all)))
@@ -466,6 +497,21 @@ impl Agent {
             )),
         };
         result.unwrap_or_else(|ApiError(status, error)| json(status, &ErrorBody { error }))
+    }
+
+    /// The CA certificate the HTTPS edge's certificates come from.
+    fn ca_pem(&self) -> Result<ApiResponse, ApiError> {
+        let ca = self.ca.as_ref().ok_or_else(|| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                "this Node agent serves no HTTPS edge, so has no CA; start it with --https".into(),
+            )
+        })?;
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/x-pem-file")
+            .body(Full::new(Bytes::from(ca.cert_pem().to_string())))
+            .expect("build CA response"))
     }
 
     /// Samples the Node and every running VM, for [`Agent::stats`].
