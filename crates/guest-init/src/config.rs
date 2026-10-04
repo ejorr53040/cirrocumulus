@@ -4,26 +4,26 @@
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
-pub(crate) struct Config {
-    pub(crate) exec: String,
+pub struct Config {
+    pub exec: String,
     #[serde(default)]
-    pub(crate) args: Vec<String>,
+    pub args: Vec<String>,
     /// `KEY=VALUE` entries; see `launch::app_env` for the defaults added.
     #[serde(default)]
-    pub(crate) env: Vec<String>,
+    pub env: Vec<String>,
     #[serde(default)]
-    pub(crate) workdir: Option<String>,
+    pub workdir: Option<String>,
     #[serde(default)]
-    pub(crate) user: Option<User>,
+    pub user: Option<User>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq, Clone, Copy)]
-pub(crate) struct User {
-    pub(crate) uid: u32,
-    pub(crate) gid: u32,
+pub struct User {
+    pub uid: u32,
+    pub gid: u32,
 }
 
-pub(crate) fn parse_config(json: &str) -> Result<Config, serde_json::Error> {
+pub fn parse_config(json: &str) -> Result<Config, serde_json::Error> {
     serde_json::from_str(json)
 }
 

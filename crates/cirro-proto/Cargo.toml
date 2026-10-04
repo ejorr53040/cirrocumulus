@@ -1,5 +1,6 @@
 [package]
 name = "cirro-proto"
+description = "Request and response types shared by the Cirrocumulus CLI and Node agent."
 edition.workspace = true
 version.workspace = true
 license.workspace = true

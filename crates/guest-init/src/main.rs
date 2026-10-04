@@ -11,10 +11,9 @@
 //! of a fixed rootfs path, so the host can supply it at boot rather than
 //! baking it into the image.
 
-mod config;
 mod launch;
 
-use config::Config;
+use cirro_guest_init::config::{self, Config};
 use nix::errno::Errno;
 use nix::mount::{MsFlags, mount};
 use nix::sys::reboot::{RebootMode, reboot, set_cad_enabled};

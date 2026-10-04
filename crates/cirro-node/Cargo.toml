@@ -1,5 +1,6 @@
 [package]
 name = "cirro-node"
+description = "The Cirrocumulus Node agent: Firecracker microVMs under jailer, per-VM network namespaces, egress policy, park and wake."
 edition.workspace = true
 version.workspace = true
 license.workspace = true

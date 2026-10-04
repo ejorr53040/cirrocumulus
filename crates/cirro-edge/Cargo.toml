@@ -1,5 +1,6 @@
 [package]
 name = "cirro-edge"
+description = "Cirrocumulus's edge: an HTTP(S) reverse proxy that routes to Apps by hostname, with a Node CA and ACME certificates."
 edition.workspace = true
 version.workspace = true
 license.workspace = true

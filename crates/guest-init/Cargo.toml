@@ -1,9 +1,21 @@
 [package]
-name = "guest-init"
+name = "cirro-guest-init"
+description = "PID 1 inside every Cirrocumulus microVM: mounts, the app's config over vsock, reaping, shutdown. Built into the `cirro` binary."
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 repository.workspace = true
+# `cirro`'s build script finds this package's source through `links`
+# metadata, here or as a crates.io download alike, and builds the binary
+# for musl to embed it.
+links = "cirro_guest_init"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "guest-init"
+path = "src/main.rs"
 
 [dependencies]
 nix = { workspace = true, features = ["mount", "process", "signal", "reboot", "fs", "net", "user"] }

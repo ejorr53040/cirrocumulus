@@ -19,7 +19,7 @@ TARGET="x86_64-unknown-linux-musl"
 APP_SRC="$HERE/fixtures/long_running_app.rs"
 APP_BIN="$BUILD_DIR/long_running_app"
 
-cargo build --release --target "$TARGET" -p guest-init \
+cargo build --release --target "$TARGET" -p cirro-guest-init \
     --manifest-path "$REPO_ROOT/Cargo.toml"
 
 GUEST_INIT_BIN="$REPO_ROOT/target/$TARGET/release/guest-init"

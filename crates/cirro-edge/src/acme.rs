@@ -145,7 +145,7 @@ impl Acme {
     }
 
     /// Orders a certificate for `host` unless it has one with more than
-    /// [`RENEW_WITHIN`] left, an order for it is under way, or its last
+    /// a month left, an order for it is under way, or its last
     /// order failed too recently to try again.
     pub async fn ensure(&self, host: &str) -> Result<(), String> {
         let fresh = self
