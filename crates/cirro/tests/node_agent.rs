@@ -42,6 +42,11 @@ fn edge_port(octet: u8) -> u16 {
     18000 + u16::from(octet)
 }
 
+/// Like [`edge_port`], for the HTTPS edge.
+fn tls_edge_port(octet: u8) -> u16 {
+    19000 + u16::from(octet)
+}
+
 /// The Node subnet octets of the agents currently running in this process.
 static LIVE_OCTETS: std::sync::Mutex<std::collections::BTreeSet<u8>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
@@ -217,6 +222,7 @@ impl Agent {
             .args(["--socket-group", &self.socket_group])
             .args(["--subnet", &format!("10.77.{octet}.0/24")])
             .args(["--http", &format!("127.0.0.1:{}", edge_port(octet))])
+            .args(["--https", &format!("127.0.0.1:{}", tls_edge_port(octet))])
             .arg("--firecracker")
             .arg(repo.join("firecracker"))
             .arg("--jailer")
@@ -2271,4 +2277,94 @@ fn an_idle_app_is_parked_and_the_next_request_wakes_it_reseeded() {
     agent.cirro().args(["rm", "tally"]).assert().success();
     agent.assert_no_cirro_state();
     agent.assert_no_snapshots();
+}
+
+/// `curl` over HTTPS to the agent's TLS edge for `host`, trusting only the
+/// CA at `ca`: its stdout, or its stderr if it failed.
+fn tls_get(agent: &Agent, host: &str, ca: &Path) -> Result<String, String> {
+    tls_get_with(agent, host, ca, &[])
+}
+
+/// [`tls_get`] with more `curl` arguments.
+fn tls_get_with(agent: &Agent, host: &str, ca: &Path, extra: &[&str]) -> Result<String, String> {
+    let port = tls_edge_port(agent.octet);
+    let output = std::process::Command::new("curl")
+        .args(["--silent", "--show-error", "--max-time", "10", "--cacert"])
+        .arg(ca)
+        .args(extra)
+        .args(["--resolve", &format!("{host}:{port}:127.0.0.1")])
+        .arg(format!("https://{host}:{port}/"))
+        .output()
+        .expect("run curl");
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+}
+
+/// M7: the edge serves HTTPS with certificates from a CA of the Node's own,
+/// which `cirro node ca` prints for clients to trust. Certificates are only
+/// issued for hostnames an App has, and the CA outlives agent restarts.
+#[test]
+fn the_tls_edge_serves_apps_with_certificates_from_the_nodes_ca() {
+    let Some(mut agent) = Agent::start(212) else {
+        return;
+    };
+    run_app(&agent, "tally", "tls.test", &["/app/counter"]).success();
+    wait_for_edge(&agent, "tls.test");
+    let ca_pem = stdout(agent.cirro().args(["node", "ca"]).assert().success());
+    assert!(
+        ca_pem.starts_with("-----BEGIN CERTIFICATE-----"),
+        "`cirro node ca` should print the CA certificate as PEM: {ca_pem:?}"
+    );
+    let ca = agent.state_dir.join("test-ca.pem");
+    std::fs::write(&ca, &ca_pem).expect("write the CA for curl");
+
+    let answer = tls_get(&agent, "tls.test", &ca).expect("HTTPS to the App through the edge");
+    let before = count(&answer);
+    let refused = tls_get(&agent, "nobody.test", &ca);
+    assert!(
+        refused.is_err(),
+        "the edge shouldn't serve a certificate for a hostname no App has: {refused:?}"
+    );
+    // A connection made for one App can't ask for another.
+    let status = tls_get_with(
+        &agent,
+        "tls.test",
+        &ca,
+        &[
+            "--header",
+            "Host: other.test",
+            "--write-out",
+            "%{http_code}",
+            "--output",
+            "/dev/null",
+        ],
+    );
+    assert_eq!(
+        status.as_deref(),
+        Ok("421"),
+        "a request whose Host isn't the connection's SNI should get a 421"
+    );
+
+    agent.restart();
+    let after_restart = stdout(agent.cirro().args(["node", "ca"]).assert().success());
+    assert_eq!(
+        after_restart, ca_pem,
+        "the Node's CA changed across a restart"
+    );
+    let after = count(&tls_get(&agent, "tls.test", &ca).expect("HTTPS after a restart"));
+    assert!(
+        after > before,
+        "the HTTPS route went somewhere else after a restart"
+    );
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "tally"])
+        .assert()
+        .success();
+    agent.cirro().args(["rm", "tally"]).assert().success();
+    agent.assert_no_cirro_state();
 }
