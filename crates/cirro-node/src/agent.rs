@@ -46,13 +46,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::unix::UCred;
 use tokio::net::{TcpListener, UnixListener};
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 use tracing::{Instrument, error, info, info_span, warn};
 
 /// How long a graceful stop waits for the VM to end before killing it,
 /// unless the request says otherwise.
 const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the edge holds a request for an App that is starting or waking
+/// before answering 503.
+const HOLD_FOR_START: Duration = Duration::from_secs(30);
 
 /// How often the agent samples the Node and every running VM.
 const SAMPLE_EVERY: Duration = Duration::from_secs(1);
@@ -143,6 +147,21 @@ struct Agent {
     shutting_down: AtomicBool,
     /// What the Node and each running VM used, for `GET /stats`.
     metrics: Mutex<Recorder>,
+    /// Told whenever a start or wake has finished, either way, so requests
+    /// held for an App that was starting can look again.
+    settled: Notify,
+    /// Why each App's last wake failed, for requests that were held for it.
+    wake_failures: Mutex<BTreeMap<String, String>>,
+}
+
+/// Tells requests held for a start or wake that it has finished, however
+/// it finished, panics included.
+struct Settled(Arc<Agent>);
+
+impl Drop for Settled {
+    fn drop(&mut self) {
+        self.0.settled.notify_waiters();
+    }
 }
 
 /// Runs the agent until SIGTERM or SIGINT, then removes the socket. VMs,
@@ -195,6 +214,8 @@ pub async fn run(config: Config) -> io::Result<()> {
         next_log: AtomicU64::new(next_log_number(&logs_dir)),
         shutting_down: AtomicBool::new(false),
         metrics: Mutex::new(Recorder::default()),
+        settled: Notify::new(),
+        wake_failures: Mutex::new(BTreeMap::new()),
     });
     agent.reconcile().await?;
     // Bound before the socket opens, so an edge that can't listen stops the
@@ -205,7 +226,10 @@ pub async fn run(config: Config) -> io::Result<()> {
                 .await
                 .map_err(|e| io::Error::other(format!("listen for HTTP on {address}: {e}")))?;
             info!(%address, "HTTP edge listening");
-            Some(tokio::spawn(cirro_edge::serve(listener, agent.clone())))
+            Some(tokio::spawn(cirro_edge::serve(
+                listener,
+                Arc::new(Edge(agent.clone())),
+            )))
         }
         None => None,
     };
@@ -521,7 +545,11 @@ impl Agent {
         // this request's future.
         let (name, route) = (run.name, run.route);
         tokio::spawn(
-            async move { self.start_vm(name, spec, route, replaced).await }.in_current_span(),
+            async move {
+                let _settled = Settled(self.clone());
+                self.start_vm(name, spec, route, replaced).await
+            }
+            .in_current_span(),
         )
         .await
         .unwrap_or_else(|e| Err(internal(format!("starting the VM panicked: {e}"))))
@@ -633,9 +661,21 @@ impl Agent {
         };
         // On its own task, like a start, so it finishes even if the client
         // goes away.
-        tokio::spawn(async move { self.finish_wake(name, spec, parked).await }.in_current_span())
-            .await
-            .unwrap_or_else(|e| Err(internal(format!("waking the VM panicked: {e}"))))
+        tokio::spawn(
+            async move {
+                let _settled = Settled(self.clone());
+                let woken = self.clone().finish_wake(name.clone(), spec, parked).await;
+                let mut failures = self.wake_failures.lock().unwrap();
+                match &woken {
+                    Ok(_) => failures.remove(&name),
+                    Err(ApiError(_, why)) => failures.insert(name, why.clone()),
+                };
+                woken
+            }
+            .in_current_span(),
+        )
+        .await
+        .unwrap_or_else(|e| Err(internal(format!("waking the VM panicked: {e}"))))
     }
 
     async fn finish_wake(
@@ -1056,27 +1096,95 @@ impl Agent {
     }
 }
 
-impl Router for Agent {
+/// What the edge does next for a hostname, decided under the VM table's
+/// lock and acted on after it is released. Each carries the App's name.
+enum Step {
+    Answer(Resolution),
+    /// The App is starting or waking: hold the request until that settles.
+    Hold(String),
+    /// The App is parked: wake it.
+    Wake(String),
+}
+
+/// The agent as the edge's [`Router`]: a request for a parked App wakes it
+/// and is held until it runs, so the client sees latency, not an error.
+struct Edge(Arc<Agent>);
+
+impl Router for Edge {
     async fn resolve(&self, host: &str) -> Resolution {
+        let agent = &self.0;
+        let deadline = tokio::time::Instant::now() + HOLD_FOR_START;
+        // Set once this request has held for a wake or tried one. Finding
+        // the App parked after that means the wake failed, and the request
+        // answers why instead of trying again.
+        let mut tried: Option<Option<String>> = None;
+        loop {
+            // Listening before looking, so a start that settles in between
+            // isn't missed.
+            let settled = agent.settled.notified();
+            tokio::pin!(settled);
+            settled.as_mut().enable();
+            match agent.step_for(host) {
+                Step::Answer(resolution) => return resolution,
+                Step::Hold(name) => {
+                    tried = Some(None);
+                    if tokio::time::timeout_at(deadline, settled).await.is_err() {
+                        return Resolution::Unavailable(still_starting(&name));
+                    }
+                }
+                Step::Wake(name) if tried.is_some() => {
+                    let why = tried
+                        .flatten()
+                        .or_else(|| agent.wake_failures.lock().unwrap().get(&name).cloned());
+                    return Resolution::Unavailable(why.unwrap_or_else(|| {
+                        format!("App {name:?} failed to wake; `cirro logs {name}` may say why")
+                    }));
+                }
+                Step::Wake(name) => {
+                    let woken =
+                        tokio::time::timeout_at(deadline, agent.clone().wake_vm(name.clone()));
+                    match woken.await {
+                        Err(_) => return Resolution::Unavailable(still_starting(&name)),
+                        Ok(Ok(_)) => info!(vm = name, host, "woke an App for a request"),
+                        // Another request's wake may have got there first,
+                        // or the App can't be woken (its snapshot is gone).
+                        Ok(Err(ApiError(StatusCode::CONFLICT, why))) => tried = Some(Some(why)),
+                        Ok(Err(ApiError(_, why))) => return Resolution::Unavailable(why),
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn still_starting(name: &str) -> String {
+    format!(
+        "App {name:?} is still starting after {HOLD_FOR_START:?}; try again shortly, or see \
+         `cirro logs {name}`"
+    )
+}
+
+impl Agent {
+    /// What a request for `host` needs next.
+    fn step_for(&self, host: &str) -> Step {
         let vms = self.vms.lock().unwrap();
         let Some((name, entry)) = app_with_host(&vms, host) else {
-            return Resolution::NotFound;
+            return Step::Answer(Resolution::NotFound);
         };
+        let name = name.clone();
         match entry {
-            Entry::Running { info, .. } => match (info.vm_address, &info.route) {
+            Entry::Running { info, .. } => Step::Answer(match (info.vm_address, &info.route) {
                 (Some(address), Some(route)) => {
                     Resolution::Upstream(SocketAddr::new(address.into(), route.port))
                 }
                 _ => Resolution::Unavailable(format!("App {name:?} has no VM address")),
-            },
-            Entry::Starting { .. } => Resolution::Unavailable(format!("App {name:?} is starting")),
-            Entry::Ended { info, .. } if is_parked(info) => {
-                Resolution::Unavailable(format!("App {name:?} is parked"))
-            }
-            Entry::Ended { info, .. } => Resolution::Unavailable(format!(
+            }),
+            Entry::Starting { .. } => Step::Hold(name),
+            Entry::Ended { info, .. } if is_parked(info) => Step::Wake(name),
+            Entry::Ended { info, .. } => Step::Answer(Resolution::Unavailable(format!(
                 "App {name:?} has ended ({})",
                 info.ended.as_ref().map_or("unknown", |e| e.reason.as_str())
-            )),
+            ))),
         }
     }
 }

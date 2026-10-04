@@ -118,7 +118,7 @@ async fn proxy(
     upstream: SocketAddr,
     peer: SocketAddr,
 ) -> Result<Response<Body>, String> {
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(upstream))
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, connect(upstream))
         .await
         .map_err(|_| format!("connecting to it timed out after {CONNECT_TIMEOUT:?}"))?
         .map_err(|e| format!("connect: {e}"))?;
@@ -163,6 +163,19 @@ async fn proxy(
     let (mut parts, body) = response.into_parts();
     remove_hop_by_hop(&mut parts.headers);
     Ok(Response::from_parts(parts, body.boxed()))
+}
+
+/// Connects to `upstream`, trying again while it refuses: an App that has
+/// just started or woken may be a moment from accepting.
+async fn connect(upstream: SocketAddr) -> std::io::Result<TcpStream> {
+    loop {
+        match TcpStream::connect(upstream).await {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            result => return result,
+        }
+    }
 }
 
 /// Headers that describe one connection, not the message, so never pass a
