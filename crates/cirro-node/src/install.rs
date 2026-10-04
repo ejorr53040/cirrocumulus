@@ -37,6 +37,34 @@ pub struct InstallConfig {
     /// `node agent`'s own `--firecracker`/`--jailer`/`--kernel` flags use,
     /// so tests can point install at local fixtures instead of the network.
     pub release_override: Option<ReleaseBinaries>,
+    /// The edge the agent serves, passed on to `cirro node agent`.
+    pub edge: EdgeConfig,
+}
+
+/// Where the agent's edge listens, and whether it gets ACME certificates:
+/// `cirro node agent`'s `--http`, `--https` and `--acme-email`.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct EdgeConfig {
+    pub http: Option<std::net::SocketAddr>,
+    pub https: Option<std::net::SocketAddr>,
+    pub acme_email: Option<String>,
+}
+
+impl EdgeConfig {
+    /// The `cirro node agent` arguments for it, each with a leading space.
+    fn agent_args(&self) -> String {
+        let mut args = String::new();
+        if let Some(http) = self.http {
+            args.push_str(&format!(" --http {http}"));
+        }
+        if let Some(https) = self.https {
+            args.push_str(&format!(" --https {https}"));
+        }
+        if let Some(email) = &self.acme_email {
+            args.push_str(&format!(" --acme-email {email}"));
+        }
+        args
+    }
 }
 
 /// Everything install resolved, persisted so uninstall (and a future
@@ -50,6 +78,9 @@ struct NodeConfig {
     unit_name: String,
     #[serde(flatten)]
     release: ReleaseBinaries,
+    /// Missing from a Node config written before the edge (M7).
+    #[serde(default)]
+    edge: EdgeConfig,
 }
 
 /// Checks KVM and cgroup v2 -- the successor to `scripts/step0/prereqs.sh`'s
@@ -119,6 +150,7 @@ pub fn install(cfg: &InstallConfig) -> io::Result<()> {
         subnet: cfg.subnet.to_string(),
         unit_name: cfg.unit_name.clone(),
         release,
+        edge: cfg.edge.clone(),
     };
     write_node_config(&cfg.state_dir, &node_config)?;
 
@@ -221,7 +253,7 @@ fn install_unit(config: &NodeConfig, state_dir: &Path) -> io::Result<()> {
          [Service]\n\
          ExecStart={bin} node agent --socket {socket} --socket-group {group} \
          --subnet {subnet} --state-dir {state_dir} --firecracker {firecracker} \
-         --jailer {jailer} --kernel {kernel}\n\
+         --jailer {jailer} --kernel {kernel}{edge}\n\
          Restart=on-failure\n\
          \n\
          [Install]\n\
@@ -234,6 +266,7 @@ fn install_unit(config: &NodeConfig, state_dir: &Path) -> io::Result<()> {
         firecracker = config.release.firecracker.display(),
         jailer = config.release.jailer.display(),
         kernel = config.release.kernel.display(),
+        edge = config.edge.agent_args(),
     );
     let unit_path = unit_path(&config.unit_name);
     fs::write(&unit_path, unit)?;
