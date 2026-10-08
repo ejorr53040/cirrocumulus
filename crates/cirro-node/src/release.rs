@@ -41,7 +41,7 @@ const JAILER_BIN_SHA256: &str = "65ef226e96f0ceda55ba643f445801ef2cc0ea667ef67ca
 // eventually and need re-pinning with a fresh `scripts/step0/fetch_kernel.sh`
 // run followed by `sha256sum`. Recorded here 2026-09-29.
 const KERNEL_URL: &str = "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260929-a738f18a8db0-0/x86_64/vmlinux-6.18.48";
-const KERNEL_SHA256: &str = "9204218e8bcca6ac23848d74f45df2eb19d7f31e8277840a7d145a0df8b078d2";
+const KERNEL_SHA256: &str = "b0ff002711a6be32f2f5cbc21fbb7b2987b7807e0d37540034d49db22ce3d06b";
 const KERNEL_FILENAME: &str = "vmlinux-6.18.48";
 
 /// The three binaries a Node needs to run VMs: wherever they came from
