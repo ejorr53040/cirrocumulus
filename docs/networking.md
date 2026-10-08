@@ -48,8 +48,11 @@ masquerades VMs' traffic out of the Node's default route, and drops:
 - new connections from VMs to the Node.
 
 The table only ever drops, so a host firewall such as ufw still applies on
-top. On a host with ufw's default forward policy of DROP, VM traffic also
-needs `ufw route allow in on cirro-+ out on <egress interface>`.
+top. `cirro node install` adds the rule that lets VMs' traffic through it:
+`ufw route allow in on cirro-+ from <subnet>` when ufw is installed, and the
+subnet as a source of the `trusted` zone when firewalld is running.
+`cirro node uninstall` removes it. Any other firewall that drops forwarded
+traffic needs the same allowance by hand.
 
 ## Reaching a VM
 

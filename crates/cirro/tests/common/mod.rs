@@ -72,3 +72,76 @@ pub(crate) fn test_agent() -> Option<&'static Path> {
         })
         .as_deref()
 }
+
+/// The rootfs images the tests boot, built once per test run without root
+/// (`mkfs.ext4 -d`). Every image carries the fixture commands under `/app`.
+#[allow(dead_code, reason = "node_install.rs only boots guest_init")]
+pub(crate) struct Rootfs {
+    /// guest-init as `/init`.
+    pub(crate) guest_init: PathBuf,
+    /// No `/init` at all, so the guest never starts guest-init.
+    pub(crate) no_init: PathBuf,
+    /// A `/init` that isn't guest-init and never takes a config.
+    pub(crate) wrong_init: PathBuf,
+}
+
+pub(crate) fn rootfs() -> &'static Rootfs {
+    static ROOTFS: OnceLock<Rootfs> = OnceLock::new();
+    ROOTFS.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(concat!(env!("CARGO_CRATE_NAME"), "-rootfs"));
+        let tree = dir.join("tree");
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["proc", "sys", "dev", "app"] {
+            std::fs::create_dir_all(tree.join(sub)).expect("create rootfs tree");
+        }
+        for fixture in [
+            "http_app",
+            "ignore_term",
+            "exit_later",
+            "probe",
+            "whoami",
+            "spin",
+            "counter",
+            "dialer",
+            "chatter",
+        ] {
+            let status = std::process::Command::new("rustc")
+                .args(["--target", "x86_64-unknown-linux-musl", "-O", "-o"])
+                .arg(tree.join("app").join(fixture))
+                .arg(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join(format!("tests/fixtures/{fixture}.rs")),
+                )
+                .status()
+                .expect("run rustc");
+            assert!(status.success(), "building the {fixture} fixture failed");
+        }
+        let no_init = make_image(&tree, &dir.join("no-init.ext4"));
+        std::fs::copy(tree.join("app/ignore_term"), tree.join("init"))
+            .expect("copy ignore_term in as /init");
+        let wrong_init = make_image(&tree, &dir.join("wrong-init.ext4"));
+        let guest_init_bin = repo_root()
+            .join("target/guest-init-embed/x86_64-unknown-linux-musl/release/guest-init");
+        std::fs::copy(&guest_init_bin, tree.join("init")).expect("copy guest-init into tree");
+        let guest_init = make_image(&tree, &dir.join("guest-init.ext4"));
+        Rootfs {
+            guest_init,
+            no_init,
+            wrong_init,
+        }
+    })
+}
+
+fn make_image(tree: &Path, image: &Path) -> PathBuf {
+    let file = std::fs::File::create(image).expect("create rootfs image");
+    file.set_len(64 * 1024 * 1024).expect("size rootfs image");
+    let status = std::process::Command::new("mkfs.ext4")
+        .args(["-q", "-F", "-d"])
+        .arg(tree)
+        .arg(image)
+        .status()
+        .expect("run mkfs.ext4");
+    assert!(status.success(), "mkfs.ext4 failed");
+    image.to_path_buf()
+}

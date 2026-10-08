@@ -16,8 +16,8 @@
 //! `GET /vms` lists running VMs; `all=true` adds Ended VMs. A parked VM is
 //! an Ended VM whose reason is [`EndReason::Parked`]; waking it starts a new
 //! VM under its name from its snapshot. The logs
-//! response is the console log from byte `offset` on (default 0), as
-//! `text/plain`, with a [`VM_STATE_HEADER`] saying whether the VM is still
+//! response is the console log from byte `offset` on (default 0), at most
+//! [`LOG_CHUNK`] bytes of it, as `text/plain`, with a [`VM_STATE_HEADER`] saying whether the VM is still
 //! running, so a client can follow it by polling from its last offset.
 //!
 //! Every non-2xx response carries an [`ErrorBody`].
@@ -28,6 +28,10 @@ use std::path::PathBuf;
 
 /// Response header on the logs endpoint: `running` or `ended`.
 pub const VM_STATE_HEADER: &str = "cirro-vm-state";
+
+/// The most of a console log one logs response holds. A full one means
+/// more was already there; ask again from where it ended.
+pub const LOG_CHUNK: u64 = 1 << 20;
 
 /// Bounds on `RunRequest.mem_mib` and `RunRequest.vcpus`. The CLI and the
 /// agent both enforce them; the agent's check is the one that counts, since

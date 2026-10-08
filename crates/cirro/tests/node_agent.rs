@@ -29,7 +29,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const HTTP_PORT: u16 = 8080;
@@ -52,77 +51,7 @@ static LIVE_OCTETS: std::sync::Mutex<std::collections::BTreeSet<u8>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 mod common;
-use common::{home, latest_kernel, repo_root, test_agent, test_agent_path};
-
-/// The rootfs images the tests boot, built once per test run without root
-/// (`mkfs.ext4 -d`). Every image carries the fixture commands under `/app`.
-struct Rootfs {
-    /// guest-init as `/init`.
-    guest_init: PathBuf,
-    /// No `/init` at all, so the guest never starts guest-init.
-    no_init: PathBuf,
-    /// A `/init` that isn't guest-init and never takes a config.
-    wrong_init: PathBuf,
-}
-
-fn rootfs() -> &'static Rootfs {
-    static ROOTFS: OnceLock<Rootfs> = OnceLock::new();
-    ROOTFS.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("node-agent-rootfs");
-        let tree = dir.join("tree");
-        let _ = std::fs::remove_dir_all(&dir);
-        for sub in ["proc", "sys", "dev", "app"] {
-            std::fs::create_dir_all(tree.join(sub)).expect("create rootfs tree");
-        }
-        for fixture in [
-            "http_app",
-            "ignore_term",
-            "exit_later",
-            "probe",
-            "whoami",
-            "spin",
-            "counter",
-            "dialer",
-        ] {
-            let status = std::process::Command::new("rustc")
-                .args(["--target", "x86_64-unknown-linux-musl", "-O", "-o"])
-                .arg(tree.join("app").join(fixture))
-                .arg(
-                    Path::new(env!("CARGO_MANIFEST_DIR"))
-                        .join(format!("tests/fixtures/{fixture}.rs")),
-                )
-                .status()
-                .expect("run rustc");
-            assert!(status.success(), "building the {fixture} fixture failed");
-        }
-        let no_init = make_image(&tree, &dir.join("no-init.ext4"));
-        std::fs::copy(tree.join("app/ignore_term"), tree.join("init"))
-            .expect("copy ignore_term in as /init");
-        let wrong_init = make_image(&tree, &dir.join("wrong-init.ext4"));
-        let guest_init_bin = repo_root()
-            .join("target/guest-init-embed/x86_64-unknown-linux-musl/release/guest-init");
-        std::fs::copy(&guest_init_bin, tree.join("init")).expect("copy guest-init into tree");
-        let guest_init = make_image(&tree, &dir.join("guest-init.ext4"));
-        Rootfs {
-            guest_init,
-            no_init,
-            wrong_init,
-        }
-    })
-}
-
-fn make_image(tree: &Path, image: &Path) -> PathBuf {
-    let file = std::fs::File::create(image).expect("create rootfs image");
-    file.set_len(64 * 1024 * 1024).expect("size rootfs image");
-    let status = std::process::Command::new("mkfs.ext4")
-        .args(["-q", "-F", "-d"])
-        .arg(tree)
-        .arg(image)
-        .status()
-        .expect("run mkfs.ext4");
-    assert!(status.success(), "mkfs.ext4 failed");
-    image.to_path_buf()
-}
+use common::{home, latest_kernel, repo_root, rootfs, test_agent, test_agent_path};
 
 /// A throwaway Node agent on Node subnet `10.77.<octet>.0/24`. It can be
 /// stopped and restarted on the same state dir, like the real one. Dropping
@@ -1000,6 +929,62 @@ fn graceful_stop_leaves_an_ended_vm_whose_logs_last_until_rm() {
     agent.cirro().args(["rm", "web"]).assert().success();
     assert!(row(&agent.ps(true), "web").is_none(), "rm left the record");
     agent.cirro().args(["logs", "web"]).assert().failure();
+    agent.assert_no_cirro_state();
+}
+
+#[test]
+fn logs_reads_a_long_console_log_whole_and_returns_while_it_still_grows() {
+    let Some(agent) = Agent::start(210) else {
+        return;
+    };
+
+    agent
+        .run("chatty", &rootfs().guest_init, &["/app/chatter"])
+        .success();
+    // Past the first of the agent's 1 MiB answers before reading. The
+    // console writes ~100-170 KB/s, so the log keeps growing as `logs`
+    // runs.
+    let log = agent.state_dir.join("logs/chatty.0.log");
+    let deadline = Instant::now() + 3 * TIMEOUT;
+    while std::fs::metadata(&log).map_or(0, |m| m.len()) < 5 << 18 {
+        assert!(
+            Instant::now() < deadline,
+            "chatter wrote only {:?} bytes",
+            std::fs::metadata(&log).map(|m| m.len())
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let logs = stdout(
+        agent
+            .cirro()
+            .args(["logs", "chatty"])
+            .timeout(TIMEOUT)
+            .assert()
+            .success(),
+    );
+    // The log was mid-write as it was read, so its last line can be cut.
+    let complete = &logs[..=logs.rfind('\n').expect("a whole line")];
+    let lines: Vec<&str> = complete
+        .lines()
+        .filter(|l| l.starts_with("CHATTER "))
+        .collect();
+    assert!(
+        logs.len() > 1 << 20,
+        "logs stopped inside the first 1 MiB answer: {} bytes",
+        logs.len()
+    );
+    // No line lost or doubled where one answer ends and the next begins.
+    for (n, line) in lines.iter().enumerate() {
+        assert_eq!(*line, format!("CHATTER {n:012}"));
+    }
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "chatty"])
+        .assert()
+        .success();
+    agent.cirro().args(["rm", "chatty"]).assert().success();
     agent.assert_no_cirro_state();
 }
 

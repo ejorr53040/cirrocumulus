@@ -28,8 +28,8 @@ use cirro_edge::acme::{Acme, is_public};
 use cirro_edge::tls::NodeCa;
 use cirro_edge::{Lease, Resolution, Router};
 use cirro_proto::{
-    EndReason, Ended, ErrorBody, MAX_MEM_MIB, MAX_VCPUS, MIN_MEM_MIB, MIN_VCPUS, Route, RunRequest,
-    Stats, StopRequest, VM_STATE_HEADER, VmInfo, VmStats,
+    EndReason, Ended, ErrorBody, LOG_CHUNK, MAX_MEM_MIB, MAX_VCPUS, MIN_MEM_MIB, MIN_VCPUS, Route,
+    RunRequest, Stats, StopRequest, VM_STATE_HEADER, VmInfo, VmStats,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -301,7 +301,7 @@ pub async fn run(config: Config) -> io::Result<()> {
             firecracker: config.firecracker,
             jailer: config.jailer,
             kernel: config.kernel,
-            jail_base: config.state_dir.join("jail"),
+            jail_base: vm::jail_base(&config.state_dir),
             node_address: config.subnet.node_address(),
             cirro_gid: gid,
         },
@@ -1305,12 +1305,8 @@ impl Agent {
             Some(entry @ Entry::Ended { .. }) => ("ended", entry.log().clone()),
             Some(entry) => ("running", entry.log().clone()),
         };
-        let mut bytes = Vec::new();
-        if let Ok(mut file) = std::fs::File::open(log) {
-            file.seek(SeekFrom::Start(offset))
-                .and_then(|_| file.read_to_end(&mut bytes))
-                .map_err(|e| internal(format!("read the console log: {e}")))?;
-        }
+        let bytes =
+            read_log(&log, offset).map_err(|e| internal(format!("read the console log: {e}")))?;
         Ok(Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/plain; charset=utf-8")
@@ -1558,6 +1554,18 @@ fn next_log_number(logs_dir: &Path) -> u64 {
         .map_or(0, |highest| highest + 1)
 }
 
+/// Up to [`LOG_CHUNK`] bytes of a console log from `offset`: empty past its
+/// end, or when it doesn't exist yet. A long-running App's log has no
+/// bound, so it is never read whole.
+fn read_log(log: &Path, offset: u64) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    if let Ok(mut file) = std::fs::File::open(log) {
+        file.seek(SeekFrom::Start(offset))?;
+        file.take(LOG_CHUNK).read_to_end(&mut bytes)?;
+    }
+    Ok(bytes)
+}
+
 /// `vcpus`/`mem_mib` (whichever `field` names) are within `[min, max]`, the
 /// same shape checked for both.
 fn in_bounds<T: PartialOrd + std::fmt::Display>(
@@ -1701,4 +1709,24 @@ fn json(status: StatusCode, body: &impl serde::Serialize) -> ApiResponse {
             serde_json::to_vec(body).expect("serialize response"),
         )))
         .expect("build response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_log_is_read_a_chunk_at_a_time_from_the_offset() {
+        let dir = crate::test_util::tempdir("cirro-agent-logs");
+        let log = dir.join("web.0.log");
+        let mut contents = vec![b'a'; LOG_CHUNK as usize];
+        contents.extend_from_slice(b"tail");
+        std::fs::write(&log, &contents).unwrap();
+
+        assert_eq!(read_log(&log, 0).unwrap().len(), LOG_CHUNK as usize);
+        assert_eq!(read_log(&log, LOG_CHUNK).unwrap(), b"tail");
+        assert!(read_log(&log, LOG_CHUNK + 4).unwrap().is_empty());
+        assert!(read_log(&dir.join("missing.log"), 0).unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
