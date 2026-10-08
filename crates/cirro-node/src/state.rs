@@ -8,7 +8,7 @@
 //! Console logs stay as files next to their record; the record names its file.
 
 use crate::vm::ProcessId;
-use cirro_proto::{EndReason, Ended, VmInfo};
+use cirro_proto::{EndReason, Ended, Route, VmInfo};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::io;
 use std::net::Ipv4Addr;
@@ -50,10 +50,32 @@ impl Store {
                  started_at INTEGER NOT NULL,
                  ended_at   INTEGER,
                  end_reason TEXT,
-                 log        TEXT NOT NULL
+                 log        TEXT NOT NULL,
+                 route_host TEXT,
+                 route_port INTEGER
              )",
         )
         .map_err(io_error)?;
+        // Databases from before routes (M7) lack their columns. Both are
+        // added in one transaction, so a crash can't leave one without the
+        // other.
+        let has_routes: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('vms') WHERE name = 'route_host'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(io_error)?
+            > 0;
+        if !has_routes {
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE vms ADD COLUMN route_host TEXT;
+                 ALTER TABLE vms ADD COLUMN route_port INTEGER;
+                 COMMIT;",
+            )
+            .map_err(io_error)?;
+        }
         let stored: Option<String> = conn
             .query_row("SELECT subnet FROM node", [], |row| row.get(0))
             .optional()
@@ -80,7 +102,7 @@ impl Store {
             .conn
             .prepare(
                 "SELECT name, vm_address, pid, pid_start, mem_mib, vcpus, started_at,
-                        ended_at, end_reason, log
+                        ended_at, end_reason, log, route_host, route_port
                  FROM vms ORDER BY name",
             )
             .map_err(io_error)?;
@@ -92,6 +114,8 @@ impl Store {
                 let ended_at: Option<i64> = row.get(7)?;
                 let end_reason: Option<String> = row.get(8)?;
                 let log: String = row.get(9)?;
+                let route_host: Option<String> = row.get(10)?;
+                let route_port: Option<u16> = row.get(11)?;
                 Ok(Record {
                     info: VmInfo {
                         name: row.get(0)?,
@@ -105,6 +129,9 @@ impl Store {
                                 reason: parse_reason(&reason)?,
                             })
                         }),
+                        route: route_host
+                            .zip(route_port)
+                            .map(|(host, port)| Route { host, port }),
                     },
                     log: PathBuf::from(log),
                     process: pid.zip(pid_start).map(|(pid, start_time)| ProcessId {
@@ -128,8 +155,9 @@ impl Store {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO vms
-                     (name, vm_address, pid, pid_start, mem_mib, vcpus, started_at, log)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     (name, vm_address, pid, pid_start, mem_mib, vcpus, started_at, log,
+                      route_host, route_port)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     info.name,
                     info.vm_address.map(|a| a.to_string()),
@@ -139,6 +167,8 @@ impl Store {
                     info.vcpus,
                     to_sql(info.started_at),
                     log.to_string_lossy(),
+                    info.route.as_ref().map(|r| &r.host),
+                    info.route.as_ref().map(|r| r.port),
                 ],
             )
             .map(drop)

@@ -36,6 +36,7 @@ cirro-proto = { path = "crates/cirro-proto", version = "0.1.0" }
 cirro-node = { path = "crates/cirro-node", version = "0.1.0" }
 cirro-image = { path = "crates/cirro-image", version = "0.1.0" }
 cirro-tui = { path = "crates/cirro-tui", version = "0.1.0" }
+cirro-edge = { path = "crates/cirro-edge", version = "0.1.0" }
 
 # Lints every crate opts into with `[lints] workspace = true`. CI runs
 # clippy with `-D warnings`, so "warn" here still fails the build.

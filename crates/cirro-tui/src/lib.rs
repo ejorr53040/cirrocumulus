@@ -113,6 +113,7 @@ mod tests {
                 vcpus: 1,
                 started_at: 0,
                 ended: None,
+                route: None,
             },
             history,
         }

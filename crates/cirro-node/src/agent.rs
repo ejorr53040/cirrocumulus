@@ -23,9 +23,10 @@ use crate::state::{Record, Store};
 use crate::subnet::Subnet;
 use crate::vm::{self, GuestConfig, Stop, Vm, VmSpec, WakeSpec};
 use bytes::Bytes;
+use cirro_edge::{Resolution, Router};
 use cirro_proto::{
-    EndReason, Ended, ErrorBody, MAX_MEM_MIB, MAX_VCPUS, MIN_MEM_MIB, MIN_VCPUS, RunRequest, Stats,
-    StopRequest, VM_STATE_HEADER, VmInfo, VmStats,
+    EndReason, Ended, ErrorBody, MAX_MEM_MIB, MAX_VCPUS, MIN_MEM_MIB, MIN_VCPUS, Route, RunRequest,
+    Stats, StopRequest, VM_STATE_HEADER, VmInfo, VmStats,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -36,22 +37,26 @@ use hyper_util::rt::TokioIo;
 use nix::sys::stat::{Mode, umask};
 use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, SeekFrom};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::net::UnixListener;
 use tokio::net::unix::UCred;
+use tokio::net::{TcpListener, UnixListener};
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 use tracing::{Instrument, error, info, info_span, warn};
 
 /// How long a graceful stop waits for the VM to end before killing it,
 /// unless the request says otherwise.
 const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the edge holds a request for an App that is starting or waking
+/// before answering 503.
+const HOLD_FOR_START: Duration = Duration::from_secs(30);
 
 /// How often the agent samples the Node and every running VM.
 const SAMPLE_EVERY: Duration = Duration::from_secs(1);
@@ -67,6 +72,8 @@ pub struct Config {
     pub firecracker: PathBuf,
     pub jailer: PathBuf,
     pub kernel: PathBuf,
+    /// Where the HTTP edge listens, if anywhere.
+    pub http: Option<SocketAddr>,
 }
 
 /// One name's record in the registry. Every VM start gets its own console
@@ -74,7 +81,11 @@ pub struct Config {
 /// the Ended VM it would have replaced.
 enum Entry {
     /// `Vm::start` is running; the entry reserves the name and VM address.
-    Starting { vm_address: Ipv4Addr, log: PathBuf },
+    Starting {
+        vm_address: Ipv4Addr,
+        log: PathBuf,
+        route: Option<Route>,
+    },
     /// Owned by a supervisor task, which `stops` reaches. `ended` turns true
     /// once the task has recorded the VM as ended.
     Running {
@@ -93,6 +104,13 @@ impl Entry {
             Entry::Starting { vm_address, .. } => Some(*vm_address),
             Entry::Running { info, .. } => info.vm_address,
             Entry::Ended { .. } => None,
+        }
+    }
+
+    fn route(&self) -> Option<&Route> {
+        match self {
+            Entry::Starting { route, .. } => route.as_ref(),
+            Entry::Running { info, .. } | Entry::Ended { info, .. } => info.route.as_ref(),
         }
     }
 
@@ -129,6 +147,21 @@ struct Agent {
     shutting_down: AtomicBool,
     /// What the Node and each running VM used, for `GET /stats`.
     metrics: Mutex<Recorder>,
+    /// Told whenever a start or wake has finished, either way, so requests
+    /// held for an App that was starting can look again.
+    settled: Notify,
+    /// Why each App's last wake failed, for requests that were held for it.
+    wake_failures: Mutex<BTreeMap<String, String>>,
+}
+
+/// Tells requests held for a start or wake that it has finished, however
+/// it finished, panics included.
+struct Settled(Arc<Agent>);
+
+impl Drop for Settled {
+    fn drop(&mut self) {
+        self.0.settled.notify_waiters();
+    }
 }
 
 /// Runs the agent until SIGTERM or SIGINT, then removes the socket. VMs,
@@ -181,8 +214,25 @@ pub async fn run(config: Config) -> io::Result<()> {
         next_log: AtomicU64::new(next_log_number(&logs_dir)),
         shutting_down: AtomicBool::new(false),
         metrics: Mutex::new(Recorder::default()),
+        settled: Notify::new(),
+        wake_failures: Mutex::new(BTreeMap::new()),
     });
     agent.reconcile().await?;
+    // Bound before the socket opens, so an edge that can't listen stops the
+    // start instead of leaving a Node whose Apps nothing can reach.
+    let edge = match config.http {
+        Some(address) => {
+            let listener = TcpListener::bind(address)
+                .await
+                .map_err(|e| io::Error::other(format!("listen for HTTP on {address}: {e}")))?;
+            info!(%address, "HTTP edge listening");
+            Some(tokio::spawn(cirro_edge::serve(
+                listener,
+                Arc::new(Edge(agent.clone())),
+            )))
+        }
+        None => None,
+    };
     let sampling = agent.clone();
     let sampler = tokio::spawn(async move {
         let sampler = Sampler::new(PathBuf::from("/"));
@@ -260,6 +310,9 @@ pub async fn run(config: Config) -> io::Result<()> {
 
     info!("shutting down; running VMs stay up");
     sampler.abort();
+    if let Some(edge) = edge {
+        edge.abort();
+    }
     let _ = std::fs::remove_file(&config.socket);
     agent.shutdown().await;
     Ok(())
@@ -405,6 +458,9 @@ impl Agent {
         }
         in_bounds("vcpus", run.vcpus, MIN_VCPUS, MAX_VCPUS)?;
         in_bounds("mem_mib", run.mem_mib, MIN_MEM_MIB, MAX_MEM_MIB)?;
+        if let Some(route) = &run.route {
+            validate_route(route)?;
+        }
         // Opened as the caller's own uid/gid, before anything else is
         // reserved: the agent runs as root, but a `cirro` group member
         // must never make it read a file (or device) they couldn't (#14).
@@ -445,6 +501,19 @@ impl Agent {
                 }
                 _ => {}
             }
+            if let Some(route) = &run.route
+                && let Some((owner, _)) = app_with_host(&vms, &route.host)
+                && *owner != run.name
+            {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "the hostname {:?} belongs to App {owner:?}; stop and rm it to free \
+                         the hostname",
+                        route.host
+                    ),
+                ));
+            }
             let vm_address = self.free_vm_address(&vms)?;
             // Reusing an Ended VM's name replaces its record once the new VM
             // has started.
@@ -453,6 +522,7 @@ impl Agent {
                 Entry::Starting {
                     vm_address,
                     log: log.clone(),
+                    route: run.route.clone(),
                 },
             ) {
                 Some(Entry::Ended { info, log }) => Some(Replaced { info, log }),
@@ -473,10 +543,16 @@ impl Agent {
         // Started on its own task, so the start runs to completion (success,
         // or a full unwind) even if the client disconnects and hyper drops
         // this request's future.
-        let name = run.name;
-        tokio::spawn(async move { self.start_vm(name, spec, replaced).await }.in_current_span())
-            .await
-            .unwrap_or_else(|e| Err(internal(format!("starting the VM panicked: {e}"))))
+        let (name, route) = (run.name, run.route);
+        tokio::spawn(
+            async move {
+                let _settled = Settled(self.clone());
+                self.start_vm(name, spec, route, replaced).await
+            }
+            .in_current_span(),
+        )
+        .await
+        .unwrap_or_else(|e| Err(internal(format!("starting the VM panicked: {e}"))))
     }
 
     /// The lowest VM address no entry in `vms` holds.
@@ -571,6 +647,7 @@ impl Agent {
                 Entry::Starting {
                     vm_address,
                     log: parked.log.clone(),
+                    route: parked.info.route.clone(),
                 },
             );
             let spec = WakeSpec {
@@ -584,9 +661,21 @@ impl Agent {
         };
         // On its own task, like a start, so it finishes even if the client
         // goes away.
-        tokio::spawn(async move { self.finish_wake(name, spec, parked).await }.in_current_span())
-            .await
-            .unwrap_or_else(|e| Err(internal(format!("waking the VM panicked: {e}"))))
+        tokio::spawn(
+            async move {
+                let _settled = Settled(self.clone());
+                let woken = self.clone().finish_wake(name.clone(), spec, parked).await;
+                let mut failures = self.wake_failures.lock().unwrap();
+                match &woken {
+                    Ok(_) => failures.remove(&name),
+                    Err(ApiError(_, why)) => failures.insert(name, why.clone()),
+                };
+                woken
+            }
+            .in_current_span(),
+        )
+        .await
+        .unwrap_or_else(|e| Err(internal(format!("waking the VM panicked: {e}"))))
     }
 
     async fn finish_wake(
@@ -625,6 +714,7 @@ impl Agent {
             vcpus: spec.vcpus,
             started_at: now(),
             ended: None,
+            route: parked.info.route.clone(),
         };
         let recorded =
             self.store
@@ -669,6 +759,7 @@ impl Agent {
         self: Arc<Self>,
         name: String,
         spec: VmSpec,
+        route: Option<Route>,
         replaced: Option<Replaced>,
     ) -> Result<ApiResponse, ApiError> {
         let vm = match Vm::start(&self.node, &spec)
@@ -692,6 +783,7 @@ impl Agent {
             vcpus: spec.vcpus,
             started_at: now(),
             ended: None,
+            route,
         };
         // A VM that isn't on record would be nobody's to stop after a restart.
         let recorded =
@@ -1002,6 +1094,132 @@ impl Agent {
         let _ = std::fs::remove_dir(&self.parked_dir);
         let _ = std::fs::remove_dir(vm::parent_cgroup());
     }
+}
+
+/// What the edge does next for a hostname, decided under the VM table's
+/// lock and acted on after it is released. Each carries the App's name.
+enum Step {
+    Answer(Resolution),
+    /// The App is starting or waking: hold the request until that settles.
+    Hold(String),
+    /// The App is parked: wake it.
+    Wake(String),
+}
+
+/// The agent as the edge's [`Router`]: a request for a parked App wakes it
+/// and is held until it runs, so the client sees latency, not an error.
+struct Edge(Arc<Agent>);
+
+impl Router for Edge {
+    async fn resolve(&self, host: &str) -> Resolution {
+        let agent = &self.0;
+        let deadline = tokio::time::Instant::now() + HOLD_FOR_START;
+        // Set once this request has held for a wake or tried one. Finding
+        // the App parked after that means the wake failed, and the request
+        // answers why instead of trying again.
+        let mut tried: Option<Option<String>> = None;
+        loop {
+            // Listening before looking, so a start that settles in between
+            // isn't missed.
+            let settled = agent.settled.notified();
+            tokio::pin!(settled);
+            settled.as_mut().enable();
+            match agent.step_for(host) {
+                Step::Answer(resolution) => return resolution,
+                Step::Hold(name) => {
+                    tried = Some(None);
+                    if tokio::time::timeout_at(deadline, settled).await.is_err() {
+                        return Resolution::Unavailable(still_starting(&name));
+                    }
+                }
+                Step::Wake(name) if tried.is_some() => {
+                    let why = tried
+                        .flatten()
+                        .or_else(|| agent.wake_failures.lock().unwrap().get(&name).cloned());
+                    return Resolution::Unavailable(why.unwrap_or_else(|| {
+                        format!("App {name:?} failed to wake; `cirro logs {name}` may say why")
+                    }));
+                }
+                Step::Wake(name) => {
+                    let woken =
+                        tokio::time::timeout_at(deadline, agent.clone().wake_vm(name.clone()));
+                    match woken.await {
+                        Err(_) => return Resolution::Unavailable(still_starting(&name)),
+                        Ok(Ok(_)) => info!(vm = name, host, "woke an App for a request"),
+                        // Another request's wake may have got there first,
+                        // or the App can't be woken (its snapshot is gone).
+                        Ok(Err(ApiError(StatusCode::CONFLICT, why))) => tried = Some(Some(why)),
+                        Ok(Err(ApiError(_, why))) => return Resolution::Unavailable(why),
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn still_starting(name: &str) -> String {
+    format!(
+        "App {name:?} is still starting after {HOLD_FOR_START:?}; try again shortly, or see \
+         `cirro logs {name}`"
+    )
+}
+
+impl Agent {
+    /// What a request for `host` needs next.
+    fn step_for(&self, host: &str) -> Step {
+        let vms = self.vms.lock().unwrap();
+        let Some((name, entry)) = app_with_host(&vms, host) else {
+            return Step::Answer(Resolution::NotFound);
+        };
+        let name = name.clone();
+        match entry {
+            Entry::Running { info, .. } => Step::Answer(match (info.vm_address, &info.route) {
+                (Some(address), Some(route)) => {
+                    Resolution::Upstream(SocketAddr::new(address.into(), route.port))
+                }
+                _ => Resolution::Unavailable(format!("App {name:?} has no VM address")),
+            }),
+            Entry::Starting { .. } => Step::Hold(name),
+            Entry::Ended { info, .. } if is_parked(info) => Step::Wake(name),
+            Entry::Ended { info, .. } => Step::Answer(Resolution::Unavailable(format!(
+                "App {name:?} has ended ({})",
+                info.ended.as_ref().map_or("unknown", |e| e.reason.as_str())
+            ))),
+        }
+    }
+}
+
+/// The App whose route has `host`, if any: its name and entry.
+fn app_with_host<'a>(
+    vms: &'a BTreeMap<String, Entry>,
+    host: &str,
+) -> Option<(&'a String, &'a Entry)> {
+    vms.iter()
+        .find(|(_, entry)| entry.route().is_some_and(|r| r.host == host))
+}
+
+/// A route's hostname is a DNS name as the edge compares it: lowercase
+/// labels of letters, digits and inner hyphens, without a trailing dot.
+fn validate_route(route: &Route) -> Result<(), ApiError> {
+    let host = &route.host;
+    let label_ok = |label: &str| {
+        (1..=63).contains(&label.len())
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    };
+    if host.len() > 253 || !host.split('.').all(label_ok) {
+        return Err(bad_request(&format!(
+            "{host:?} isn't a hostname: use lowercase letters, digits, hyphens and dots, \
+             like web.example.com"
+        )));
+    }
+    if route.port == 0 {
+        return Err(bad_request("the route's port must be 1-65535"));
+    }
+    Ok(())
 }
 
 fn is_parked(info: &VmInfo) -> bool {

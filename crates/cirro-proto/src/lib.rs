@@ -60,6 +60,19 @@ pub struct RunRequest {
     /// Who the command runs as inside the guest; root when unset.
     #[serde(default)]
     pub user: Option<User>,
+    /// Makes the VM an App: the Node's edge sends requests for the route's
+    /// hostname to it.
+    #[serde(default)]
+    pub route: Option<Route>,
+}
+
+/// An App's route: requests to the Node's edge for `host` go to `port` on
+/// the App's VM. A hostname belongs to at most one App on the Node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Route {
+    /// A DNS name in lowercase, without a trailing dot.
+    pub host: String,
+    pub port: u16,
 }
 
 /// A numeric user and group inside the guest.
@@ -80,6 +93,9 @@ pub struct VmInfo {
     /// Seconds since the Unix epoch, on the Node's clock.
     pub started_at: u64,
     pub ended: Option<Ended>,
+    /// Set for an App, and kept while it is parked or ended, until `rm`.
+    #[serde(default)]
+    pub route: Option<Route>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

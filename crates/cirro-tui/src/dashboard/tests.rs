@@ -12,6 +12,7 @@ fn vm(name: &str, cpu_percent: f64, memory_mib: u64) -> VmStats {
             vcpus: 1,
             started_at: 0,
             ended: None,
+            route: None,
         },
         history: vec![VmRates {
             cpu_percent,
