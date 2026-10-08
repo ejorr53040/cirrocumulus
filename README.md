@@ -11,10 +11,10 @@ Every workload gets its own Firecracker microVM, locked down with jailer.
 Manage everything from your terminal.
 
 > Pre-alpha: the single-node VM lifecycle (`node install`, `run` from an OCI
-> image or a rootfs, `image`, `ps`, `top`, `logs`, `stop`, `rm`,
-> `node uninstall`) works. `ssh`, `park`, `wake`, `bench`, `db` and the
-> multi-node control plane (`server`, `node join`) are listed in `--help` but
-> exit with "not yet implemented".
+> image or a rootfs, `image`, `ps`, `top`, `logs`, `stop`, `rm`, `park`,
+> `wake`, `bench`, `node uninstall`) works. `ssh`, `db` and the multi-node
+> control plane (`server`, `node join`) are listed in `--help` but exit with
+> "not yet implemented".
 
 ## Install
 
@@ -94,14 +94,22 @@ park and wake have no such wait.
 
 | Operation | p50 | p99 |
 | --- | ---: | ---: |
-| boot | 3155 ms | 3773 ms |
-| park | 274 ms | 463 ms |
-| wake | 158 ms | 409 ms |
+| boot | 2916 ms | 2947 ms |
+| park | 274 ms | 1854 ms |
+| wake | 43 ms | 54 ms |
 
-Wake misses the goal of a 100 ms p99. Firecracker's own log put one wake's
-snapshot load at about 17 ms, so most of the time is likely the host-side setup
-around it (network namespace, veth, NAT and jailer, each a separate
-process, then moving the snapshot into the jail); profiling it is the next step.
+Wake meets the goal of a 100 ms p99. A profiled wake (p50 of 20) spent about
+10 ms loading and resuming the snapshot in Firecracker; the rest is the host
+side. Firecracker takes about 25 ms to start under jailer, and the VM's network
+namespace and links (two `ip -batch` runs, `sysctl` and `nft`) are set up
+while it does, so that start is most of a wake. Then come moving the snapshot
+into the jail (under 1 ms), recording the VM, which doesn't wait for the disk
+([ADR 0006](docs/adr/0006-state-commits-dont-fsync.md)), and the CLI's round
+trip to the agent (a few ms).
+
+Park's tail is writing 256 MiB of guest memory to disk: on this btrfs it
+sometimes took over a second, and did so before these wake changes too (981 ms
+p99 over 10 runs of the earlier build).
 
 ## Development
 

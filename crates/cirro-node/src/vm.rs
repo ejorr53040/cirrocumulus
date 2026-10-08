@@ -88,6 +88,9 @@ const CGROUP_POLL_ATTEMPTS: u32 = 100;
 const CONSOLE_TAIL_LINES: usize = 10;
 /// How long jailer has to bring up Firecracker's API socket.
 const API_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often to look for that socket. Firecracker is up in ~25 ms, and a
+/// wake waits on it, so a coarse poll shows up in every wake's time.
+const API_SOCKET_POLL: Duration = Duration::from_millis(1);
 /// Fixed VMM overhead added to the guest's memory for the cgroup ceiling,
 /// until `cirro bench` measures it.
 const VMM_OVERHEAD_MIB: u64 = 32;
@@ -181,8 +184,9 @@ impl std::error::Error for Error {}
 /// A started VM, holding everything needed to tear it down.
 pub struct Vm {
     /// The VMM: jailer execs into Firecracker without forking, so this is
-    /// Firecracker itself once spawned. Always the last thing started, so
-    /// teardown kills it before unwinding `undo`.
+    /// Firecracker itself once spawned. Teardown kills it before unwinding
+    /// `undo`, so no undo step runs under a live VMM, though some (the
+    /// links, NAT) are pushed after it starts.
     vmm: Option<Vmm>,
     undo: Vec<Undo>,
     api_socket: PathBuf,
@@ -564,8 +568,9 @@ impl Vm {
     }
 
     /// Steps 1-4 of every VM start, whether booted or woken: the network
-    /// namespace and its links and NAT, the Node's route, and jailer up to
-    /// Firecracker's API socket. Returns the uid Firecracker runs as.
+    /// namespace, jailer in it, then the namespace's links and NAT and the
+    /// Node's route while Firecracker starts, and last Firecracker's API
+    /// socket. Returns the uid Firecracker runs as.
     async fn host_steps(
         &mut self,
         node: &NodeConfig,
@@ -579,68 +584,16 @@ impl Vm {
         let uid = VM_UID_BASE + (u32::from(c) << 8 | u32::from(d));
         let vm_addr = vm_address.to_string();
         let node_addr = node.node_address.to_string();
+        let uid_s = uid.to_string();
 
-        // 1. The VM's network namespace, with its tap inside.
+        // 1. The VM's network namespace.
         ip(&["netns", "add", &id]).await?;
         self.undo.push(Undo::netns(&id));
-        let uid_s = uid.to_string();
-        ip_in(&id, &["link", "set", "lo", "up"]).await?;
-        ip_in(
-            &id,
-            &[
-                "tuntap", "add", "dev", "tap0", "mode", "tap", "user", &uid_s, "group", &uid_s,
-            ],
-        )
-        .await?;
-        ip_in(
-            &id,
-            &["addr", "add", &format!("{GUEST_GATEWAY}/30"), "dev", "tap0"],
-        )
-        .await?;
-        ip_in(&id, &["link", "set", "tap0", "address", TAP_MAC]).await?;
-        ip_in(&id, &["link", "set", "tap0", "up"]).await?;
 
-        // 2. A veth pair to the Node, and 1:1 NAT between the Guest address
-        //    and the VM address inside the namespace.
-        ip(&[
-            "link", "add", &id, "type", "veth", "peer", "name", "veth0", "netns", &id,
-        ])
-        .await?;
-        self.undo.push(Undo::link(&id));
-        ip(&["addr", "add", &format!("{node_addr}/32"), "dev", &id]).await?;
-        ip(&["link", "set", &id, "up"]).await?;
-        ip_in(
-            &id,
-            &["addr", "add", &format!("{vm_addr}/32"), "dev", "veth0"],
-        )
-        .await?;
-        ip_in(&id, &["link", "set", "veth0", "up"]).await?;
-        ip_in(
-            &id,
-            &["route", "add", &format!("{node_addr}/32"), "dev", "veth0"],
-        )
-        .await?;
-        ip_in(
-            &id,
-            &["route", "add", "default", "via", &node_addr, "dev", "veth0"],
-        )
-        .await?;
-        in_netns(&id, &["sysctl", "-qw", "net.ipv4.ip_forward=1"]).await?;
-        nft_in(&id, &nat_ruleset(vm_address)).await?;
-
-        // 3. The Node's route to the VM address. Deleting the veth removes it.
-        ip(&[
-            "route",
-            "add",
-            &format!("{vm_addr}/32"),
-            "dev",
-            &id,
-            "src",
-            &node_addr,
-        ])
-        .await?;
-
-        // 4. jailer, in the namespace and under the VM's cgroup limits.
+        // 2. jailer, in the namespace and under the VM's cgroup limits. It
+        //    needs only the namespace to exist: Firecracker opens the tap at
+        //    boot or snapshot load, not at start, so it starts now and the
+        //    links below are set up while it does.
         enable_io_accounting();
         let root = jail_dir(node, &id).join("root");
         self.jail_root = root.clone();
@@ -699,6 +652,43 @@ impl Vm {
         }
         self.vmm = Some(Vmm::Child(child));
 
+        // 3. The tap inside the namespace, a veth pair to the Node, 1:1 NAT
+        //    between the Guest address and the VM address inside the
+        //    namespace, and the Node's route to the VM address (deleting the
+        //    veth removes it). One `ip -batch` on each side of the veth,
+        //    since every `ip` run costs a fork and exec on the wake path.
+        // The veth's undo goes first: a batch that fails after `link add`
+        // leaves it, and deleting a link that isn't there is a no-op.
+        self.undo.push(Undo::link(&id));
+        ip_batch(
+            None,
+            &[
+                format!("link add {id} type veth peer name veth0 netns {id}"),
+                format!("addr add {node_addr}/32 dev {id}"),
+                format!("link set {id} up"),
+                format!("route add {vm_addr}/32 dev {id} src {node_addr}"),
+            ],
+        )
+        .await?;
+        ip_batch(
+            Some(&id),
+            &[
+                "link set lo up".to_string(),
+                format!("tuntap add dev tap0 mode tap user {uid_s} group {uid_s}"),
+                format!("addr add {GUEST_GATEWAY}/30 dev tap0"),
+                format!("link set tap0 address {TAP_MAC}"),
+                "link set tap0 up".to_string(),
+                format!("addr add {vm_addr}/32 dev veth0"),
+                "link set veth0 up".to_string(),
+                format!("route add {node_addr}/32 dev veth0"),
+                format!("route add default via {node_addr} dev veth0"),
+            ],
+        )
+        .await?;
+        in_netns(&id, &["sysctl", "-qw", "net.ipv4.ip_forward=1"]).await?;
+        nft_in(&id, &nat_ruleset(vm_address)).await?;
+
+        // 4. Firecracker's API socket.
         let api_socket = root.join("run/firecracker.socket");
         self.api_socket = api_socket.clone();
         let deadline = Instant::now() + API_SOCKET_TIMEOUT;
@@ -715,7 +705,7 @@ impl Vm {
                     api_socket.display()
                 )));
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(API_SOCKET_POLL).await;
         }
 
         Ok(uid)
@@ -1024,15 +1014,15 @@ fn undo_steps(node: &NodeConfig, id: &str) -> Vec<Undo> {
     // Popped from the end, so the reverse of the order start pushes them.
     vec![
         Undo::netns(id),
-        Undo::link(id),
         Undo::jail_dir(node, id),
         Undo::cgroup(id),
+        Undo::link(id),
     ]
 }
 
 /// Removes everything the VM at `vm_address` may have left on the Node, for
 /// a VM that is gone or was never recorded: kills whatever still runs in its
-/// cgroup, then removes its cgroup, jail directory, veth and namespace.
+/// cgroup, then removes its veth, cgroup, jail directory and namespace.
 pub async fn clean_up(node: &NodeConfig, vm_address: Ipv4Addr) {
     let id = host_id(vm_address);
     kill_cgroup(&parent_cgroup().join(&id)).await;
@@ -1140,8 +1130,32 @@ async fn ip(args: &[&str]) -> Result<(), Error> {
     run(Command::new("ip").args(args), None).await
 }
 
-async fn ip_in(netns: &str, args: &[&str]) -> Result<(), Error> {
-    run(Command::new("ip").args(["-n", netns]).args(args), None).await
+/// Runs `ip` commands, one per line, in a single `ip -batch`, in `netns` if
+/// given. `ip` stops at the first command that fails.
+async fn ip_batch(netns: Option<&str>, commands: &[String]) -> Result<(), Error> {
+    let mut cmd = Command::new("ip");
+    if let Some(netns) = netns {
+        cmd.args(["-n", netns]);
+    }
+    run(
+        cmd.args(["-batch", "-"]),
+        Some(&(commands.join("\n") + "\n")),
+    )
+    .await
+    .map_err(|e| name_failed_batch_command(e, commands))
+}
+
+/// `ip -batch` reports a failure by line number (`Command failed -:2`);
+/// adds the command on that line, which the error doesn't otherwise show.
+fn name_failed_batch_command(e: Error, commands: &[String]) -> Error {
+    let command =
+        e.0.rsplit_once("Command failed -:")
+            .and_then(|(_, line)| line.trim().parse::<usize>().ok())
+            .and_then(|line| commands.get(line.checked_sub(1)?));
+    match command {
+        Some(command) => Error(format!("{} (`{command}`)", e.0)),
+        None => e,
+    }
 }
 
 async fn in_netns(netns: &str, argv: &[&str]) -> Result<(), Error> {
@@ -1196,4 +1210,34 @@ async fn run(cmd: &mut Command, stdin: Option<&str>) -> Result<(), Error> {
 
 fn err(what: &str, e: impl std::fmt::Display) -> Error {
     Error(format!("{what}: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_ip_batch_names_the_command_that_failed() {
+        let commands = ["link set lo up".to_string(), "link set tap0 up".to_string()];
+        let failed = Error(
+            "\"ip\" \"-batch\" \"-\" failed: exit status: 1: \
+             Cannot find device \"tap0\"\nCommand failed -:2"
+                .into(),
+        );
+        let named = name_failed_batch_command(failed, &commands).to_string();
+        assert!(
+            named.contains("`link set tap0 up`"),
+            "should name line 2's command: {named}"
+        );
+    }
+
+    #[test]
+    fn a_batch_error_without_a_line_number_is_left_as_it_is() {
+        let commands = ["link set lo up".to_string()];
+        let failed = Error("spawn ip: No such file or directory".into());
+        assert_eq!(
+            name_failed_batch_command(failed, &commands).to_string(),
+            "spawn ip: No such file or directory"
+        );
+    }
 }
