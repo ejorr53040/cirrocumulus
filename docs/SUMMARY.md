@@ -24,6 +24,7 @@
 - [0006 State commits don't fsync](adr/0006-state-commits-dont-fsync.md)
 - [0007 The edge is hyper in the agent](adr/0007-edge-in-the-agent-on-hyper.md)
 - [0008 ACME over HTTP-01 from the edge](adr/0008-acme-over-http-01-from-the-edge.md)
+- [0009 Install opens the host firewall for the Node subnet](adr/0009-install-opens-the-host-firewall-for-the-node-subnet.md)
 
 # Measurements
 

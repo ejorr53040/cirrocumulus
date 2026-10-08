@@ -35,9 +35,9 @@ expect "step0 shell scripts" "$nothing" $'scripts/step0/build_rootfs_nat.sh\nscr
 expect "other CI scripts" "$nothing" $'scripts/ci/check-commits.sh\n.githooks/pre-push'
 
 expect "one crate" $'rust=true\nsupply_chain=true\ncrates=cirro-node' \
-    'crates/cirro-node/src/network.rs'
+    'crates/cirro-node/src/egress.rs'
 expect "two crates, sorted and deduplicated" $'rust=true\nsupply_chain=true\ncrates=cirro-node guest-init' \
-    $'crates/guest-init/src/main.rs\ncrates/cirro-node/src/network.rs\ncrates/cirro-node/tests/network.rs'
+    $'crates/guest-init/src/main.rs\ncrates/cirro-node/src/egress.rs\ncrates/cirro-node/tests/jailer.rs'
 expect "crate plus docs" $'rust=true\nsupply_chain=true\ncrates=cirro' \
     $'crates/cirro/src/main.rs\nCONTEXT.md'
 

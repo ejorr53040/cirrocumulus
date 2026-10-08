@@ -1,0 +1,12 @@
+#!/bin/sh
+# A static page plus /cgi-bin/status. The status shows the boot_id and
+# uptime, so after a park and wake you can see it's the same boot resumed,
+# not a fresh one. START_DELAY (seconds) holds off listening, to watch the
+# edge hold a request while an App comes up.
+port="${PORT:-80}"
+if [ -n "$START_DELAY" ]; then
+    echo "hello-http: waiting ${START_DELAY}s before listening"
+    sleep "$START_DELAY"
+fi
+echo "hello-http: serving on :$port"
+exec httpd -f -vv -p "$port" -h /www

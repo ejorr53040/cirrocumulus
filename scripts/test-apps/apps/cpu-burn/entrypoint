@@ -1,0 +1,10 @@
+#!/bin/sh
+# Spins WORKERS busy loops (default 1), to watch CPU in `cirro top`.
+workers="${WORKERS:-1}"
+echo "cpu-burn: $workers busy loop(s)"
+i=0
+while [ "$i" -lt "$workers" ]; do
+    ( while :; do :; done ) &
+    i=$((i + 1))
+done
+wait

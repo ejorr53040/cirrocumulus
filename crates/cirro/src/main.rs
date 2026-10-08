@@ -6,7 +6,9 @@ use cirro_image::run_config::merge_env;
 use cirro_node::agent;
 use cirro_node::release::ReleaseBinaries;
 use cirro_node::subnet::Subnet;
-use cirro_proto::{Route, RunRequest, Stats, StopRequest, User, VM_STATE_HEADER, VmInfo};
+use cirro_proto::{
+    LOG_CHUNK, Route, RunRequest, Stats, StopRequest, User, VM_STATE_HEADER, VmInfo,
+};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use hyper::Method;
 use std::io::{self, Write};
@@ -203,7 +205,7 @@ enum NodeCommand {
         /// The state dir `install` was given
         #[arg(long, default_value = "/var/lib/cirro")]
         state_dir: PathBuf,
-        /// Uninstall even if VMs are still running
+        /// Uninstall even if VMs are still running, killing them
         #[arg(long)]
         force: bool,
     },
@@ -396,6 +398,7 @@ fn main() -> ExitCode {
             Command::Node(NodeCommand::Ca) => node_ca(&cli.socket).await,
             Command::Node(NodeCommand::Uninstall { state_dir, force }) => {
                 cirro_node::install::uninstall(&state_dir, force)
+                    .await
                     .map_err(|e| format!("node uninstall: {e}"))
             }
             _ => Err(format!("{}: not yet implemented", command_path(&matches))),
@@ -850,6 +853,12 @@ async fn logs(socket: &Path, name: &str, follow: bool) -> Result<(), String> {
             .and_then(|()| out.flush())
             .map_err(|e| format!("writing the log: {e}"))?;
         offset += bytes.len() as u64;
+        // A full chunk means the log already held more. Anything short is
+        // where it ended as it was read, so a plain `logs` stops there even
+        // while the App keeps writing.
+        if bytes.len() as u64 == LOG_CHUNK {
+            continue;
+        }
         // The agent reads the VM's state before its log, so once it says
         // ended, this read got everything.
         let ended = headers

@@ -11,13 +11,11 @@ cirro-proto.workspace = true
 cirro-edge.workspace = true
 serde = { workspace = true, features = ["derive"] }
 bytes.workspace = true
-futures-util.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 hyperlocal.workspace = true
-nix = { workspace = true, features = ["ioctl", "fs", "signal", "socket", "uio", "user"] }
-rtnetlink.workspace = true
+nix = { workspace = true, features = ["fs", "signal", "socket", "uio", "user"] }
 rusqlite.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
