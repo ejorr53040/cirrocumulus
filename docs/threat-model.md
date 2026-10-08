@@ -83,8 +83,9 @@ A manual source review on 2026-09-28 found one High (the agent would boot
 any host path as a rootfs; it now opens the rootfs as the caller, #14), three
 Mediums (resource bounds checked only in the CLI, an unverified guest kernel
 download, an unsigned demo package install), all fixed, and two Lows still open
-(the development sudoers rule's breadth, two unused modules with their own
-`sudo` calls). The OCI layer parser and guest-init's config parser have
+(the development sudoers rule's breadth, and `jailer::Jail`, which only
+the step 0 tests use, with its own `sudo` call; the other unused module is
+gone). The OCI layer parser and guest-init's config parser have
 been fuzzed for minutes, not days ([fuzz/README.md](https://github.com/ejorr53040/cirrocumulus/blob/main/fuzz/README.md)),
 with nothing found. No third party has audited Cirrocumulus. `cargo deny` checks every
 dependency against the RustSec advisory database in CI.

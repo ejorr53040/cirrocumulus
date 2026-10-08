@@ -14,7 +14,7 @@ use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, Uri, Version};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -27,6 +27,10 @@ use tracing::{debug, warn};
 
 /// How long a client has to finish its TLS handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a client has to send each request's headers, the first one
+/// and each one after on a kept-alive connection.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the edge waits to connect to an App's VM before answering 502.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -159,7 +163,11 @@ where
         let (router, scheme) = (router.clone(), scheme.clone());
         async move { Ok::<_, hyper::Error>(handle(req, router.as_ref(), peer, &scheme).await) }
     });
+    // hyper skips its default header timeout without a timer, which would
+    // let idle clients hold the agent's file descriptors forever.
     if let Err(e) = http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
         .serve_connection(TokioIo::new(stream), service)
         .await
     {
