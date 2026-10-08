@@ -22,7 +22,7 @@ mkdir -p "$BUILD_DIR"
 
 # Keep in sync with crates/cirro-node/src/release.rs's KERNEL_URL/KERNEL_SHA256.
 KERNEL_URL="https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260929-a738f18a8db0-0/x86_64/vmlinux-6.18.48"
-KERNEL_SHA256="9204218e8bcca6ac23848d74f45df2eb19d7f31e8277840a7d145a0df8b078d2"
+KERNEL_SHA256="b0ff002711a6be32f2f5cbc21fbb7b2987b7807e0d37540034d49db22ce3d06b"
 KERNEL_FILE="$BUILD_DIR/$(basename "$KERNEL_URL")"
 
 verify() {

@@ -1,5 +1,6 @@
 [package]
 name = "cirro-edge"
+description = "Cirrocumulus's edge: an HTTP(S) reverse proxy that routes to Apps by hostname, with a Node CA and ACME certificates."
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -10,11 +11,18 @@ bytes.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+instant-acme.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
 tokio-rustls.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+x509-parser.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
 
 [lints]
 workspace = true

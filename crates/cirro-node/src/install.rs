@@ -1,7 +1,8 @@
 //! `cirro node install` / `cirro node uninstall` (#11): sets up (and tears
 //! back down) everything a Node needs before `cirro node agent` can run --
 //! prerequisites, the pinned Firecracker/jailer/kernel, the `cirro` group,
-//! the state dir, and a systemd unit that starts the agent at boot.
+//! the state dir, a host firewall rule letting VMs' traffic be forwarded,
+//! and a systemd unit that starts the agent at boot.
 //!
 //! Everything install writes is recorded in one `NodeConfig` file at
 //! `<state_dir>/node.json`, so uninstall doesn't need to be told the same
@@ -12,8 +13,9 @@
 
 use crate::egress;
 use crate::release::{self, ReleaseBinaries};
-use crate::state::Store;
+use crate::state::{Record, Store};
 use crate::subnet::Subnet;
+use crate::vm;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
@@ -37,6 +39,34 @@ pub struct InstallConfig {
     /// `node agent`'s own `--firecracker`/`--jailer`/`--kernel` flags use,
     /// so tests can point install at local fixtures instead of the network.
     pub release_override: Option<ReleaseBinaries>,
+    /// The edge the agent serves, passed on to `cirro node agent`.
+    pub edge: EdgeConfig,
+}
+
+/// Where the agent's edge listens, and whether it gets ACME certificates:
+/// `cirro node agent`'s `--http`, `--https` and `--acme-email`.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct EdgeConfig {
+    pub http: Option<std::net::SocketAddr>,
+    pub https: Option<std::net::SocketAddr>,
+    pub acme_email: Option<String>,
+}
+
+impl EdgeConfig {
+    /// The `cirro node agent` arguments for it, each with a leading space.
+    fn agent_args(&self) -> String {
+        let mut args = String::new();
+        if let Some(http) = self.http {
+            args.push_str(&format!(" --http {http}"));
+        }
+        if let Some(https) = self.https {
+            args.push_str(&format!(" --https {https}"));
+        }
+        if let Some(email) = &self.acme_email {
+            args.push_str(&format!(" --acme-email {email}"));
+        }
+        args
+    }
 }
 
 /// Everything install resolved, persisted so uninstall (and a future
@@ -50,6 +80,9 @@ struct NodeConfig {
     unit_name: String,
     #[serde(flatten)]
     release: ReleaseBinaries,
+    /// Missing from a Node config written before the edge (M7).
+    #[serde(default)]
+    edge: EdgeConfig,
 }
 
 /// Checks KVM and cgroup v2 -- the successor to `scripts/step0/prereqs.sh`'s
@@ -119,8 +152,11 @@ pub fn install(cfg: &InstallConfig) -> io::Result<()> {
         subnet: cfg.subnet.to_string(),
         unit_name: cfg.unit_name.clone(),
         release,
+        edge: cfg.edge.clone(),
     };
     write_node_config(&cfg.state_dir, &node_config)?;
+
+    allow_through_host_firewall(&node_config.subnet)?;
 
     install_unit(&node_config, &cfg.state_dir)?;
 
@@ -128,11 +164,12 @@ pub fn install(cfg: &InstallConfig) -> io::Result<()> {
 }
 
 /// Reverses [`install`]: refuses while a VM is still running unless
-/// `force`, then removes the systemd unit, the group, the egress policy,
-/// restores `net.ipv4.ip_forward`, and removes the state dir -- everything
+/// `force`, which kills them, then removes the systemd unit, the group,
+/// the host firewall rule, the egress policy, restores
+/// `net.ipv4.ip_forward`, and removes the state dir -- everything
 /// install created, and everything the agent itself created while it ran
 /// (the egress table, `ip_forward.before`).
-pub fn uninstall(state_dir: &Path, force: bool) -> io::Result<()> {
+pub async fn uninstall(state_dir: &Path, force: bool) -> io::Result<()> {
     let node_config = read_node_config(state_dir).map_err(|e| {
         io::Error::other(format!(
             "{}: {e} (nothing installed here?)",
@@ -145,7 +182,12 @@ pub fn uninstall(state_dir: &Path, force: bool) -> io::Result<()> {
     }
 
     remove_unit(&node_config.unit_name)?;
+    // Once the agent is stopped, so it can't take them back, and before the
+    // egress policy goes: a VM left running would outlive it, free to reach
+    // the LAN.
+    clean_up_vms(state_dir, &node_config).await?;
     let _ = remove_group(&node_config.group);
+    remove_from_host_firewall(&node_config.subnet);
     let _ = egress::remove_node_policy();
     egress::restore_ip_forward(&state_dir.join(IP_FORWARD_RECORD))?;
 
@@ -153,13 +195,40 @@ pub fn uninstall(state_dir: &Path, force: bool) -> io::Result<()> {
     Ok(())
 }
 
-fn refuse_if_vms_running(state_dir: &Path, subnet: &str) -> io::Result<()> {
+/// The records of every VM in `state_dir`, none before the agent first ran.
+fn records(state_dir: &Path, subnet: &str) -> io::Result<Vec<Record>> {
     let db = state_dir.join("state.db");
     if !db.exists() {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    let running: Vec<String> = Store::open(&db, subnet)?
-        .load()?
+    Store::open(&db, subnet)?.load()
+}
+
+/// Kills every VM the Node has a record of and removes its host state, as
+/// the agent does for a VM that is gone. Ended VMs too: one whose VMM died
+/// can still have its namespace, veth or cgroup until the agent next
+/// starts, and after uninstall it never will.
+async fn clean_up_vms(state_dir: &Path, config: &NodeConfig) -> io::Result<()> {
+    let subnet: Subnet = config.subnet.parse().map_err(io::Error::other)?;
+    let node = vm::NodeConfig {
+        firecracker: config.release.firecracker.clone(),
+        jailer: config.release.jailer.clone(),
+        kernel: config.release.kernel.clone(),
+        jail_base: vm::jail_base(state_dir),
+        node_address: subnet.node_address(),
+        // Only used to hand a new VM's console log to the group.
+        cirro_gid: 0,
+    };
+    for record in records(state_dir, &config.subnet)? {
+        if let Some(vm_address) = record.info.vm_address {
+            vm::clean_up(&node, vm_address).await;
+        }
+    }
+    Ok(())
+}
+
+fn refuse_if_vms_running(state_dir: &Path, subnet: &str) -> io::Result<()> {
+    let running: Vec<String> = records(state_dir, subnet)?
         .into_iter()
         .filter(|r| r.process.is_some_and(|p| p.is_running()))
         .map(|r| r.info.name)
@@ -196,6 +265,83 @@ fn remove_group(name: &str) -> io::Result<()> {
     set_group_existence(name, false, "groupdel")
 }
 
+/// The comment ufw shows beside the rule, so `ufw status` says whose it is.
+const UFW_COMMENT: &str = "cirro Node VMs";
+
+/// Lets the Node subnet's forwarded traffic past a host firewall whose
+/// default is to drop it: ufw's `DEFAULT_FORWARD_POLICY="DROP"`, or
+/// firewalld's zones. The egress policy's own drops (SMTP, other VMs, the
+/// LAN, the Node) still apply, since a drop is final across tables (see
+/// `egress`'s module doc); this only stops the host firewall dropping the
+/// rest, the internet traffic VMs are meant to have. Fails install if a
+/// firewall that is there refuses the rule.
+fn allow_through_host_firewall(subnet: &str) -> io::Result<()> {
+    for mut command in host_firewall_commands(subnet, true) {
+        run(&mut command)?;
+    }
+    Ok(())
+}
+
+/// Reverses [`allow_through_host_firewall`]. Best-effort, like the rest
+/// of uninstall: a rule that's already gone isn't a failure.
+fn remove_from_host_firewall(subnet: &str) {
+    for mut command in host_firewall_commands(subnet, false) {
+        let _ = run(&mut command);
+    }
+}
+
+/// The commands that add (`allow`) or remove the Node subnet's rule.
+///
+/// The ufw rule matches traffic in on the VMs' veths from the subnet, with
+/// no egress interface, so it keeps working when the default route moves
+/// (Wi-Fi to Ethernet). It is there whenever ufw is installed, even
+/// inactive, so turning ufw on later doesn't cut VMs off. firewalld gets
+/// the subnet as a source of its `trusted` zone, at runtime and in its
+/// saved config while it runs, and in its saved config alone through
+/// `firewall-offline-cmd` while it doesn't. Adding a rule that's there is
+/// a no-op for both.
+fn host_firewall_commands(subnet: &str, allow: bool) -> Vec<Command> {
+    let mut commands = Vec::new();
+    if succeeds("ufw", "version") {
+        let mut ufw = Command::new("ufw");
+        ufw.args(ufw_route_rule(subnet, allow));
+        commands.push(ufw);
+    }
+    let source = format!("--{}-source={subnet}", if allow { "add" } else { "remove" });
+    let firewalld = |program: &str, permanent: bool| {
+        let mut command = Command::new(program);
+        command.args(permanent.then_some("--permanent"));
+        command.args(["--zone=trusted", &source]);
+        command
+    };
+    if succeeds("firewall-cmd", "--state") {
+        commands.push(firewalld("firewall-cmd", false));
+        commands.push(firewalld("firewall-cmd", true));
+    } else if succeeds("firewall-offline-cmd", "--version") {
+        commands.push(firewalld("firewall-offline-cmd", false));
+    }
+    commands
+}
+
+/// `ufw route [delete] allow ...` for the Node subnet.
+fn ufw_route_rule(subnet: &str, allow: bool) -> Vec<&str> {
+    let mut args = vec!["route"];
+    if !allow {
+        args.push("delete");
+    }
+    args.extend(["allow", "in", "on", "cirro-+", "from", subnet]);
+    args.extend(["comment", UFW_COMMENT]);
+    args
+}
+
+/// Whether `program arg` runs and exits 0.
+fn succeeds(program: &str, arg: &str) -> bool {
+    Command::new(program)
+        .arg(arg)
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
 fn write_node_config(state_dir: &Path, config: &NodeConfig) -> io::Result<()> {
     let json = serde_json::to_string_pretty(config).map_err(io::Error::other)?;
     fs::write(state_dir.join(NODE_CONFIG_FILE), json)
@@ -221,8 +367,9 @@ fn install_unit(config: &NodeConfig, state_dir: &Path) -> io::Result<()> {
          [Service]\n\
          ExecStart={bin} node agent --socket {socket} --socket-group {group} \
          --subnet {subnet} --state-dir {state_dir} --firecracker {firecracker} \
-         --jailer {jailer} --kernel {kernel}\n\
+         --jailer {jailer} --kernel {kernel}{edge}\n\
          Restart=on-failure\n\
+         LimitNOFILE=65536\n\
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n",
@@ -234,6 +381,7 @@ fn install_unit(config: &NodeConfig, state_dir: &Path) -> io::Result<()> {
         firecracker = config.release.firecracker.display(),
         jailer = config.release.jailer.display(),
         kernel = config.release.kernel.display(),
+        edge = config.edge.agent_args(),
     );
     let unit_path = unit_path(&config.unit_name);
     fs::write(&unit_path, unit)?;
@@ -280,6 +428,22 @@ mod tests {
     /// for (covered instead by `crates/cirro/tests/node_install.rs`).
     fn tempdir() -> PathBuf {
         crate::test_util::tempdir("cirro-install-test")
+    }
+
+    #[test]
+    fn ufw_rule_routes_the_subnet_in_from_vm_veths_to_anywhere() {
+        assert_eq!(
+            ufw_route_rule("10.77.0.0/24", true).join(" "),
+            "route allow in on cirro-+ from 10.77.0.0/24 comment cirro Node VMs"
+        );
+    }
+
+    #[test]
+    fn ufw_delete_names_the_same_rule_install_added() {
+        let added = ufw_route_rule("10.77.0.0/24", true);
+        let deleted = ufw_route_rule("10.77.0.0/24", false);
+        assert_eq!(deleted[..2], ["route", "delete"]);
+        assert_eq!(deleted[2..], added[1..]);
     }
 
     #[test]

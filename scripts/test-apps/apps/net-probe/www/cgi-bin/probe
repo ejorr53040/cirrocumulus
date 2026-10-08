@@ -1,0 +1,35 @@
+#!/bin/sh
+# Each probe is "label host port expected". "connected" means a TCP
+# handshake finished; "refused" means a host answered with a reset (so it
+# was reachable); "blocked" means no answer before the timeout, which is
+# what the Node's drop rules look like. Override with PROBES, one per line.
+gw=$(ip route | awk '/default/ {print $3; exit}')
+default_probes="internet-https 1.1.1.1 443 connected
+dns-name       example.com 443 connected
+smtp-587       smtp.gmail.com 587 connected
+smtp-25        smtp.gmail.com 25 blocked
+lan            192.168.1.1 80 blocked
+other-vm       10.77.0.3 80 blocked
+node-itself    ${gw:-10.77.0.1} 22 blocked
+metadata       169.254.169.254 80 blocked"
+
+probe() {
+    out=$(nc -w "${TIMEOUT:-3}" "$1" "$2" </dev/null 2>&1)
+    case $? in
+        0) echo connected ;;
+        *) case "$out" in
+               *refused*) echo refused ;;
+               *"bad address"*) echo no-dns ;;
+               *) echo blocked ;;
+           esac ;;
+    esac
+}
+
+printf 'Content-Type: text/plain\r\n\r\n'
+printf '%-15s %-22s %-10s %-10s %s\n' PROBE TARGET EXPECTED GOT OK
+echo "${PROBES:-$default_probes}" | while read -r label host port want; do
+    [ -z "$label" ] && continue
+    got=$(probe "$host" "$port")
+    ok=yes; [ "$got" = "$want" ] || ok=NO
+    printf '%-15s %-22s %-10s %-10s %s\n' "$label" "$host:$port" "$want" "$got" "$ok"
+done

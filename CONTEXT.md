@@ -68,3 +68,11 @@ _Avoid_: internal IP, VM IP
 **Edge**:
 The HTTP(S) reverse proxy in the Node agent that receives requests from outside the Node and sends each to the App whose Route names its hostname.
 _Avoid_: router (except the `Router` trait the edge asks), load balancer, ingress controller
+
+**Node CA**:
+The certificate authority each Node makes for itself, which signs the Edge's certificates for hostnames that aren't public. Clients trust it with `cirro node ca`.
+_Avoid_: root CA, self-signed certificate (each certificate is signed by the Node CA, not by itself)
+
+**Public hostname**:
+A Route's hostname under a top-level domain anyone can register, so an ACME CA can certify it; `.test`, `.local`, `.internal` and the other reserved or private-use names are not.
+_Avoid_: external hostname, real domain

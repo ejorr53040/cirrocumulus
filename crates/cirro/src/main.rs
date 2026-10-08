@@ -6,7 +6,9 @@ use cirro_image::run_config::merge_env;
 use cirro_node::agent;
 use cirro_node::release::ReleaseBinaries;
 use cirro_node::subnet::Subnet;
-use cirro_proto::{Route, RunRequest, Stats, StopRequest, User, VM_STATE_HEADER, VmInfo};
+use cirro_proto::{
+    LOG_CHUNK, Route, RunRequest, Stats, StopRequest, User, VM_STATE_HEADER, VmInfo,
+};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use hyper::Method;
 use std::io::{self, Write};
@@ -20,10 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// image writes these bytes out as the guest's `/init`. `build.rs` builds
 /// guest-init as part of building `cirro` itself, so this path always
 /// exists by the time this file is compiled.
-pub(crate) static GUEST_INIT_BINARY: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../target/guest-init-embed/x86_64-unknown-linux-musl/release/guest-init"
-));
+pub(crate) static GUEST_INIT_BINARY: &[u8] = include_bytes!(env!("CIRRO_GUEST_INIT"));
 
 /// Where the CLI finds the Node agent unless told otherwise.
 const DEFAULT_SOCKET: &str = "/run/cirro/agent.sock";
@@ -190,13 +189,23 @@ enum NodeCommand {
         /// Use this guest kernel instead of fetching the pinned release
         #[arg(long, requires = "firecracker", requires = "jailer")]
         kernel: Option<PathBuf>,
+        /// Serve the HTTP edge on this address (e.g. 0.0.0.0:80)
+        #[arg(long, value_name = "ADDRESS:PORT")]
+        http: Option<SocketAddr>,
+        /// Serve the HTTPS edge on this address (e.g. 0.0.0.0:443)
+        #[arg(long, value_name = "ADDRESS:PORT")]
+        https: Option<SocketAddr>,
+        /// Get public hostnames' certificates from Let's Encrypt, with this
+        /// contact address, agreeing to its terms of service
+        #[arg(long, requires = "https", requires = "http")]
+        acme_email: Option<String>,
     },
     /// Reverse `install`: refuses while a VM is running unless `--force`
     Uninstall {
         /// The state dir `install` was given
         #[arg(long, default_value = "/var/lib/cirro")]
         state_dir: PathBuf,
-        /// Uninstall even if VMs are still running
+        /// Uninstall even if VMs are still running, killing them
         #[arg(long)]
         force: bool,
     },
@@ -231,6 +240,23 @@ enum NodeCommand {
         /// certificates from the Node's own CA (`cirro node ca`)
         #[arg(long, value_name = "ADDRESS:PORT")]
         https: Option<SocketAddr>,
+        /// Get public hostnames' certificates from an ACME CA (Let's
+        /// Encrypt unless --acme-directory says otherwise), with this
+        /// contact address, agreeing to the CA's terms of service. Needs
+        /// the HTTP edge on port 80.
+        #[arg(long, requires = "https", requires = "http")]
+        acme_email: Option<String>,
+        /// The ACME CA's directory URL
+        #[arg(
+            long,
+            requires = "acme_email",
+            default_value = "https://acme-v02.api.letsencrypt.org/directory"
+        )]
+        acme_directory: String,
+        /// Trust this CA certificate (PEM) for the ACME directory, e.g. a
+        /// test CA's
+        #[arg(long, requires = "acme_email")]
+        acme_root: Option<PathBuf>,
     },
 }
 
@@ -290,6 +316,9 @@ fn main() -> ExitCode {
                 kernel,
                 http,
                 https,
+                acme_email,
+                acme_directory,
+                acme_root,
             }) => {
                 init_agent_logging();
                 agent::run(agent::Config {
@@ -302,6 +331,11 @@ fn main() -> ExitCode {
                     kernel,
                     http,
                     https,
+                    acme: acme_email.map(|email| agent::AcmeConfig {
+                        directory: acme_directory,
+                        email,
+                        root: acme_root,
+                    }),
                 })
                 .await
                 .map_err(|e| format!("node agent: {e}"))
@@ -329,6 +363,9 @@ fn main() -> ExitCode {
                 firecracker,
                 jailer,
                 kernel,
+                http,
+                https,
+                acme_email,
             }) => cirro_image::check_mke2fs()
                 .map_err(|e| io::Error::other(e.0))
                 .and_then(|()| {
@@ -338,6 +375,11 @@ fn main() -> ExitCode {
                         group,
                         subnet,
                         unit_name,
+                        edge: cirro_node::install::EdgeConfig {
+                            http,
+                            https,
+                            acme_email,
+                        },
                         // `requires` on all three CLI args above guarantees this is
                         // never a partial combination.
                         release_override: match (firecracker, jailer, kernel) {
@@ -356,6 +398,7 @@ fn main() -> ExitCode {
             Command::Node(NodeCommand::Ca) => node_ca(&cli.socket).await,
             Command::Node(NodeCommand::Uninstall { state_dir, force }) => {
                 cirro_node::install::uninstall(&state_dir, force)
+                    .await
                     .map_err(|e| format!("node uninstall: {e}"))
             }
             _ => Err(format!("{}: not yet implemented", command_path(&matches))),
@@ -810,6 +853,12 @@ async fn logs(socket: &Path, name: &str, follow: bool) -> Result<(), String> {
             .and_then(|()| out.flush())
             .map_err(|e| format!("writing the log: {e}"))?;
         offset += bytes.len() as u64;
+        // A full chunk means the log already held more. Anything short is
+        // where it ended as it was read, so a plain `logs` stops there even
+        // while the App keeps writing.
+        if bytes.len() as u64 == LOG_CHUNK {
+            continue;
+        }
         // The agent reads the VM's state before its log, so once it says
         // ended, this read got everything.
         let ended = headers

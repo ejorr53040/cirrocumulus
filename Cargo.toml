@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+# Built with nightly by `cargo fuzz`; see fuzz/README.md.
+exclude = ["fuzz"]
 
 [workspace.package]
 edition = "2024"
@@ -21,9 +23,7 @@ bytes = "1"
 serde = "1"
 serde_json = "1"
 nix = "0.31.3"
-rtnetlink = "0.23"
 rusqlite = { version = "0.40", features = ["bundled"] }
-futures-util = "0.3"
 tracing = "0.1"
 tar = "0.4"
 flate2 = "1"
@@ -32,6 +32,8 @@ ratatui = "0.30"
 oci-client = { version = "0.18", default-features = false, features = ["rustls-tls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
+instant-acme = { version = "0.8", default-features = false, features = ["hyper-rustls", "rcgen", "ring"] }
+x509-parser = { version = "0.18", default-features = false }
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring", "tls12"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "std"] }
 cirro-proto = { path = "crates/cirro-proto", version = "0.1.0" }
@@ -39,6 +41,7 @@ cirro-node = { path = "crates/cirro-node", version = "0.1.0" }
 cirro-image = { path = "crates/cirro-image", version = "0.1.0" }
 cirro-tui = { path = "crates/cirro-tui", version = "0.1.0" }
 cirro-edge = { path = "crates/cirro-edge", version = "0.1.0" }
+cirro-guest-init = { path = "crates/guest-init", version = "0.1.0" }
 
 # Lints every crate opts into with `[lints] workspace = true`. CI runs
 # clippy with `-D warnings`, so "warn" here still fails the build.

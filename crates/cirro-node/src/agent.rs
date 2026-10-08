@@ -23,11 +23,13 @@ use crate::state::{Record, Store};
 use crate::subnet::Subnet;
 use crate::vm::{self, GuestConfig, Stop, Vm, VmSpec, WakeSpec};
 use bytes::Bytes;
+pub use cirro_edge::acme::AcmeConfig;
+use cirro_edge::acme::{Acme, is_public};
 use cirro_edge::tls::NodeCa;
 use cirro_edge::{Lease, Resolution, Router};
 use cirro_proto::{
-    EndReason, Ended, ErrorBody, MAX_MEM_MIB, MAX_VCPUS, MIN_MEM_MIB, MIN_VCPUS, Route, RunRequest,
-    Stats, StopRequest, VM_STATE_HEADER, VmInfo, VmStats,
+    EndReason, Ended, ErrorBody, LOG_CHUNK, MAX_MEM_MIB, MAX_VCPUS, MIN_MEM_MIB, MIN_VCPUS, Route,
+    RunRequest, Stats, StopRequest, VM_STATE_HEADER, VmInfo, VmStats,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -59,6 +61,10 @@ const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// before answering 503.
 const HOLD_FOR_START: Duration = Duration::from_secs(30);
 
+/// How often the agent looks for ACME certificates to get, renew, or try
+/// again after a failure (which backs off on its own).
+const RENEW_CHECK_EVERY: Duration = Duration::from_secs(5 * 60);
+
 /// How often the agent looks for Apps that have been idle long enough to
 /// park.
 const IDLE_CHECK_EVERY: Duration = Duration::from_secs(1);
@@ -82,6 +88,9 @@ pub struct Config {
     /// Where the HTTPS edge listens, if anywhere. Its certificates come
     /// from a CA of the Node's own, kept in the state dir.
     pub https: Option<SocketAddr>,
+    /// With `https`: get public hostnames' certificates from this ACME CA
+    /// instead, proved through the HTTP edge.
+    pub acme: Option<AcmeConfig>,
 }
 
 /// One name's record in the registry. Every VM start gets its own console
@@ -227,6 +236,8 @@ struct Agent {
     wake_failures: Mutex<BTreeMap<String, String>>,
     /// The CA the HTTPS edge's certificates come from, when there is one.
     ca: Option<Arc<NodeCa>>,
+    /// Where public hostnames' certificates come from, when ACME is on.
+    acme: Option<Arc<Acme>>,
 }
 
 /// Tells requests held for a start, wake or park that it has finished,
@@ -276,12 +287,21 @@ pub async fn run(config: Config) -> io::Result<()> {
         Some(_) => Some(Arc::new(NodeCa::load_or_create(&config.state_dir)?)),
         None => None,
     };
+    let acme = match config.acme {
+        Some(acme) if config.https.is_some() => Some(Acme::load(&config.state_dir, acme)?),
+        Some(_) => {
+            return Err(io::Error::other(
+                "ACME certificates are for the HTTPS edge: start the agent with --https too",
+            ));
+        }
+        None => None,
+    };
     let agent = Arc::new(Agent {
         node: vm::NodeConfig {
             firecracker: config.firecracker,
             jailer: config.jailer,
             kernel: config.kernel,
-            jail_base: config.state_dir.join("jail"),
+            jail_base: vm::jail_base(&config.state_dir),
             node_address: config.subnet.node_address(),
             cirro_gid: gid,
         },
@@ -296,9 +316,14 @@ pub async fn run(config: Config) -> io::Result<()> {
         settled: Notify::new(),
         wake_failures: Mutex::new(BTreeMap::new()),
         ca,
+        acme,
     });
     agent.reconcile().await?;
     let idle_parker = tokio::spawn(agent.clone().park_idle_apps());
+    let renewer = agent
+        .acme
+        .is_some()
+        .then(|| tokio::spawn(agent.clone().renew_certificates()));
     // Bound before the socket opens, so an edge that can't listen stops the
     // start instead of leaving a Node whose Apps nothing can reach.
     let edge = match config.http {
@@ -321,9 +346,10 @@ pub async fn run(config: Config) -> io::Result<()> {
                 .await
                 .map_err(|e| io::Error::other(format!("listen for HTTPS on {address}: {e}")))?;
             let routes = agent.clone();
-            let tls = cirro_edge::tls::server_config(ca.clone(), move |host| {
-                app_with_host(&routes.vms.lock().unwrap(), host).is_some()
-            })?;
+            let tls =
+                cirro_edge::tls::server_config(ca.clone(), agent.acme.clone(), move |host| {
+                    app_with_host(&routes.vms.lock().unwrap(), host).is_some()
+                })?;
             info!(%address, "HTTPS edge listening");
             Some(tokio::spawn(cirro_edge::serve_tls(
                 listener,
@@ -411,6 +437,9 @@ pub async fn run(config: Config) -> io::Result<()> {
     info!("shutting down; running VMs stay up");
     sampler.abort();
     idle_parker.abort();
+    if let Some(renewer) = renewer {
+        renewer.abort();
+    }
     for edge in [edge, tls_edge].into_iter().flatten() {
         edge.abort();
     }
@@ -967,6 +996,9 @@ impl Agent {
             let _ = std::fs::remove_file(old.log);
         }
         info!(vm = name, address = %spec.vm_address, "VM started");
+        if let Some(route) = &info.route {
+            self.get_certificate(&route.host);
+        }
         self.start_supervising(info.clone(), spec.console_log, vm);
         Ok(json(StatusCode::CREATED, &info))
     }
@@ -1203,6 +1235,43 @@ impl Agent {
         }
     }
 
+    /// Starts getting `host` a certificate from the ACME CA, in the
+    /// background, if ACME is on and `host` is public.
+    fn get_certificate(&self, host: &str) {
+        let Some(acme) = self.acme.clone() else {
+            return;
+        };
+        if !is_public(host) {
+            return;
+        }
+        let host = host.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = acme.ensure(&host).await {
+                warn!(host, "get a certificate from the ACME CA: {e}");
+            }
+        });
+    }
+
+    /// Gets every App's public hostname a certificate, and renews those
+    /// near expiry, at start and then every [`RENEW_CHECK_EVERY`], until the
+    /// task is aborted.
+    async fn renew_certificates(self: Arc<Self>) {
+        let mut every = tokio::time::interval(RENEW_CHECK_EVERY);
+        loop {
+            every.tick().await;
+            let hosts: Vec<String> = self
+                .vms
+                .lock()
+                .unwrap()
+                .values()
+                .filter_map(|entry| Some(entry.route()?.host.clone()))
+                .collect();
+            for host in hosts {
+                self.get_certificate(&host);
+            }
+        }
+    }
+
     /// The Ended VM record of `name`, once its supervisor has recorded it.
     fn ended_info(&self, name: &str) -> Result<ApiResponse, ApiError> {
         match self.vms.lock().unwrap().get(name) {
@@ -1236,12 +1305,8 @@ impl Agent {
             Some(entry @ Entry::Ended { .. }) => ("ended", entry.log().clone()),
             Some(entry) => ("running", entry.log().clone()),
         };
-        let mut bytes = Vec::new();
-        if let Ok(mut file) = std::fs::File::open(log) {
-            file.seek(SeekFrom::Start(offset))
-                .and_then(|_| file.read_to_end(&mut bytes))
-                .map_err(|e| internal(format!("read the console log: {e}")))?;
-        }
+        let bytes =
+            read_log(&log, offset).map_err(|e| internal(format!("read the console log: {e}")))?;
         Ok(Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/plain; charset=utf-8")
@@ -1328,6 +1393,10 @@ enum Holding {
 struct Edge(Arc<Agent>);
 
 impl Router for Edge {
+    fn acme_challenge(&self, token: &str) -> Option<String> {
+        self.0.acme.as_ref()?.challenge(token)
+    }
+
     async fn resolve(&self, host: &str) -> Resolution {
         let agent = &self.0;
         let deadline = tokio::time::Instant::now() + HOLD_FOR_START;
@@ -1485,6 +1554,18 @@ fn next_log_number(logs_dir: &Path) -> u64 {
         .map_or(0, |highest| highest + 1)
 }
 
+/// Up to [`LOG_CHUNK`] bytes of a console log from `offset`: empty past its
+/// end, or when it doesn't exist yet. A long-running App's log has no
+/// bound, so it is never read whole.
+fn read_log(log: &Path, offset: u64) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    if let Ok(mut file) = std::fs::File::open(log) {
+        file.seek(SeekFrom::Start(offset))?;
+        file.take(LOG_CHUNK).read_to_end(&mut bytes)?;
+    }
+    Ok(bytes)
+}
+
 /// `vcpus`/`mem_mib` (whichever `field` names) are within `[min, max]`, the
 /// same shape checked for both.
 fn in_bounds<T: PartialOrd + std::fmt::Display>(
@@ -1628,4 +1709,24 @@ fn json(status: StatusCode, body: &impl serde::Serialize) -> ApiResponse {
             serde_json::to_vec(body).expect("serialize response"),
         )))
         .expect("build response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_log_is_read_a_chunk_at_a_time_from_the_offset() {
+        let dir = crate::test_util::tempdir("cirro-agent-logs");
+        let log = dir.join("web.0.log");
+        let mut contents = vec![b'a'; LOG_CHUNK as usize];
+        contents.extend_from_slice(b"tail");
+        std::fs::write(&log, &contents).unwrap();
+
+        assert_eq!(read_log(&log, 0).unwrap().len(), LOG_CHUNK as usize);
+        assert_eq!(read_log(&log, LOG_CHUNK).unwrap(), b"tail");
+        assert!(read_log(&log, LOG_CHUNK + 4).unwrap().is_empty());
+        assert!(read_log(&dir.join("missing.log"), 0).unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

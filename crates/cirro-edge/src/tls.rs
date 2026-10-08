@@ -7,6 +7,8 @@
 //! Node for any name at all, not just its Apps'. Trust it only on machines
 //! that would trust the Node's operators that far.
 
+use crate::acme::{Acme, is_public};
+use crate::fs::write_whole;
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose,
     date_time_ymd,
@@ -17,9 +19,8 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::{ServerConfig, version};
 use std::collections::HashMap;
-use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tracing::{debug, info, warn};
@@ -104,13 +105,8 @@ impl NodeCa {
         &self.cert_pem
     }
 
-    /// A certificate for `host`, signed by the CA, with its key, valid
-    /// until the time returned.
-    fn certify(
-        &self,
-        host: &str,
-        provider: &CryptoProvider,
-    ) -> Result<(CertifiedKey, SystemTime), String> {
+    /// A certificate for `host`, signed by the CA.
+    fn certify(&self, host: &str, provider: &CryptoProvider) -> Result<HostCertificate, String> {
         let key = KeyPair::generate().map_err(|e| e.to_string())?;
         let mut params =
             CertificateParams::new(vec![host.to_string()]).map_err(|e| e.to_string())?;
@@ -131,7 +127,23 @@ impl NodeCa {
             .map_err(|e| e.to_string())?;
         let certified =
             CertifiedKey::new(vec![CertificateDer::from(cert.der().to_vec())], signing_key);
-        Ok((certified, not_after))
+        Ok(HostCertificate {
+            certified: Arc::new(certified),
+            expires: not_after,
+        })
+    }
+}
+
+/// A hostname's certificate, with its key, ready to serve.
+pub(crate) struct HostCertificate {
+    pub(crate) certified: Arc<CertifiedKey>,
+    pub(crate) expires: SystemTime,
+}
+
+impl HostCertificate {
+    /// Whether it is still valid `margin` from now.
+    pub(crate) fn lasts(&self, margin: Duration) -> bool {
+        self.expires > SystemTime::now() + margin
     }
 }
 
@@ -148,28 +160,14 @@ fn ca_params() -> CertificateParams {
     params
 }
 
-/// Writes `bytes` to `path` with `mode` through a temporary file renamed
-/// into place, so `path` never holds part of them.
-fn write_whole(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
-    let mut temporary = path.as_os_str().to_owned();
-    temporary.push(".tmp");
-    let temporary = PathBuf::from(temporary);
-    let _ = std::fs::remove_file(&temporary);
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(&temporary)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    std::fs::rename(&temporary, path)
-}
-
 /// The edge's TLS configuration: a certificate for each hostname `routed`
-/// says an App has, signed by `ca` the first time a client asks for it. A
-/// hostname no App has gets no certificate, so the handshake fails.
+/// says an App has. With `acme`, a public hostname's comes from the ACME
+/// CA, and until it has one the handshake fails; every other hostname's is
+/// signed by `ca` the first time a client asks for it. A hostname no App
+/// has gets no certificate, so the handshake fails.
 pub fn server_config(
     ca: Arc<NodeCa>,
+    acme: Option<Arc<Acme>>,
     routed: impl Fn(&str) -> bool + Send + Sync + 'static,
 ) -> io::Result<Arc<ServerConfig>> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -179,6 +177,7 @@ pub fn server_config(
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(HostCertificates {
             ca,
+            acme,
             provider,
             routed: Box::new(routed),
             signed: Mutex::new(HashMap::new()),
@@ -190,10 +189,11 @@ pub fn server_config(
 /// Picks, and signs when it must, the certificate for a client's SNI.
 struct HostCertificates {
     ca: Arc<NodeCa>,
+    acme: Option<Arc<Acme>>,
     provider: Arc<CryptoProvider>,
     routed: Box<dyn Fn(&str) -> bool + Send + Sync>,
-    /// Each hostname's certificate and when it expires.
-    signed: Mutex<HashMap<String, (Arc<CertifiedKey>, SystemTime)>>,
+    /// Each hostname's certificate.
+    signed: Mutex<HashMap<String, HostCertificate>>,
 }
 
 impl std::fmt::Debug for HostCertificates {
@@ -214,16 +214,21 @@ impl ResolvesServerCert for HostCertificates {
         if !(self.routed)(&host) {
             return None;
         }
-        let mut signed = self.signed.lock().unwrap();
-        if let Some((certified, expires)) = signed.get(&host)
-            && *expires > SystemTime::now() + RESIGN_WITHIN
+        if let Some(acme) = &self.acme
+            && is_public(&host)
         {
-            return Some(certified.clone());
+            return acme.certificate(&host);
+        }
+        let mut signed = self.signed.lock().unwrap();
+        if let Some(certificate) = signed.get(&host)
+            && certificate.lasts(RESIGN_WITHIN)
+        {
+            return Some(certificate.certified.clone());
         }
         match self.ca.certify(&host, &self.provider) {
-            Ok((certified, expires)) => {
-                let certified = Arc::new(certified);
-                signed.insert(host, (certified.clone(), expires));
+            Ok(certificate) => {
+                let certified = certificate.certified.clone();
+                signed.insert(host, certificate);
                 Some(certified)
             }
             Err(e) => {
@@ -238,7 +243,7 @@ impl ResolvesServerCert for HostCertificates {
 mod tests {
     use super::*;
 
-    fn tempdir(name: &str) -> PathBuf {
+    fn tempdir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("cirro-edge-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

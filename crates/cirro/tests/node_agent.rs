@@ -29,7 +29,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const HTTP_PORT: u16 = 8080;
@@ -52,77 +51,7 @@ static LIVE_OCTETS: std::sync::Mutex<std::collections::BTreeSet<u8>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 mod common;
-use common::{home, latest_kernel, repo_root, test_agent, test_agent_path};
-
-/// The rootfs images the tests boot, built once per test run without root
-/// (`mkfs.ext4 -d`). Every image carries the fixture commands under `/app`.
-struct Rootfs {
-    /// guest-init as `/init`.
-    guest_init: PathBuf,
-    /// No `/init` at all, so the guest never starts guest-init.
-    no_init: PathBuf,
-    /// A `/init` that isn't guest-init and never takes a config.
-    wrong_init: PathBuf,
-}
-
-fn rootfs() -> &'static Rootfs {
-    static ROOTFS: OnceLock<Rootfs> = OnceLock::new();
-    ROOTFS.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("node-agent-rootfs");
-        let tree = dir.join("tree");
-        let _ = std::fs::remove_dir_all(&dir);
-        for sub in ["proc", "sys", "dev", "app"] {
-            std::fs::create_dir_all(tree.join(sub)).expect("create rootfs tree");
-        }
-        for fixture in [
-            "http_app",
-            "ignore_term",
-            "exit_later",
-            "probe",
-            "whoami",
-            "spin",
-            "counter",
-            "dialer",
-        ] {
-            let status = std::process::Command::new("rustc")
-                .args(["--target", "x86_64-unknown-linux-musl", "-O", "-o"])
-                .arg(tree.join("app").join(fixture))
-                .arg(
-                    Path::new(env!("CARGO_MANIFEST_DIR"))
-                        .join(format!("tests/fixtures/{fixture}.rs")),
-                )
-                .status()
-                .expect("run rustc");
-            assert!(status.success(), "building the {fixture} fixture failed");
-        }
-        let no_init = make_image(&tree, &dir.join("no-init.ext4"));
-        std::fs::copy(tree.join("app/ignore_term"), tree.join("init"))
-            .expect("copy ignore_term in as /init");
-        let wrong_init = make_image(&tree, &dir.join("wrong-init.ext4"));
-        let guest_init_bin = repo_root()
-            .join("target/guest-init-embed/x86_64-unknown-linux-musl/release/guest-init");
-        std::fs::copy(&guest_init_bin, tree.join("init")).expect("copy guest-init into tree");
-        let guest_init = make_image(&tree, &dir.join("guest-init.ext4"));
-        Rootfs {
-            guest_init,
-            no_init,
-            wrong_init,
-        }
-    })
-}
-
-fn make_image(tree: &Path, image: &Path) -> PathBuf {
-    let file = std::fs::File::create(image).expect("create rootfs image");
-    file.set_len(64 * 1024 * 1024).expect("size rootfs image");
-    let status = std::process::Command::new("mkfs.ext4")
-        .args(["-q", "-F", "-d"])
-        .arg(tree)
-        .arg(image)
-        .status()
-        .expect("run mkfs.ext4");
-    assert!(status.success(), "mkfs.ext4 failed");
-    image.to_path_buf()
-}
+use common::{home, latest_kernel, repo_root, rootfs, test_agent, test_agent_path};
 
 /// A throwaway Node agent on Node subnet `10.77.<octet>.0/24`. It can be
 /// stopped and restarted on the same state dir, like the real one. Dropping
@@ -135,6 +64,8 @@ struct Agent {
     socket_group: String,
     state_dir: PathBuf,
     socket: PathBuf,
+    /// More `cirro node agent` arguments, for tests that need them.
+    extra_args: Vec<String>,
 }
 
 impl Agent {
@@ -144,7 +75,20 @@ impl Agent {
         Agent::start_with_socket_group(octet, &getgid().as_raw().to_string())
     }
 
+    /// Like [`Agent::start`], with more `cirro node agent` arguments.
+    fn start_with_args(octet: u8, args: &[&str]) -> Option<Agent> {
+        Agent::start_with(
+            octet,
+            &getgid().as_raw().to_string(),
+            args.iter().map(|a| a.to_string()).collect(),
+        )
+    }
+
     fn start_with_socket_group(octet: u8, socket_group: &str) -> Option<Agent> {
+        Agent::start_with(octet, socket_group, Vec::new())
+    }
+
+    fn start_with(octet: u8, socket_group: &str, extra_args: Vec<String>) -> Option<Agent> {
         if !Path::new("/dev/kvm").exists() {
             eprintln!("skipping: /dev/kvm not present");
             return None;
@@ -178,6 +122,7 @@ impl Agent {
             socket_group: socket_group.to_string(),
             state_dir,
             socket,
+            extra_args,
         };
         agent.spawn().expect("start the Node agent");
         Some(agent)
@@ -228,7 +173,8 @@ impl Agent {
             .arg("--jailer")
             .arg(repo.join("jailer"))
             .arg("--kernel")
-            .arg(latest_kernel());
+            .arg(latest_kernel())
+            .args(&self.extra_args);
         cmd
     }
 
@@ -983,6 +929,62 @@ fn graceful_stop_leaves_an_ended_vm_whose_logs_last_until_rm() {
     agent.cirro().args(["rm", "web"]).assert().success();
     assert!(row(&agent.ps(true), "web").is_none(), "rm left the record");
     agent.cirro().args(["logs", "web"]).assert().failure();
+    agent.assert_no_cirro_state();
+}
+
+#[test]
+fn logs_reads_a_long_console_log_whole_and_returns_while_it_still_grows() {
+    let Some(agent) = Agent::start(210) else {
+        return;
+    };
+
+    agent
+        .run("chatty", &rootfs().guest_init, &["/app/chatter"])
+        .success();
+    // Past the first of the agent's 1 MiB answers before reading. The
+    // console writes ~100-170 KB/s, so the log keeps growing as `logs`
+    // runs.
+    let log = agent.state_dir.join("logs/chatty.0.log");
+    let deadline = Instant::now() + 3 * TIMEOUT;
+    while std::fs::metadata(&log).map_or(0, |m| m.len()) < 5 << 18 {
+        assert!(
+            Instant::now() < deadline,
+            "chatter wrote only {:?} bytes",
+            std::fs::metadata(&log).map(|m| m.len())
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let logs = stdout(
+        agent
+            .cirro()
+            .args(["logs", "chatty"])
+            .timeout(TIMEOUT)
+            .assert()
+            .success(),
+    );
+    // The log was mid-write as it was read, so its last line can be cut.
+    let complete = &logs[..=logs.rfind('\n').expect("a whole line")];
+    let lines: Vec<&str> = complete
+        .lines()
+        .filter(|l| l.starts_with("CHATTER "))
+        .collect();
+    assert!(
+        logs.len() > 1 << 20,
+        "logs stopped inside the first 1 MiB answer: {} bytes",
+        logs.len()
+    );
+    // No line lost or doubled where one answer ends and the next begins.
+    for (n, line) in lines.iter().enumerate() {
+        assert_eq!(*line, format!("CHATTER {n:012}"));
+    }
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "chatty"])
+        .assert()
+        .success();
+    agent.cirro().args(["rm", "chatty"]).assert().success();
     agent.assert_no_cirro_state();
 }
 
@@ -2359,6 +2361,163 @@ fn the_tls_edge_serves_apps_with_certificates_from_the_nodes_ca() {
         after > before,
         "the HTTPS route went somewhere else after a restart"
     );
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "tally"])
+        .assert()
+        .success();
+    agent.cirro().args(["rm", "tally"]).assert().success();
+    agent.assert_no_cirro_state();
+}
+
+/// Pebble, Let's Encrypt's ACME test server, with its mock DNS answering
+/// 127.0.0.1 for every name, so it validates HTTP-01 challenges against
+/// the agent's own edge. Built with `go install` into the test agent's
+/// directory; the test skips without it.
+struct Pebble {
+    servers: Vec<Child>,
+    /// Pebble's own TLS certificate's CA, which the agent must trust.
+    minica: PathBuf,
+    directory: String,
+    management: String,
+    config: PathBuf,
+}
+
+impl Pebble {
+    /// Pebble on ports derived from `octet`, validating HTTP-01 against
+    /// the edge of the agent on that octet.
+    fn start(octet: u8) -> Option<Pebble> {
+        let bin = home().join(".local/lib/cirro-test/go");
+        let source = std::fs::read_dir(home().join("go/pkg/mod/github.com/letsencrypt/pebble"))
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .max();
+        let (Some(source), true) = (source, bin.join("pebble").exists()) else {
+            eprintln!(
+                "skipping: no Pebble -- `GOBIN={} go install \
+                 github.com/letsencrypt/pebble/v2/cmd/pebble{{,-challtestsrv}}@latest`",
+                bin.display()
+            );
+            return None;
+        };
+        let port = |base: u16| (base + u16::from(octet)).to_string();
+        let dns = format!("127.0.0.1:{}", port(20000));
+        let challtestsrv = std::process::Command::new(bin.join("pebble-challtestsrv"))
+            .args(["-defaultIPv4", "127.0.0.1", "-defaultIPv6", ""])
+            .args(["-dnsserver", &dns])
+            .args(["-management", &format!("127.0.0.1:{}", port(20300))])
+            .args(["-http01", "", "-https01", "", "-tlsalpn01", "", "-doh", ""])
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("start pebble-challtestsrv");
+        let certs = source.join("test/certs");
+        let listen = format!("127.0.0.1:{}", port(20600));
+        let management = format!("127.0.0.1:{}", port(20900));
+        let config = serde_json::json!({ "pebble": {
+            "listenAddress": listen,
+            "managementListenAddress": management,
+            "certificate": certs.join("localhost/cert.pem"),
+            "privateKey": certs.join("localhost/key.pem"),
+            "httpPort": edge_port(octet),
+            "tlsPort": tls_edge_port(octet),
+            "ocspResponderURL": "",
+            "externalAccountBindingRequired": false,
+        }});
+        let config_path =
+            std::env::temp_dir().join(format!("cirro-pebble-{}-{octet}.json", std::process::id()));
+        std::fs::write(&config_path, config.to_string()).expect("write Pebble's config");
+        let pebble = std::process::Command::new(bin.join("pebble"))
+            .arg("-config")
+            .arg(&config_path)
+            .args(["-dnsserver", &dns])
+            .env("PEBBLE_VA_NOSLEEP", "1")
+            .env("PEBBLE_WFE_NONCEREJECT", "0")
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("start pebble");
+        let pebble = Pebble {
+            servers: vec![challtestsrv, pebble],
+            minica: certs.join("pebble.minica.pem"),
+            directory: format!("https://localhost:{}/dir", port(20600)),
+            management: format!("https://localhost:{}", port(20900)),
+            config: config_path,
+        };
+        let deadline = Instant::now() + TIMEOUT;
+        while TcpStream::connect(&listen).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "Pebble never listened on {listen}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Some(pebble)
+    }
+
+    /// The root the certificates Pebble issues chain to, written to `path`.
+    fn write_root(&self, path: &Path) {
+        let status = std::process::Command::new("curl")
+            .args(["--silent", "--fail", "--cacert"])
+            .arg(&self.minica)
+            .arg(format!("{}/roots/0", self.management))
+            .arg("--output")
+            .arg(path)
+            .status()
+            .expect("run curl");
+        assert!(status.success(), "fetching Pebble's root failed");
+    }
+}
+
+impl Drop for Pebble {
+    fn drop(&mut self) {
+        for server in &mut self.servers {
+            let _ = server.kill();
+            let _ = server.wait();
+        }
+        let _ = std::fs::remove_file(&self.config);
+    }
+}
+
+/// M7: with ACME on, an App whose hostname is public gets its certificate
+/// from the ACME CA, which validates the hostname over HTTP-01 through the
+/// Node's own edge, and is served with it.
+#[test]
+fn an_app_with_a_public_hostname_is_served_with_an_acme_certificate() {
+    let Some(pebble) = Pebble::start(211) else {
+        return;
+    };
+    let minica = pebble.minica.to_string_lossy().into_owned();
+    let Some(agent) = Agent::start_with_args(
+        211,
+        &[
+            "--acme-email",
+            "ops@cirro-test.dev",
+            "--acme-directory",
+            &pebble.directory,
+            "--acme-root",
+            &minica,
+        ],
+    ) else {
+        return;
+    };
+    run_app(&agent, "tally", "app.cirro-test.dev", &["/app/counter"]).success();
+    wait_for_edge(&agent, "app.cirro-test.dev");
+    let root = agent.state_dir.join("pebble-root.pem");
+    pebble.write_root(&root);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let answer = loop {
+        match tls_get(&agent, "app.cirro-test.dev", &root) {
+            Ok(answer) => break answer,
+            Err(e) => assert!(
+                Instant::now() < deadline,
+                "the App was never served with a certificate from the ACME CA: {e}"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    count(&answer);
 
     agent
         .cirro()

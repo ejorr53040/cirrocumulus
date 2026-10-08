@@ -2,6 +2,8 @@
 //! whose route names the request's `Host` (ADR 0007). It knows nothing of
 //! VMs: a [`Router`], the Node agent, says where a hostname goes.
 
+pub mod acme;
+mod fs;
 pub mod tls;
 
 use bytes::Bytes;
@@ -12,7 +14,7 @@ use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, Uri, Version};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,6 +27,10 @@ use tracing::{debug, warn};
 
 /// How long a client has to finish its TLS handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a client has to send each request's headers, the first one
+/// and each one after on a kept-alive connection.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the edge waits to connect to an App's VM before answering 502.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -65,6 +71,14 @@ impl std::fmt::Debug for Lease {
 pub trait Router: Send + Sync + 'static {
     /// `host` is in lowercase, without a port or a trailing dot.
     fn resolve(&self, host: &str) -> impl Future<Output = Resolution> + Send;
+
+    /// The answer to an ACME HTTP-01 challenge for `token`, while one is
+    /// under way: the HTTP edge serves it at
+    /// `/.well-known/acme-challenge/<token>` for any hostname.
+    fn acme_challenge(&self, token: &str) -> Option<String> {
+        let _ = token;
+        None
+    }
 }
 
 type Body = BoxBody<Bytes, hyper::Error>;
@@ -149,7 +163,11 @@ where
         let (router, scheme) = (router.clone(), scheme.clone());
         async move { Ok::<_, hyper::Error>(handle(req, router.as_ref(), peer, &scheme).await) }
     });
+    // hyper skips its default header timeout without a timer, which would
+    // let idle clients hold the agent's file descriptors forever.
     if let Err(e) = http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
         .serve_connection(TokioIo::new(stream), service)
         .await
     {
@@ -169,6 +187,15 @@ async fn handle<R: Router>(
             "the request names no host\n".into(),
         );
     };
+    if let Scheme::Http = scheme
+        && let Some(token) = req
+            .uri()
+            .path()
+            .strip_prefix("/.well-known/acme-challenge/")
+        && let Some(answer) = router.acme_challenge(token)
+    {
+        return text(StatusCode::OK, answer);
+    }
     // A connection's certificate was chosen for one hostname; a request on
     // it for another would borrow that certificate (RFC 9110 15.5.20).
     if let Scheme::Https { sni } = scheme
