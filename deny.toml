@@ -41,8 +41,8 @@ unused-allowed-license = "allow"
 ignore = true
 
 [bans]
-# Duplicate versions come from upstream (e.g. rtnetlink pinning an older
-# nix); warn so they're visible in CI logs without blocking on others' releases.
+# Duplicate versions come from upstream; warn so they're visible in CI logs
+# without blocking on others' releases.
 multiple-versions = "warn"
 # No `version = "*"` deps; path deps between workspace crates are fine.
 wildcards = "deny"

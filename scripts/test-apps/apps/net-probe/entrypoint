@@ -1,0 +1,6 @@
+#!/bin/sh
+# Checks the Node's egress policy from inside a VM: prints a probe report
+# to the console at boot, then serves a fresh one at /cgi-bin/probe.
+/www/cgi-bin/probe | tail -n +3
+echo "net-probe: serving on :${PORT:-80}"
+exec httpd -f -p "${PORT:-80}" -h /www

@@ -54,3 +54,6 @@ SECURITY_AUDIT.md
 # --- Reference docs & visualzations (youre welcome claude) ---
 /docs/rust-book/
 /graphify-out/
+
+# --- Test App build artifacts (Alpine packages, rootfs images) ---
+/scripts/test-apps/.build/

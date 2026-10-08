@@ -1,0 +1,16 @@
+#!/bin/sh
+# Grows its memory by STEP_MB (default 16) every STEP_SECS (default 2)
+# up to TARGET_MB (default 128), then holds it. Set TARGET_MB above the
+# VM's --mem to watch the guest's OOM killer.
+target="${TARGET_MB:-128}" step="${STEP_MB:-16}" secs="${STEP_SECS:-2}"
+echo "mem-hog: growing to ${target}M in ${step}M steps every ${secs}s"
+exec awk -v target="$target" -v step="$step" -v secs="$secs" 'BEGIN {
+    mb = "x"; while (length(mb) < 1048576) mb = mb mb
+    for (have = 0; have < target; have += step) {
+        for (i = 0; i < step; i++) hog[have + i] = mb sprintf("%d", have + i)
+        printf "mem-hog: holding %dM\n", have + step; fflush()
+        system("sleep " secs)
+    }
+    print "mem-hog: at target, holding"; fflush()
+    while (1) system("sleep 3600")
+}'
