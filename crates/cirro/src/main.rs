@@ -129,6 +129,11 @@ struct RunArgs {
     /// The port the App listens on inside the VM
     #[arg(long, requires = "host")]
     port: Option<u16>,
+    /// Park the App once no request has come through the edge for this
+    /// many seconds; the next request wakes it
+    #[arg(long, value_name = "SECS", requires = "host",
+        value_parser = clap::value_parser!(u32).range(1..))]
+    idle_park: Option<u32>,
     /// An image (nginx:alpine, ghcr.io/owner/app@sha256:...), or the path
     /// of an ext4 rootfs with guest-init as /init
     #[arg(value_name = "IMAGE|ROOTFS")]
@@ -197,6 +202,9 @@ enum NodeCommand {
     },
     /// Join this node to a cluster
     Join { token: String },
+    /// Print the CA certificate the HTTPS edge's certificates come from,
+    /// for clients to trust
+    Ca,
     /// Run the Node agent in the foreground (as root)
     Agent {
         /// Where the agent keeps jails and console logs
@@ -219,6 +227,10 @@ enum NodeCommand {
         /// on this address (e.g. 0.0.0.0:80)
         #[arg(long, value_name = "ADDRESS:PORT")]
         http: Option<SocketAddr>,
+        /// Serve the HTTPS edge on this address (e.g. 0.0.0.0:443), with
+        /// certificates from the Node's own CA (`cirro node ca`)
+        #[arg(long, value_name = "ADDRESS:PORT")]
+        https: Option<SocketAddr>,
     },
 }
 
@@ -277,6 +289,7 @@ fn main() -> ExitCode {
                 jailer,
                 kernel,
                 http,
+                https,
             }) => {
                 init_agent_logging();
                 agent::run(agent::Config {
@@ -288,6 +301,7 @@ fn main() -> ExitCode {
                     jailer,
                     kernel,
                     http,
+                    https,
                 })
                 .await
                 .map_err(|e| format!("node agent: {e}"))
@@ -339,6 +353,7 @@ fn main() -> ExitCode {
                     })
                 })
                 .map_err(|e| format!("node install: {e}")),
+            Command::Node(NodeCommand::Ca) => node_ca(&cli.socket).await,
             Command::Node(NodeCommand::Uninstall { state_dir, force }) => {
                 cirro_node::install::uninstall(&state_dir, force)
                     .map_err(|e| format!("node uninstall: {e}"))
@@ -379,10 +394,11 @@ fn command_path(matches: &clap::ArgMatches) -> String {
 }
 
 async fn run(socket: &Path, args: RunArgs) -> Result<(), String> {
-    let route = args
-        .host
-        .zip(args.port)
-        .map(|(host, port)| Route { host, port });
+    let route = args.host.zip(args.port).map(|(host, port)| Route {
+        host,
+        port,
+        idle_park_secs: args.idle_park,
+    });
     let request = run_request(
         args.name,
         args.mem,
@@ -721,6 +737,13 @@ async fn top_once(socket: &Path) -> Result<(), String> {
         .unwrap_or_default();
     print!("{}", cirro_tui::snapshot(&stats));
     Ok(())
+}
+
+async fn node_ca(socket: &Path) -> Result<(), String> {
+    let (_, pem) = client::send(socket, Method::GET, "/ca", None::<&()>).await?;
+    std::io::stdout()
+        .write_all(&pem)
+        .map_err(|e| format!("write the CA: {e}"))
 }
 
 async fn ps(socket: &Path, all: bool) -> Result<(), String> {

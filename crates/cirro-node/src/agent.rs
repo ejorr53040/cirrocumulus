@@ -23,7 +23,8 @@ use crate::state::{Record, Store};
 use crate::subnet::Subnet;
 use crate::vm::{self, GuestConfig, Stop, Vm, VmSpec, WakeSpec};
 use bytes::Bytes;
-use cirro_edge::{Resolution, Router};
+use cirro_edge::tls::NodeCa;
+use cirro_edge::{Lease, Resolution, Router};
 use cirro_proto::{
     EndReason, Ended, ErrorBody, MAX_MEM_MIB, MAX_VCPUS, MIN_MEM_MIB, MIN_VCPUS, Route, RunRequest,
     Stats, StopRequest, VM_STATE_HEADER, VmInfo, VmStats,
@@ -40,7 +41,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::unix::UCred;
@@ -58,6 +59,10 @@ const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// before answering 503.
 const HOLD_FOR_START: Duration = Duration::from_secs(30);
 
+/// How often the agent looks for Apps that have been idle long enough to
+/// park.
+const IDLE_CHECK_EVERY: Duration = Duration::from_secs(1);
+
 /// How often the agent samples the Node and every running VM.
 const SAMPLE_EVERY: Duration = Duration::from_secs(1);
 
@@ -74,6 +79,9 @@ pub struct Config {
     pub kernel: PathBuf,
     /// Where the HTTP edge listens, if anywhere.
     pub http: Option<SocketAddr>,
+    /// Where the HTTPS edge listens, if anywhere. Its certificates come
+    /// from a CA of the Node's own, kept in the state dir.
+    pub https: Option<SocketAddr>,
 }
 
 /// One name's record in the registry. Every VM start gets its own console
@@ -93,6 +101,7 @@ enum Entry {
         log: PathBuf,
         stops: mpsc::Sender<Stop>,
         ended: watch::Receiver<bool>,
+        traffic: Arc<Traffic>,
     },
     /// History only: holds no host state and no VM address.
     Ended { info: VmInfo, log: PathBuf },
@@ -120,6 +129,70 @@ impl Entry {
                 log
             }
         }
+    }
+}
+
+/// The edge's requests to one running VM, for idle park.
+struct Traffic {
+    /// Requests the edge is proxying to it now.
+    in_flight: AtomicU32,
+    /// When the last request finished, or the VM started if none has.
+    last: Mutex<Instant>,
+    /// Set while it is being parked: requests for it are held until the
+    /// park ends, then wake it.
+    parking: AtomicBool,
+}
+
+impl Traffic {
+    fn new() -> Traffic {
+        Traffic {
+            in_flight: AtomicU32::new(0),
+            last: Mutex::new(Instant::now()),
+            parking: AtomicBool::new(false),
+        }
+    }
+
+    /// Whether nothing has come or been in flight for `idle`.
+    fn idle_for(&self, idle: Duration) -> bool {
+        self.in_flight.load(Ordering::SeqCst) == 0 && self.last.lock().unwrap().elapsed() >= idle
+    }
+}
+
+/// The right to park one VM: while it is held no other park starts, and
+/// the edge holds requests for the VM. Released when dropped, however the
+/// park ended.
+struct ParkClaim(Arc<Traffic>);
+
+impl ParkClaim {
+    fn take(traffic: &Arc<Traffic>) -> Option<ParkClaim> {
+        traffic
+            .parking
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| ParkClaim(traffic.clone()))
+    }
+}
+
+impl Drop for ParkClaim {
+    fn drop(&mut self) {
+        self.0.parking.store(false, Ordering::SeqCst);
+    }
+}
+
+/// One request in flight to a VM, counted until dropped.
+struct InFlight(Arc<Traffic>);
+
+impl InFlight {
+    fn start(traffic: &Arc<Traffic>) -> InFlight {
+        traffic.in_flight.fetch_add(1, Ordering::SeqCst);
+        InFlight(traffic.clone())
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        *self.0.last.lock().unwrap() = Instant::now();
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -152,10 +225,12 @@ struct Agent {
     settled: Notify,
     /// Why each App's last wake failed, for requests that were held for it.
     wake_failures: Mutex<BTreeMap<String, String>>,
+    /// The CA the HTTPS edge's certificates come from, when there is one.
+    ca: Option<Arc<NodeCa>>,
 }
 
-/// Tells requests held for a start or wake that it has finished, however
-/// it finished, panics included.
+/// Tells requests held for a start, wake or park that it has finished,
+/// however it finished, panics included.
 struct Settled(Arc<Agent>);
 
 impl Drop for Settled {
@@ -197,6 +272,10 @@ pub async fn run(config: Config) -> io::Result<()> {
     egress::ensure_node_policy(&config.subnet.to_string(), egress_iface.as_deref())
         .map_err(|e| io::Error::other(format!("apply the Node's egress policy: {e}")))?;
     let gid = resolve_group(&config.socket_group)?;
+    let ca = match config.https {
+        Some(_) => Some(Arc::new(NodeCa::load_or_create(&config.state_dir)?)),
+        None => None,
+    };
     let agent = Arc::new(Agent {
         node: vm::NodeConfig {
             firecracker: config.firecracker,
@@ -216,8 +295,10 @@ pub async fn run(config: Config) -> io::Result<()> {
         metrics: Mutex::new(Recorder::default()),
         settled: Notify::new(),
         wake_failures: Mutex::new(BTreeMap::new()),
+        ca,
     });
     agent.reconcile().await?;
+    let idle_parker = tokio::spawn(agent.clone().park_idle_apps());
     // Bound before the socket opens, so an edge that can't listen stops the
     // start instead of leaving a Node whose Apps nothing can reach.
     let edge = match config.http {
@@ -232,6 +313,25 @@ pub async fn run(config: Config) -> io::Result<()> {
             )))
         }
         None => None,
+    };
+    // `agent.ca` is set exactly when `config.https` is.
+    let tls_edge = match (config.https, &agent.ca) {
+        (Some(address), Some(ca)) => {
+            let listener = TcpListener::bind(address)
+                .await
+                .map_err(|e| io::Error::other(format!("listen for HTTPS on {address}: {e}")))?;
+            let routes = agent.clone();
+            let tls = cirro_edge::tls::server_config(ca.clone(), move |host| {
+                app_with_host(&routes.vms.lock().unwrap(), host).is_some()
+            })?;
+            info!(%address, "HTTPS edge listening");
+            Some(tokio::spawn(cirro_edge::serve_tls(
+                listener,
+                Arc::new(Edge(agent.clone())),
+                tls,
+            )))
+        }
+        _ => None,
     };
     let sampling = agent.clone();
     let sampler = tokio::spawn(async move {
@@ -310,7 +410,8 @@ pub async fn run(config: Config) -> io::Result<()> {
 
     info!("shutting down; running VMs stay up");
     sampler.abort();
-    if let Some(edge) = edge {
+    idle_parker.abort();
+    for edge in [edge, tls_edge].into_iter().flatten() {
         edge.abort();
     }
     let _ = std::fs::remove_file(&config.socket);
@@ -358,6 +459,7 @@ impl Agent {
         }
         let result = match (&method, segments.as_slice()) {
             (&Method::GET, ["stats"]) => Ok(json(StatusCode::OK, &self.stats())),
+            (&Method::GET, ["ca"]) => self.ca_pem(),
             (&Method::GET, ["vms"]) => {
                 let all = query_param(&query, "all") == Some("true");
                 Ok(json(StatusCode::OK, &self.list(all)))
@@ -373,7 +475,10 @@ impl Agent {
                     Err(e) => Err(e),
                 }
             }
-            (&Method::POST, ["vms", name, "park"]) => self.park_vm(name).await,
+            (&Method::POST, ["vms", name, "park"]) => {
+                let name = name.to_string();
+                self.park_vm(name).await
+            }
             (&Method::POST, ["vms", name, "wake"]) => {
                 let name = name.to_string();
                 self.wake_vm(name).await
@@ -392,6 +497,21 @@ impl Agent {
             )),
         };
         result.unwrap_or_else(|ApiError(status, error)| json(status, &ErrorBody { error }))
+    }
+
+    /// The CA certificate the HTTPS edge's certificates come from.
+    fn ca_pem(&self) -> Result<ApiResponse, ApiError> {
+        let ca = self.ca.as_ref().ok_or_else(|| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                "this Node agent serves no HTTPS edge, so has no CA; start it with --https".into(),
+            )
+        })?;
+        Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/x-pem-file")
+            .body(Full::new(Bytes::from(ca.cert_pem().to_string())))
+            .expect("build CA response"))
     }
 
     /// Samples the Node and every running VM, for [`Agent::stats`].
@@ -571,7 +691,52 @@ impl Agent {
 
     /// Snapshots a running VM and ends it as parked. A VM that can't be
     /// parked keeps running, and the error says why.
-    async fn park_vm(&self, name: &str) -> Result<ApiResponse, ApiError> {
+    async fn park_vm(self: Arc<Self>, name: String) -> Result<ApiResponse, ApiError> {
+        let claim = self.claim_park(&name)?;
+        self.park_claimed(name, claim).await
+    }
+
+    /// Claims the park of a running VM, or says why it can't be parked.
+    fn claim_park(&self, name: &str) -> Result<ParkClaim, ApiError> {
+        if let Some(Entry::Running { traffic, .. }) = self.vms.lock().unwrap().get(name) {
+            return ParkClaim::take(traffic).ok_or_else(|| {
+                ApiError(
+                    StatusCode::CONFLICT,
+                    format!("VM {name:?} is already being parked"),
+                )
+            });
+        }
+        Err(self.running(name).err().unwrap_or_else(|| {
+            ApiError(
+                StatusCode::CONFLICT,
+                format!("VM {name:?} started while it was being parked; try again"),
+            )
+        }))
+    }
+
+    /// Parks a VM whose park `claim` holds. On its own task, like a start,
+    /// so the park finishes, and the claim is released, even if the client
+    /// goes away.
+    async fn park_claimed(
+        self: Arc<Self>,
+        name: String,
+        claim: ParkClaim,
+    ) -> Result<ApiResponse, ApiError> {
+        tokio::spawn(
+            async move {
+                // Dropped in reverse: the claim is released before held
+                // requests are told to look again.
+                let _settled = Settled(self.clone());
+                let _claim = claim;
+                self.park(&name).await
+            }
+            .in_current_span(),
+        )
+        .await
+        .unwrap_or_else(|e| Err(internal(format!("parking the VM panicked: {e}"))))
+    }
+
+    async fn park(&self, name: &str) -> Result<ApiResponse, ApiError> {
         let (stops, mut ended) = self.running(name)?;
         let (done_tx, done) = oneshot::channel();
         let park = Stop::Park {
@@ -819,6 +984,7 @@ impl Agent {
                 log,
                 stops: stops_tx,
                 ended: ended_rx,
+                traffic: Arc::new(Traffic::new()),
             },
         );
         let agent = self.clone();
@@ -995,6 +1161,48 @@ impl Agent {
         }
     }
 
+    /// Parks every App that has had no request for its idle time, once a
+    /// second, until the task is aborted. An App whose park fails keeps
+    /// running and gets a whole idle time before the next try.
+    async fn park_idle_apps(self: Arc<Self>) {
+        let mut every = tokio::time::interval(IDLE_CHECK_EVERY);
+        every.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            every.tick().await;
+            // Claimed under the VM table's lock, which every request takes
+            // to reach a VM: none can slip in between the check and the park.
+            let idle: Vec<(String, Arc<Traffic>, ParkClaim)> = self
+                .vms
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(name, entry)| match entry {
+                    Entry::Running { info, traffic, .. } => {
+                        let secs = info.route.as_ref()?.idle_park_secs?;
+                        if !traffic.idle_for(Duration::from_secs(secs.into())) {
+                            return None;
+                        }
+                        let claim = ParkClaim::take(traffic)?;
+                        Some((name.clone(), traffic.clone(), claim))
+                    }
+                    _ => None,
+                })
+                .collect();
+            for (name, traffic, claim) in idle {
+                let agent = self.clone();
+                tokio::spawn(async move {
+                    match agent.park_claimed(name.clone(), claim).await {
+                        Ok(_) => info!(vm = name, "parked an idle App"),
+                        Err(ApiError(_, why)) => {
+                            warn!(vm = name, "couldn't park an idle App: {why}");
+                            *traffic.last.lock().unwrap() = Instant::now();
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     /// The Ended VM record of `name`, once its supervisor has recorded it.
     fn ended_info(&self, name: &str) -> Result<ApiResponse, ApiError> {
         match self.vms.lock().unwrap().get(name) {
@@ -1100,10 +1308,19 @@ impl Agent {
 /// lock and acted on after it is released. Each carries the App's name.
 enum Step {
     Answer(Resolution),
-    /// The App is starting or waking: hold the request until that settles.
-    Hold(String),
+    /// The App is starting, waking or parking: hold the request until that
+    /// settles.
+    Hold(String, Holding),
     /// The App is parked: wake it.
     Wake(String),
+}
+
+/// What a held request waits for.
+enum Holding {
+    /// A start or wake, after which the App runs or the start failed.
+    Start,
+    /// A park, after which the App is parked and the request wakes it.
+    Park,
 }
 
 /// The agent as the edge's [`Router`]: a request for a parked App wakes it
@@ -1126,10 +1343,18 @@ impl Router for Edge {
             settled.as_mut().enable();
             match agent.step_for(host) {
                 Step::Answer(resolution) => return resolution,
-                Step::Hold(name) => {
-                    tried = Some(None);
+                Step::Hold(name, holding) => {
+                    if let Holding::Start = &holding {
+                        tried = Some(None);
+                    }
                     if tokio::time::timeout_at(deadline, settled).await.is_err() {
-                        return Resolution::Unavailable(still_starting(&name));
+                        return Resolution::Unavailable(match holding {
+                            Holding::Start => still_starting(&name),
+                            Holding::Park => format!(
+                                "App {name:?} is still being parked after {HOLD_FOR_START:?}; \
+                                 try again shortly"
+                            ),
+                        });
                     }
                 }
                 Step::Wake(name) if tried.is_some() => {
@@ -1173,13 +1398,21 @@ impl Agent {
         };
         let name = name.clone();
         match entry {
-            Entry::Running { info, .. } => Step::Answer(match (info.vm_address, &info.route) {
-                (Some(address), Some(route)) => {
-                    Resolution::Upstream(SocketAddr::new(address.into(), route.port))
-                }
-                _ => Resolution::Unavailable(format!("App {name:?} has no VM address")),
-            }),
-            Entry::Starting { .. } => Step::Hold(name),
+            Entry::Running { traffic, .. } if traffic.parking.load(Ordering::SeqCst) => {
+                Step::Hold(name, Holding::Park)
+            }
+            Entry::Running { info, traffic, .. } => {
+                Step::Answer(match (info.vm_address, &info.route) {
+                    // Counted under the VM table's lock, so the idle parker
+                    // never picks a VM a request is about to reach.
+                    (Some(address), Some(route)) => Resolution::Upstream(
+                        SocketAddr::new(address.into(), route.port),
+                        Lease::new(InFlight::start(traffic)),
+                    ),
+                    _ => Resolution::Unavailable(format!("App {name:?} has no VM address")),
+                })
+            }
+            Entry::Starting { .. } => Step::Hold(name, Holding::Start),
             Entry::Ended { info, .. } if is_parked(info) => Step::Wake(name),
             Entry::Ended { info, .. } => Step::Answer(Resolution::Unavailable(format!(
                 "App {name:?} has ended ({})",
