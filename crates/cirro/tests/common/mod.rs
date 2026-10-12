@@ -105,6 +105,7 @@ pub(crate) fn rootfs() -> &'static Rootfs {
             "counter",
             "dialer",
             "chatter",
+            "udp",
         ] {
             let status = std::process::Command::new("rustc")
                 .args(["--target", "x86_64-unknown-linux-musl", "-O", "-o"])
