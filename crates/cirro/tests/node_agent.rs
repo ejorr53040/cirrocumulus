@@ -1486,6 +1486,76 @@ fn vms_reach_the_internet_but_not_smtp_each_other_or_the_lan() {
     agent.assert_no_cirro_state();
 }
 
+/// A guest can send from any address it likes. Its forged datagrams must
+/// reach neither another VM nor the Node.
+///
+/// A strict rp_filter (1) on the Node, or a host firewall that drops
+/// VM-to-VM forwarding and VM-to-Node input (ufw's defaults), also stops
+/// them, so on such a Node this passes without Cirrocumulus's own rules. To
+/// see it fail without them: `sysctl -w net.ipv4.conf.{all,default}.rp_filter=2`,
+/// `ufw route allow in on cirro-+ out on cirro-+` and
+/// `ufw allow in on cirro-+ to any port 31217 proto udp`.
+#[test]
+fn a_vm_cant_get_past_the_egress_policy_by_forging_its_source_address() {
+    let Some(agent) = Agent::start(217) else {
+        return;
+    };
+    let node = std::net::UdpSocket::bind("0.0.0.0:31217").expect("bind a UDP port on the Node");
+    node.set_nonblocking(true).unwrap();
+    let listener = stdout(
+        agent
+            .run(
+                "listener",
+                &rootfs().guest_init,
+                &["/app/udp", "listen", "9000"],
+            )
+            .success(),
+    )
+    .trim()
+    .to_string();
+    wait_for_log(&agent, "listener", "UDP_LISTENING");
+
+    let other_vm = format!("{listener}:9000");
+    agent
+        .run(
+            "spoofer",
+            &rootfs().guest_init,
+            &[
+                "/app/udp",
+                "spoof",
+                // A documentation address (RFC 5737), so a packet that did
+                // escape would impersonate no one.
+                "203.0.113.7",
+                &other_vm,
+                "10.77.217.1:31217",
+            ],
+        )
+        .success();
+    wait_for_log(&agent, "spoofer", "UDP_SENT 20");
+
+    let heard = stdout(agent.cirro().args(["logs", "listener"]).assert().success());
+    assert!(
+        !heard.contains("UDP_FROM"),
+        "a forged source reached another VM:\n{heard}"
+    );
+    let mut buf = [0; 64];
+    let node_heard = std::iter::from_fn(|| node.recv_from(&mut buf).ok().map(|(_, from)| from))
+        .collect::<Vec<_>>();
+    assert!(
+        node_heard.is_empty(),
+        "a forged source reached the Node: {node_heard:?}"
+    );
+
+    for name in ["listener", "spoofer"] {
+        agent
+            .cirro()
+            .args(["stop", "--force", name])
+            .assert()
+            .success();
+    }
+    agent.assert_no_cirro_state();
+}
+
 #[test]
 fn run_sets_the_commands_env_workdir_and_user_and_finds_it_on_path() {
     let Some(agent) = Agent::start(229) else {

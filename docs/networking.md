@@ -46,6 +46,8 @@ masquerades VMs' traffic out of the Node's default route, and drops:
   `169.254/16`, `172.16/12`, `192.168/16`), so a VM can't reach the LAN, the
   cloud metadata address, or the Node itself;
 - new connections from VMs to the Node.
+- anything a VM sends from an address that isn't its own, since a guest can
+  forge its source address and every rule above matches on it.
 
 The table only ever drops, so a host firewall such as ufw still applies on
 top. `cirro node install` adds the rule that lets VMs' traffic through it:

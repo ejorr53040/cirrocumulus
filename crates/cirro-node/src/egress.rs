@@ -3,6 +3,11 @@
 //! egress interface, but can't send SMTP (TCP/25), reach other VMs, reach
 //! the Node's LAN, or open connections to the Node itself.
 //!
+//! The rules below key on the source address, so the first rule in each
+//! chain drops anything from a VM's veth whose source isn't a VM address: a
+//! guest can send from any address it likes, and the Node's rp_filter is
+//! loose on many distros.
+//!
 //! It all lives in one nftables table, `ip cirro`, which the Node agent
 //! ensures at startup and never removes; only `cirro node uninstall` does
 //! (#11). Every rule matches only Cirrocumulus interfaces (`cirro-*`, the
@@ -47,9 +52,11 @@ pub fn ensure_node_policy(subnet: &str, egress_iface: Option<&str>) -> io::Resul
          flush chain ip {TABLE} forward\n\
          flush chain ip {TABLE} input\n\
          add rule ip {TABLE} postrouting ip saddr @node_subnets oifname @egress_ifaces masquerade\n\
+         add rule ip {TABLE} forward iifname \"cirro-*\" ip saddr != @node_subnets drop\n\
          add rule ip {TABLE} forward iifname \"cirro-*\" ip saddr @node_subnets tcp dport 25 drop\n\
          add rule ip {TABLE} forward iifname \"cirro-*\" ip saddr @node_subnets ip daddr @node_subnets drop\n\
          add rule ip {TABLE} forward iifname \"cirro-*\" ip saddr @node_subnets ip daddr @lan drop\n\
+         add rule ip {TABLE} input iifname \"cirro-*\" ip saddr != @node_subnets drop\n\
          add rule ip {TABLE} input iifname \"cirro-*\" ip saddr @node_subnets ct state new drop\n\
          add element ip {TABLE} node_subnets {{ {subnet} }}\n"
     );
