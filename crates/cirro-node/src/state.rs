@@ -33,6 +33,15 @@ pub(crate) struct MachineRecord {
     pub(crate) fingerprint: String,
 }
 
+/// A Machine-backed App: requests for `host` go to `port` on `machine`'s
+/// localhost.
+pub(crate) struct MachineAppRecord {
+    pub(crate) name: String,
+    pub(crate) machine: String,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+}
+
 pub(crate) struct Store {
     conn: Connection,
 }
@@ -71,6 +80,12 @@ impl Store {
                  ssh         TEXT NOT NULL,
                  pinned_key  TEXT NOT NULL,
                  fingerprint TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS machine_apps (
+                 name    TEXT PRIMARY KEY,
+                 machine TEXT NOT NULL,
+                 host    TEXT NOT NULL,
+                 port    INTEGER NOT NULL
              )",
         )
         .map_err(io_error)?;
@@ -231,6 +246,43 @@ impl Store {
                     machine.fingerprint
                 ],
             )
+            .map(drop)
+            .map_err(io_error)
+    }
+
+    /// Every Machine-backed App's record.
+    pub(crate) fn load_machine_apps(&self) -> io::Result<Vec<MachineAppRecord>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT name, machine, host, port FROM machine_apps ORDER BY name")
+            .map_err(io_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(MachineAppRecord {
+                    name: row.get(0)?,
+                    machine: row.get(1)?,
+                    host: row.get(2)?,
+                    port: row.get(3)?,
+                })
+            })
+            .map_err(io_error)?;
+        rows.collect::<Result<_, _>>().map_err(io_error)
+    }
+
+    /// Records a Machine-backed App just made; its name must be free.
+    pub(crate) fn insert_machine_app(&self, app: &MachineAppRecord) -> io::Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO machine_apps (name, machine, host, port) VALUES (?1, ?2, ?3, ?4)",
+                params![app.name, app.machine, app.host, app.port],
+            )
+            .map(drop)
+            .map_err(io_error)
+    }
+
+    pub(crate) fn delete_machine_app(&self, name: &str) -> io::Result<()> {
+        self.conn
+            .execute("DELETE FROM machine_apps WHERE name = ?1", params![name])
             .map(drop)
             .map_err(io_error)
     }

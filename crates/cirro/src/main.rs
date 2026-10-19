@@ -7,8 +7,8 @@ use cirro_node::agent;
 use cirro_node::release::ReleaseBinaries;
 use cirro_node::subnet::Subnet;
 use cirro_proto::{
-    AddMachine, LOG_CHUNK, MachineHostKey, MachineInfo, MachineScan, Route, RunRequest, Stats,
-    StopRequest, User, VM_STATE_HEADER, VmInfo,
+    AddMachine, LOG_CHUNK, MachineAppInfo, MachineAppRequest, MachineHostKey, MachineInfo,
+    MachineScan, Route, RunRequest, Stats, StopRequest, User, VM_STATE_HEADER, VmInfo,
 };
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use hyper::Method;
@@ -130,9 +130,17 @@ struct RunArgs {
     /// to it
     #[arg(long, requires = "port")]
     host: Option<String>,
-    /// The port the App listens on inside the VM
+    /// The port the App listens on inside the VM, or on the Machine's
+    /// localhost with --machine
     #[arg(long, requires = "host")]
     port: Option<u16>,
+    /// Make a Machine-backed App instead of booting a VM: the edge sends
+    /// requests for --host to --port on this Machine's localhost, where
+    /// something already listens
+    #[arg(long, requires = "host", conflicts_with_all = [
+        "image", "command", "env", "workdir", "user", "idle_park", "mem", "vcpus"
+    ])]
+    machine: Option<String>,
     /// Park the App once no request has come through the edge for this
     /// many seconds; the next request wakes it
     #[arg(long, value_name = "SECS", requires = "host",
@@ -140,8 +148,8 @@ struct RunArgs {
     idle_park: Option<u32>,
     /// An image (nginx:alpine, ghcr.io/owner/app@sha256:...), or the path
     /// of an ext4 rootfs with guest-init as /init
-    #[arg(value_name = "IMAGE|ROOTFS")]
-    image: String,
+    #[arg(value_name = "IMAGE|ROOTFS", required_unless_present = "machine")]
+    image: Option<String>,
     /// The command to run in the VM, and its arguments [default: the
     /// image's]. A rootfs has no default, so needs one.
     #[arg(last = true)]
@@ -471,11 +479,29 @@ async fn run(socket: &Path, args: RunArgs) -> Result<(), String> {
         port,
         idle_park_secs: args.idle_park,
     });
+    if let Some(machine) = args.machine {
+        let request = MachineAppRequest {
+            name: args.name,
+            machine,
+            // `--machine` requires `--host`, which requires `--port`.
+            route: route.ok_or("--machine needs --host and --port")?,
+        };
+        return client::call::<MachineAppInfo>(
+            socket,
+            Method::POST,
+            "/machine-apps",
+            Some(&request),
+        )
+        .await
+        .map(drop);
+    }
+    // Required unless `--machine`, which returned above.
+    let image = args.image.ok_or("an image or rootfs is required")?;
     let request = run_request(
         args.name,
         args.mem,
         args.vcpus,
-        &args.image,
+        &image,
         Guest {
             command: args.command,
             env: args.env,
@@ -826,10 +852,19 @@ async fn ps(socket: &Path, all: bool) -> Result<(), String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let mut header = format!(
-        "{:<32} {:<15} {:>7} {:>5} {:>7}  {:<24}",
-        "NAME", "VM ADDRESS", "MEMORY", "VCPUS", "UPTIME", "HOST"
-    );
+    let machine_apps: Vec<MachineAppInfo> =
+        client::call(socket, Method::GET, "/machine-apps", None::<&()>)
+            .await?
+            .unwrap_or_default();
+    let mut header = ps_row([
+        "NAME",
+        "VM ADDRESS",
+        "MEMORY",
+        "VCPUS",
+        "UPTIME",
+        "HOST",
+        "MACHINE",
+    ]);
     if all {
         header.push_str("  STATUS");
     }
@@ -843,15 +878,15 @@ async fn ps(socket: &Path, all: bool) -> Result<(), String> {
             Some(_) => "-".to_string(),
         };
         let host = vm.route.as_ref().map_or("-", |r| r.host.as_str());
-        let mut row = format!(
-            "{:<32} {:<15} {:>7} {:>5} {:>7}  {:<24}",
-            vm.name,
-            address,
-            format_mem(vm.mem_mib),
-            vm.vcpus,
-            uptime,
+        let mut row = ps_row([
+            &vm.name,
+            &address,
+            &format_mem(vm.mem_mib),
+            &vm.vcpus.to_string(),
+            &uptime,
             host,
-        );
+            "-",
+        ]);
         if all {
             match vm.ended {
                 None => row.push_str("  running"),
@@ -864,7 +899,29 @@ async fn ps(socket: &Path, all: bool) -> Result<(), String> {
         }
         println!("{row}");
     }
+    for app in machine_apps {
+        let mut row = ps_row([
+            &app.name,
+            "-",
+            "-",
+            "-",
+            "-",
+            &app.route.host,
+            &format!("{}:{}", app.machine, app.route.port),
+        ]);
+        if all {
+            row.push_str("  ");
+            row.push_str(app.status.as_str());
+        }
+        println!("{row}");
+    }
     Ok(())
+}
+
+/// One line of `ps`: name, VM address, memory, vCPUs, uptime, host and
+/// Machine.
+fn ps_row([name, address, mem, vcpus, uptime, host, machine]: [&str; 7]) -> String {
+    format!("{name:<32} {address:<15} {mem:>7} {vcpus:>5} {uptime:>7}  {host:<24}  {machine:<24}")
 }
 
 async fn logs(socket: &Path, name: &str, follow: bool) -> Result<(), String> {

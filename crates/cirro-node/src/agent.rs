@@ -29,8 +29,8 @@ use cirro_edge::tls::NodeCa;
 use cirro_edge::{Lease, Resolution, Router};
 use cirro_proto::{
     AddMachine, EndReason, Ended, ErrorBody, LOG_CHUNK, MAX_MEM_MIB, MAX_VCPUS, MIN_MEM_MIB,
-    MIN_VCPUS, MachineHostKey, MachineScan, Route, RunRequest, Stats, StopRequest, VM_STATE_HEADER,
-    VmInfo, VmStats,
+    MIN_VCPUS, MachineAppRequest, MachineHostKey, MachineScan, Route, RunRequest, Stats,
+    StopRequest, VM_STATE_HEADER, VmInfo, VmStats,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -355,6 +355,7 @@ pub async fn run(config: Config) -> io::Result<()> {
             let tls =
                 cirro_edge::tls::server_config(ca.clone(), agent.acme.clone(), move |host| {
                     app_with_host(&routes.vms.lock().unwrap(), host).is_some()
+                        || routes.machines.app_with_host(host).is_some()
                 })?;
             info!(%address, "HTTPS edge listening");
             Some(tokio::spawn(cirro_edge::serve_tls(
@@ -497,7 +498,21 @@ impl Agent {
         {
             return json(e.0, &ErrorBody { error: e.1 });
         }
+        if let ["vms", name, action] = segments.as_slice()
+            && self.machines.has_app(name)
+        {
+            let error = format!(
+                "{name:?} is a Machine-backed App: Cirrocumulus doesn't run what serves it, so \
+                 it can't {action} it; `cirro rm {name}` takes it off the edge"
+            );
+            return json(StatusCode::CONFLICT, &ErrorBody { error });
+        }
         let result = match (&method, segments.as_slice()) {
+            (&Method::GET, ["machine-apps"]) => Ok(json(StatusCode::OK, &self.machines.apps())),
+            (&Method::POST, ["machine-apps"]) => match read_json::<MachineAppRequest>(req).await {
+                Ok(request) => self.run_on_machine(request),
+                Err(e) => Err(e),
+            },
             (&Method::GET, ["stats"]) => Ok(json(StatusCode::OK, &self.stats())),
             (&Method::GET, ["ca"]) => self.ca_pem(),
             (&Method::GET, ["vms"]) => {
@@ -672,6 +687,17 @@ impl Agent {
                     "the Node agent is shutting down".into(),
                 ));
             }
+            if self.machines.has_app(&run.name) {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    format!("a Machine-backed App named {:?} already exists", run.name),
+                ));
+            }
+            if let Some(route) = &run.route
+                && let Some(owner) = self.machines.app_with_host(&route.host)
+            {
+                return Err(hostname_taken(&route.host, &owner, false));
+            }
             match vms.get(&run.name) {
                 Some(Entry::Starting { .. } | Entry::Running { .. }) => {
                     return Err(ApiError(
@@ -694,14 +720,7 @@ impl Agent {
                 && let Some((owner, _)) = app_with_host(&vms, &route.host)
                 && *owner != run.name
             {
-                return Err(ApiError(
-                    StatusCode::CONFLICT,
-                    format!(
-                        "the hostname {:?} belongs to App {owner:?}; stop and rm it to free \
-                         the hostname",
-                        route.host
-                    ),
-                ));
+                return Err(hostname_taken(&route.host, owner, true));
             }
             let vm_address = self.free_vm_address(&vms)?;
             // Reusing an Ended VM's name replaces its record once the new VM
@@ -1306,7 +1325,8 @@ impl Agent {
                 .values()
                 .filter_map(|entry| Some(entry.route()?.host.clone()))
                 .collect();
-            for host in hosts {
+            let machine_hosts = self.machines.apps().into_iter().map(|app| app.route.host);
+            for host in hosts.into_iter().chain(machine_hosts) {
                 self.get_certificate(&host);
             }
         }
@@ -1355,7 +1375,39 @@ impl Agent {
             .expect("build logs response"))
     }
 
+    /// Makes a Machine-backed App, whose name and hostname mustn't be a
+    /// VM's or a VM-backed App's.
+    fn run_on_machine(&self, request: MachineAppRequest) -> Result<ApiResponse, ApiError> {
+        validate_name("App", &request.name)?;
+        validate_route(&request.route)?;
+        if request.route.idle_park_secs.is_some() {
+            return Err(bad_request(
+                "a Machine-backed App can't idle-park: Cirrocumulus doesn't run what serves it",
+            ));
+        }
+        // Held through the add, so no VM takes the name or hostname meanwhile.
+        let vms = self.vms.lock().unwrap();
+        if vms.contains_key(&request.name) {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                format!(
+                    "a VM named {:?} already exists; rm it to use its name",
+                    request.name
+                ),
+            ));
+        }
+        if let Some((owner, _)) = app_with_host(&vms, &request.route.host) {
+            return Err(hostname_taken(&request.route.host, owner, true));
+        }
+        let info = self.machines.add_app(request, &self.store)?;
+        self.get_certificate(&info.route.host);
+        Ok(json(StatusCode::CREATED, &info))
+    }
+
     fn remove(&self, name: &str) -> Result<ApiResponse, ApiError> {
+        if self.machines.remove_app(name, &self.store)? {
+            return Ok(no_content());
+        }
         let mut vms = self.vms.lock().unwrap();
         match vms.get(name) {
             None => Err(no_such_vm(name)),
@@ -1499,6 +1551,9 @@ fn still_starting(name: &str) -> String {
 impl Agent {
     /// What a request for `host` needs next.
     fn step_for(&self, host: &str) -> Step {
+        if let Some(resolution) = self.machines.resolve(host) {
+            return Step::Answer(resolution);
+        }
         let vms = self.vms.lock().unwrap();
         let Some((name, entry)) = app_with_host(&vms, host) else {
             return Step::Answer(Resolution::NotFound);
@@ -1536,6 +1591,16 @@ fn app_with_host<'a>(
 ) -> Option<(&'a String, &'a Entry)> {
     vms.iter()
         .find(|(_, entry)| entry.route().is_some_and(|r| r.host == host))
+}
+
+/// `host` is already the Route of App `owner`, which has to stop before
+/// `rm` when it's VM-backed.
+fn hostname_taken(host: &str, owner: &str, vm_backed: bool) -> ApiError {
+    let stop = if vm_backed { "stop and " } else { "" };
+    ApiError(
+        StatusCode::CONFLICT,
+        format!("the hostname {host:?} belongs to App {owner:?}; {stop}rm it to free the hostname"),
+    )
 }
 
 /// A route's hostname is a DNS name as the edge compares it: lowercase

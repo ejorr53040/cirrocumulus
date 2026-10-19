@@ -4,13 +4,17 @@
 //! OpenSSH `ssh` per Machine running to know whether the Machine is up.
 
 use super::{ApiError, bad_request, internal};
-use crate::state::{MachineRecord, Store};
-use cirro_proto::{AddMachine, MachineInfo, MachineStatus};
+use crate::state::{MachineAppRecord, MachineRecord, Store};
+use cirro_edge::{Lease, Resolution};
+use cirro_proto::{
+    AddMachine, MachineAppInfo, MachineAppRequest, MachineInfo, MachineStatus, Route,
+};
 use hyper::StatusCode;
 use nix::sys::signal::Signal;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
+use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -35,9 +39,21 @@ pub(super) struct Machines {
 
 struct Machine {
     record: MachineRecord,
+    /// Its Machine-backed Apps, by name.
+    apps: BTreeMap<String, MachineApp>,
+    /// What the current `ssh` says: each new `ssh` gets a fresh one, so an
+    /// old one ending can't mark the new one down.
     link: Arc<Mutex<Link>>,
     /// Owns the Machine's `ssh`, which is killed when the task is dropped.
     tunnel: JoinHandle<()>,
+}
+
+struct MachineApp {
+    route: Route,
+    /// The port on the Node's 127.0.0.1 that `ssh` forwards to the route's
+    /// port on the Machine's localhost. Chosen afresh on each connect, so
+    /// a new `ssh` never waits for the old one to let go of it.
+    local_port: u16,
 }
 
 impl Drop for Machine {
@@ -66,15 +82,154 @@ impl Machines {
     /// Brings back the Machines a previous agent added, connecting to each
     /// in the background so an unreachable one holds nothing up.
     pub(super) fn restore(&self, store: &Mutex<Store>) -> io::Result<()> {
-        let records = store.lock().unwrap().load_machines()?;
+        let (records, app_records) = {
+            let store = store.lock().unwrap();
+            (store.load_machines()?, store.load_machine_apps()?)
+        };
         for record in records {
+            let apps = app_records
+                .iter()
+                .filter(|app| app.machine == record.name)
+                .map(|app| {
+                    let route = Route {
+                        host: app.host.clone(),
+                        port: app.port,
+                        idle_park_secs: None,
+                    };
+                    (app.name.clone(), route)
+                })
+                .collect();
             // One Machine that can't be set up mustn't stop the agent starting.
             let name = record.name.clone();
-            if let Err(e) = self.connect(record) {
+            if let Err(e) = self.connect(record, apps) {
                 warn!("restore Machine {name:?}: {e}");
             }
         }
         Ok(())
+    }
+
+    pub(super) fn apps(&self) -> Vec<MachineAppInfo> {
+        let entries = self.entries.lock().unwrap();
+        entries
+            .values()
+            .flat_map(|machine| {
+                let status = machine.link.lock().unwrap().status;
+                machine.apps.iter().map(move |(name, app)| MachineAppInfo {
+                    name: name.clone(),
+                    machine: machine.record.name.clone(),
+                    route: app.route.clone(),
+                    status,
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn has_app(&self, name: &str) -> bool {
+        has_app(&self.entries.lock().unwrap(), name)
+    }
+
+    /// The Machine-backed App whose route has `host`, if any.
+    pub(super) fn app_with_host(&self, host: &str) -> Option<String> {
+        app_with_host(&self.entries.lock().unwrap(), host)
+    }
+
+    /// Where the edge sends a request for `host`, when a Machine-backed App
+    /// has it: through its Machine's `ssh` while that's up.
+    pub(super) fn resolve(&self, host: &str) -> Option<Resolution> {
+        let entries = self.entries.lock().unwrap();
+        entries.values().find_map(|machine| {
+            let app = machine.apps.values().find(|app| app.route.host == host)?;
+            let link = machine.link.lock().unwrap();
+            Some(match link.status {
+                MachineStatus::Up => Resolution::Upstream(
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, app.local_port)),
+                    Lease::new(()),
+                ),
+                MachineStatus::Unreachable => Resolution::Unavailable(format!(
+                    "Machine {:?} is unreachable{}",
+                    machine.record.name,
+                    link.last_error
+                        .as_ref()
+                        .map_or(String::new(), |e| format!(": {e}"))
+                )),
+            })
+        })
+    }
+
+    /// Makes a Machine-backed App and reconnects its Machine to forward to
+    /// it. The caller has checked the name and hostname aren't a VM's or
+    /// a VM-backed App's, and holds the VM table so neither can be taken
+    /// meanwhile.
+    pub(super) fn add_app(
+        &self,
+        request: MachineAppRequest,
+        store: &Mutex<Store>,
+    ) -> Result<MachineAppInfo, ApiError> {
+        let mut entries = self.entries.lock().unwrap();
+        if has_app(&entries, &request.name) {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                format!("an App named {:?} already exists", request.name),
+            ));
+        }
+        if let Some(owner) = app_with_host(&entries, &request.route.host) {
+            return Err(super::hostname_taken(&request.route.host, &owner, false));
+        }
+        let machine = entries.get_mut(&request.machine).ok_or_else(|| {
+            ApiError(
+                StatusCode::NOT_FOUND,
+                format!("no Machine named {:?}", request.machine),
+            )
+        })?;
+        machine.apps.insert(
+            request.name.clone(),
+            MachineApp {
+                route: request.route.clone(),
+                local_port: 0,
+            },
+        );
+        if let Err(e) = self.start_tunnel(machine) {
+            machine.apps.remove(&request.name);
+            return Err(internal(format!(
+                "reconnect Machine {:?}: {e}",
+                request.machine
+            )));
+        }
+        let recorded = store.lock().unwrap().insert_machine_app(&MachineAppRecord {
+            name: request.name.clone(),
+            machine: request.machine.clone(),
+            host: request.route.host.clone(),
+            port: request.route.port,
+        });
+        if let Err(e) = recorded {
+            machine.apps.remove(&request.name);
+            let _ = self.start_tunnel(machine);
+            return Err(internal(format!("record App {:?}: {e}", request.name)));
+        }
+        Ok(MachineAppInfo {
+            name: request.name,
+            machine: request.machine,
+            route: request.route,
+            status: machine.link.lock().unwrap().status,
+        })
+    }
+
+    /// Removes the Machine-backed App `name` and stops forwarding to it;
+    /// `false` when there's none.
+    pub(super) fn remove_app(&self, name: &str, store: &Mutex<Store>) -> Result<bool, ApiError> {
+        let mut entries = self.entries.lock().unwrap();
+        let Some(machine) = entries.values_mut().find(|m| m.apps.contains_key(name)) else {
+            return Ok(false);
+        };
+        store
+            .lock()
+            .unwrap()
+            .delete_machine_app(name)
+            .map_err(|e| internal(format!("remove the record of App {name:?}: {e}")))?;
+        machine.apps.remove(name);
+        self.start_tunnel(machine)
+            .map_err(|e| internal(format!("reconnect Machine {:?}: {e}", machine.record.name)))?;
+        Ok(true)
     }
 
     /// The agent's SSH public key, made on first use.
@@ -188,7 +343,7 @@ impl Machines {
             .insert_machine(&record)
             .map_err(|e| internal(format!("record Machine {:?}: {e}", record.name)))?;
         let name = record.name.clone();
-        self.connect(record)
+        self.connect(record, BTreeMap::new())
             .map_err(|e| internal(format!("connect to Machine {name:?}: {e}")))?;
         Ok(self.entries.lock().unwrap()[&name].info())
     }
@@ -197,10 +352,20 @@ impl Machines {
         // Not mid-add: rewriting known_hosts would unpin the key being added.
         let _adding = self.adding.lock().await;
         let mut entries = self.entries.lock().unwrap();
-        if !entries.contains_key(name) {
+        let Some(machine) = entries.get(name) else {
             return Err(ApiError(
                 StatusCode::NOT_FOUND,
                 format!("no Machine named {name:?}"),
+            ));
+        };
+        if !machine.apps.is_empty() {
+            let apps: Vec<&str> = machine.apps.keys().map(String::as_str).collect();
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                format!(
+                    "Machine {name:?} still has Apps ({}); rm them first",
+                    apps.join(", ")
+                ),
             ));
         }
         store
@@ -220,27 +385,64 @@ impl Machines {
         self.entries.lock().unwrap().clear();
     }
 
-    /// Starts the Machine's `ssh` and tracks what it says.
-    fn connect(&self, record: MachineRecord) -> io::Result<()> {
-        let target = Target::parse(&record.ssh).map_err(|e| io::Error::other(e.1))?;
+    /// Records the Machine with its Apps and starts its `ssh`.
+    fn connect(&self, record: MachineRecord, apps: BTreeMap<String, Route>) -> io::Result<()> {
         let mut entries = self.entries.lock().unwrap();
         self.write_known_hosts(&entries, Some(&record))?;
-        let link = Arc::new(Mutex::new(Link {
+        let mut machine = Machine {
+            record,
+            apps: apps
+                .into_iter()
+                .map(|(name, route)| {
+                    (
+                        name,
+                        MachineApp {
+                            route,
+                            local_port: 0,
+                        },
+                    )
+                })
+                .collect(),
+            link: Arc::new(Mutex::new(Link {
+                status: MachineStatus::Unreachable,
+                last_error: None,
+            })),
+            tunnel: tokio::spawn(async {}),
+        };
+        self.start_tunnel(&mut machine)?;
+        entries.insert(machine.record.name.clone(), machine);
+        Ok(())
+    }
+
+    /// Replaces the Machine's `ssh` with one that forwards to each of its
+    /// Apps, and tracks what it says.
+    fn start_tunnel(&self, machine: &mut Machine) -> io::Result<()> {
+        let target = Target::parse(&machine.record.ssh).map_err(|e| io::Error::other(e.1))?;
+        // Every port is chosen before anything changes, so a failure leaves
+        // the running `ssh` and the ports the edge uses as they were.
+        let ports = free_local_ports(machine.apps.len())?;
+        let mut options = vec![
+            "-N".to_string(),
+            "-o".into(),
+            "ExitOnForwardFailure=yes".into(),
+        ];
+        for (app, port) in machine.apps.values_mut().zip(ports) {
+            app.local_port = port;
+            options.push("-L".into());
+            options.push(format!(
+                "127.0.0.1:{}:localhost:{}",
+                app.local_port, app.route.port
+            ));
+        }
+        machine.tunnel.abort();
+        machine.link = Arc::new(Mutex::new(Link {
             status: MachineStatus::Unreachable,
             last_error: None,
         }));
-        let tunnel = tokio::spawn(run_tunnel(
-            self.ssh(&record.name, &target, &["-N"], &[]),
-            link.clone(),
+        machine.tunnel = tokio::spawn(run_tunnel(
+            self.ssh(&machine.record.name, &target, &options, &[]),
+            machine.link.clone(),
         ));
-        entries.insert(
-            record.name.clone(),
-            Machine {
-                record,
-                link,
-                tunnel,
-            },
-        );
         Ok(())
     }
 
@@ -263,7 +465,7 @@ impl Machines {
 
     /// `ssh` to the Machine `name` with the agent's key, trusting only its
     /// pinned host key and ignoring root's own SSH config.
-    fn ssh(&self, name: &str, target: &Target, options: &[&str], command: &[&str]) -> Command {
+    fn ssh(&self, name: &str, target: &Target, options: &[String], command: &[&str]) -> Command {
         let mut cmd = Command::new("ssh");
         cmd.args(["-F", "/dev/null", "-T"])
             .args(["-o", "BatchMode=yes"])
@@ -454,6 +656,31 @@ async fn fingerprint(key: &str) -> Result<String, ApiError> {
         .nth(1)
         .map(str::to_string)
         .ok_or_else(|| internal(format!("ssh-keygen couldn't read the host key {key:?}")))
+}
+
+fn has_app(entries: &BTreeMap<String, Machine>, name: &str) -> bool {
+    entries.values().any(|m| m.apps.contains_key(name))
+}
+
+fn app_with_host(entries: &BTreeMap<String, Machine>, host: &str) -> Option<String> {
+    entries.values().find_map(|m| {
+        m.apps
+            .iter()
+            .find(|(_, app)| app.route.host == host)
+            .map(|(name, _)| name.clone())
+    })
+}
+
+/// `n` different ports free on the Node's 127.0.0.1 a moment ago: all
+/// held at once while they're chosen, so none is handed out twice.
+// ponytail: something else can take one before `ssh` binds it; `ssh` then
+// exits (ExitOnForwardFailure) and the Machine shows unreachable until #44
+// reconnects it on fresh ports.
+fn free_local_ports(n: usize) -> io::Result<Vec<u16>> {
+    let held = (0..n)
+        .map(|_| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)))
+        .collect::<io::Result<Vec<_>>>()?;
+    held.iter().map(|l| Ok(l.local_addr()?.port())).collect()
 }
 
 /// The last thing `ssh` said, which is why it failed when it did.
