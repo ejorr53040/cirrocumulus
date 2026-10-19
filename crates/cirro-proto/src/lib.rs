@@ -17,11 +17,17 @@
 //! | `GET /machines`                |                 | `200` `[`[`MachineInfo`]`]` |
 //! | `POST /machines/scan`          | [`MachineScan`] | `200` [`MachineHostKey`] |
 //! | `DELETE /machines/{name}`      |                 | `204`                    |
+//! | `POST /machine-apps`           | [`MachineAppRequest`] | `201` [`MachineAppInfo`] |
+//! | `GET /machine-apps`            |                 | `200` `[`[`MachineAppInfo`]`]` |
 //!
 //! `GET /ssh-key` is the agent's own SSH public key, made on first use: a
 //! Machine lets the agent in by listing it in `authorized_keys`. A scan
 //! asks a Machine for its host key without trusting it, so `cirro machine
 //! add` can show the fingerprint for confirming before it's pinned.
+//!
+//! A Machine-backed App shares its name and hostname with VMs' and Apps',
+//! so `DELETE /vms/{name}` removes it too; stopping, parking, waking or
+//! reading the logs of one is refused, since nothing of it runs on the Node.
 //!
 //! `GET /vms` lists running VMs; `all=true` adds Ended VMs. A parked VM is
 //! an Ended VM whose reason is [`EndReason::Parked`]; waking it starts a new
@@ -203,6 +209,28 @@ pub struct MachineHostKey {
     /// The fingerprint (`SHA256:...`) of the host key the Machine
     /// presented: its Ed25519 key's when it has one.
     pub host_key: String,
+}
+
+/// Make a Machine-backed App: the Node's edge sends requests for the
+/// route's hostname to `route.port` on the Machine's own localhost.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineAppRequest {
+    /// 1-32 characters of lowercase letters, digits and hyphens.
+    pub name: String,
+    /// The Machine it runs on.
+    pub machine: String,
+    /// Without `idle_park_secs`: what serves a Machine-backed App isn't the
+    /// Node's to park.
+    pub route: Route,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineAppInfo {
+    pub name: String,
+    pub machine: String,
+    pub route: Route,
+    /// Its Machine's: whether the edge can reach it.
+    pub status: MachineStatus,
 }
 
 /// Whether the agent's SSH connection to a Machine is up.

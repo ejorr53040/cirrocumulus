@@ -91,7 +91,18 @@ impl Agent {
     /// Like [`Agent::start`], for tests that boot no VM and so don't need
     /// KVM: Machine tests.
     fn start_without_kvm(octet: u8) -> Option<Agent> {
-        Agent::start_checked(octet, &getgid().as_raw().to_string(), Vec::new(), false)
+        Agent::start_without_kvm_with_args(octet, &[])
+    }
+
+    /// Like [`Agent::start_without_kvm`], with more `cirro node agent`
+    /// arguments.
+    fn start_without_kvm_with_args(octet: u8, args: &[&str]) -> Option<Agent> {
+        Agent::start_checked(
+            octet,
+            &getgid().as_raw().to_string(),
+            args.iter().map(|a| a.to_string()).collect(),
+            false,
+        )
     }
 
     fn start_with(octet: u8, socket_group: &str, extra_args: Vec<String>) -> Option<Agent> {
@@ -2926,4 +2937,261 @@ fn a_machine_survives_a_restart_and_rm_leaves_nothing() {
         .args(["machine", "rm", "pi"])
         .assert()
         .failure();
+}
+
+/// Lets the agent in to `sshd` and adds it as Machine `name`.
+fn add_machine(agent: &Agent, sshd: &Sshd, name: &str) {
+    authorize_agent(agent, sshd);
+    agent
+        .cirro()
+        .args(["machine", "add", name, "--ssh", &sshd.target()])
+        .args(["--host-key", &sshd.fingerprint()])
+        .assert()
+        .success();
+    wait_for_machine(agent, name, "up");
+}
+
+/// A service on a Machine: answers every request on 127.0.0.1:`port` with
+/// `body`, until the test process exits.
+fn serve_http(port: u16, body: &'static str) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind the service");
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+}
+
+/// `cirro run --name <name> --machine <machine> --host <host> --port <port>`.
+fn run_on_machine(
+    agent: &Agent,
+    name: &str,
+    machine: &str,
+    host: &str,
+    port: u16,
+) -> assert_cmd::assert::Assert {
+    agent
+        .cirro()
+        .args(["run", "--name", name, "--machine", machine, "--host", host])
+        .args(["--port", &port.to_string()])
+        .assert()
+}
+
+/// M8: a Machine-backed App is served through the edge, over HTTP and
+/// HTTPS, from a port on its Machine's localhost, and `ps` lists it with
+/// its Machine.
+#[test]
+fn a_machine_backed_app_is_served_through_the_edge() {
+    let Some(sshd) = Sshd::start(184) else {
+        return;
+    };
+    let Some(agent) = Agent::start_without_kvm(184) else {
+        return;
+    };
+    add_machine(&agent, &sshd, "pi");
+    let port = 23184;
+    serve_http(port, "hello from pi");
+
+    run_on_machine(&agent, "web", "pi", "pi.test", port).success();
+    let answer = wait_for_edge(&agent, "pi.test");
+    assert!(answer.ends_with("hello from pi"), "{answer:?}");
+
+    let ca = agent.state_dir.join("test-ca.pem");
+    std::fs::write(
+        &ca,
+        stdout(agent.cirro().args(["node", "ca"]).assert().success()),
+    )
+    .unwrap();
+    assert_eq!(
+        tls_get(&agent, "pi.test", &ca).expect("HTTPS through the edge"),
+        "hello from pi"
+    );
+
+    let ps = agent.ps(false);
+    let web = row(&ps, "web").unwrap_or_else(|| panic!("web isn't listed:\n{ps}"));
+    assert!(web.contains(&format!("pi:{port}")), "{web}");
+    assert!(web.contains("pi.test"), "{web}");
+}
+
+/// M8: a Machine-backed App can't be stopped, parked or woken, since
+/// nothing of it runs on the Node; its name and hostname are its own; it
+/// outlives an agent restart; its Machine can't be removed under it; and
+/// `rm` takes it off the edge.
+#[test]
+fn a_machine_backed_app_is_only_routed_and_rm_takes_it_off_the_edge() {
+    let Some(sshd) = Sshd::start(185) else {
+        return;
+    };
+    let Some(mut agent) = Agent::start_without_kvm(185) else {
+        return;
+    };
+    add_machine(&agent, &sshd, "pi");
+    let port = 23185;
+    serve_http(port, "hello from pi");
+    run_on_machine(&agent, "web", "pi", "pi.test", port).success();
+    wait_for_edge(&agent, "pi.test");
+
+    for action in ["stop", "park", "wake", "logs"] {
+        let refused = stderr(agent.cirro().args([action, "web"]).assert().failure());
+        assert!(
+            refused.contains("Machine-backed App"),
+            "{action}: {refused}"
+        );
+    }
+    let idle = agent
+        .cirro()
+        .args([
+            "run",
+            "--name",
+            "lazy",
+            "--machine",
+            "pi",
+            "--host",
+            "lazy.test",
+        ])
+        .args(["--port", &port.to_string(), "--idle-park", "60"])
+        .assert()
+        .failure();
+    let idle = stderr(idle);
+    assert!(idle.contains("--idle-park"), "{idle}");
+    let both = agent
+        .cirro()
+        .args([
+            "run",
+            "--name",
+            "both",
+            "--machine",
+            "pi",
+            "--host",
+            "both.test",
+        ])
+        .args(["--port", &port.to_string()])
+        .arg(&rootfs().guest_init)
+        .assert()
+        .failure();
+    let both = stderr(both);
+    assert!(both.contains("--machine"), "{both}");
+    let no_route = stderr(
+        agent
+            .cirro()
+            .args(["run", "--name", "bare", "--machine", "pi"])
+            .assert()
+            .failure(),
+    );
+    assert!(no_route.contains("--host"), "{no_route}");
+    let nowhere = stderr(run_on_machine(&agent, "other", "nope", "other.test", port).failure());
+    assert!(nowhere.contains("no Machine named"), "{nowhere}");
+    let same_name = stderr(run_on_machine(&agent, "web", "pi", "other.test", port).failure());
+    assert!(same_name.contains("already exists"), "{same_name}");
+    let same_host = stderr(run_on_machine(&agent, "other", "pi", "pi.test", port).failure());
+    assert!(same_host.contains("belongs to App \"web\""), "{same_host}");
+    let in_use = stderr(
+        agent
+            .cirro()
+            .args(["machine", "rm", "pi"])
+            .assert()
+            .failure(),
+    );
+    assert!(in_use.contains("web"), "{in_use}");
+
+    agent.restart();
+    let answer = wait_for_edge(&agent, "pi.test");
+    assert!(answer.ends_with("hello from pi"), "{answer:?}");
+
+    agent.cirro().args(["rm", "web"]).assert().success();
+    let gone = edge_get(&agent, "pi.test").expect("ask the edge");
+    assert!(gone.starts_with("HTTP/1.1 404"), "{gone:?}");
+    assert!(row(&agent.ps(true), "web").is_none());
+    agent
+        .cirro()
+        .args(["machine", "rm", "pi"])
+        .assert()
+        .success();
+}
+
+/// M8: VM-backed and Machine-backed Apps share one namespace of names and
+/// hostnames, whichever comes first.
+#[test]
+fn vm_and_machine_backed_apps_share_names_and_hostnames() {
+    let Some(sshd) = Sshd::start(186) else {
+        return;
+    };
+    let Some(agent) = Agent::start(186) else {
+        return;
+    };
+    add_machine(&agent, &sshd, "pi");
+    let port = 23186;
+    serve_http(port, "hello from pi");
+    run_app(&agent, "tally", "counter.test", &["/app/counter"]).success();
+    run_on_machine(&agent, "web", "pi", "pi.test", port).success();
+
+    let name = stderr(run_on_machine(&agent, "tally", "pi", "other.test", port).failure());
+    assert!(name.contains("already exists"), "{name}");
+    let host = stderr(run_on_machine(&agent, "other", "pi", "counter.test", port).failure());
+    assert!(host.contains("belongs to App \"tally\""), "{host}");
+    let name = stderr(run_app(&agent, "web", "vm.test", &["/app/counter"]).failure());
+    assert!(name.contains("already exists"), "{name}");
+    let host = stderr(run_app(&agent, "other", "pi.test", &["/app/counter"]).failure());
+    assert!(host.contains("belongs to App \"web\""), "{host}");
+
+    agent.cirro().args(["rm", "web"]).assert().success();
+    agent
+        .cirro()
+        .args(["stop", "--force", "tally"])
+        .assert()
+        .success();
+    agent.cirro().args(["rm", "tally"]).assert().success();
+    agent.assert_no_cirro_state();
+}
+
+/// M8: a Machine-backed App with a public hostname gets its certificate
+/// from the ACME CA, as a VM-backed App does.
+#[test]
+fn a_machine_backed_app_with_a_public_hostname_gets_an_acme_certificate() {
+    let Some(pebble) = Pebble::start(187) else {
+        return;
+    };
+    let Some(sshd) = Sshd::start(187) else {
+        return;
+    };
+    let minica = pebble.minica.to_string_lossy().into_owned();
+    let Some(agent) = Agent::start_without_kvm_with_args(
+        187,
+        &[
+            "--acme-email",
+            "ops@cirro-test.dev",
+            "--acme-directory",
+            &pebble.directory,
+            "--acme-root",
+            &minica,
+        ],
+    ) else {
+        return;
+    };
+    add_machine(&agent, &sshd, "pi");
+    let port = 23187;
+    serve_http(port, "hello from pi");
+    run_on_machine(&agent, "web", "pi", "pi.cirro-test.dev", port).success();
+    wait_for_edge(&agent, "pi.cirro-test.dev");
+    let root = agent.state_dir.join("pebble-root.pem");
+    pebble.write_root(&root);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let answer = loop {
+        match tls_get(&agent, "pi.cirro-test.dev", &root) {
+            Ok(answer) => break answer,
+            Err(e) => assert!(
+                Instant::now() < deadline,
+                "the App was never served with a certificate from the ACME CA: {e}"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    assert_eq!(answer, "hello from pi");
 }
