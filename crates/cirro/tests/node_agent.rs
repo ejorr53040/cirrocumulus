@@ -88,8 +88,23 @@ impl Agent {
         Agent::start_with(octet, socket_group, Vec::new())
     }
 
+    /// Like [`Agent::start`], for tests that boot no VM and so don't need
+    /// KVM: Machine tests.
+    fn start_without_kvm(octet: u8) -> Option<Agent> {
+        Agent::start_checked(octet, &getgid().as_raw().to_string(), Vec::new(), false)
+    }
+
     fn start_with(octet: u8, socket_group: &str, extra_args: Vec<String>) -> Option<Agent> {
-        if !Path::new("/dev/kvm").exists() {
+        Agent::start_checked(octet, socket_group, extra_args, true)
+    }
+
+    fn start_checked(
+        octet: u8,
+        socket_group: &str,
+        extra_args: Vec<String>,
+        needs_kvm: bool,
+    ) -> Option<Agent> {
+        if needs_kvm && !Path::new("/dev/kvm").exists() {
             eprintln!("skipping: /dev/kvm not present");
             return None;
         }
@@ -2596,4 +2611,319 @@ fn an_app_with_a_public_hostname_is_served_with_an_acme_certificate() {
         .success();
     agent.cirro().args(["rm", "tally"]).assert().success();
     agent.assert_no_cirro_state();
+}
+
+/// A throwaway `sshd` on 127.0.0.1, run as the test user, standing in for a
+/// Machine: its own host key and `authorized_keys`, both in a temp dir.
+/// Dropping it kills `sshd` and removes the dir.
+struct Sshd {
+    child: Child,
+    dir: PathBuf,
+    port: u16,
+}
+
+impl Sshd {
+    /// Starts `sshd` for the test on Node subnet octet `octet`, or returns
+    /// `None` (after saying why) when there's no `sshd` to run.
+    fn start(octet: u8) -> Option<Sshd> {
+        // Arch has it in /usr/bin; Debian and Fedora in /usr/sbin.
+        let Some(sshd) = ["/usr/bin/sshd", "/usr/sbin/sshd"]
+            .into_iter()
+            .map(Path::new)
+            .find(|p| p.exists())
+        else {
+            eprintln!("skipping: no sshd in /usr/bin or /usr/sbin");
+            return None;
+        };
+        let port = 22000 + u16::from(octet);
+        let dir = std::env::temp_dir().join(format!("cirro-sshd-{}-{octet}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create sshd dir");
+        let status = std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(dir.join("host_key"))
+            .status()
+            .expect("run ssh-keygen");
+        assert!(status.success(), "ssh-keygen failed");
+        std::fs::write(dir.join("authorized_keys"), "").unwrap();
+        let config = dir.join("sshd_config");
+        std::fs::write(
+            &config,
+            format!(
+                "Port {port}\nListenAddress 127.0.0.1\nHostKey {dir}/host_key\n\
+                 AuthorizedKeysFile {dir}/authorized_keys\nPidFile none\nStrictModes no\n\
+                 UsePAM no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n",
+                dir = dir.display()
+            ),
+        )
+        .unwrap();
+        let child = std::process::Command::new(sshd)
+            .arg("-f")
+            .arg(&config)
+            .args(["-D", "-e"])
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start sshd");
+        let deadline = Instant::now() + TIMEOUT;
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(Instant::now() < deadline, "sshd never listened on {port}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Some(Sshd { child, dir, port })
+    }
+
+    /// The `--ssh` target that logs in to it as the test user.
+    fn target(&self) -> String {
+        let user = std::env::var("USER").expect("USER set");
+        format!("{user}@127.0.0.1:{}", self.port)
+    }
+
+    /// Its host key's fingerprint, as `ssh-keygen -l` prints it.
+    fn fingerprint(&self) -> String {
+        let out = std::process::Command::new("ssh-keygen")
+            .arg("-lf")
+            .arg(self.dir.join("host_key.pub"))
+            .output()
+            .expect("run ssh-keygen");
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .nth(1)
+            .expect("a fingerprint")
+            .to_string()
+    }
+
+    /// Lets `public_key` log in.
+    fn authorize(&self, public_key: &str) {
+        std::fs::write(self.dir.join("authorized_keys"), public_key).unwrap();
+    }
+}
+
+impl Drop for Sshd {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// `cirro machine ls`'s row for `name` once it shows `status`.
+fn wait_for_machine(agent: &Agent, name: &str, status: &str) -> String {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let ls = stdout(agent.cirro().args(["machine", "ls"]).assert().success());
+        if let Some(row) = row(&ls, name)
+            && row.split_whitespace().any(|field| field == status)
+        {
+            return row.to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Machine {name} never showed {status}:\n{ls}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Lets the agent's SSH key log in to `sshd`.
+fn authorize_agent(agent: &Agent, sshd: &Sshd) {
+    let key = stdout(agent.cirro().args(["machine", "key"]).assert().success());
+    sshd.authorize(&key);
+}
+
+/// M8: a Machine added with its host key given up front is pinned and
+/// listed with its target and fingerprint, and comes up.
+#[test]
+fn a_machine_added_with_its_host_key_is_listed_up() {
+    let Some(sshd) = Sshd::start(180) else {
+        return;
+    };
+    let Some(agent) = Agent::start_without_kvm(180) else {
+        return;
+    };
+    authorize_agent(&agent, &sshd);
+    agent
+        .cirro()
+        .args(["machine", "add", "pi", "--ssh", &sshd.target()])
+        .args(["--host-key", &sshd.fingerprint()])
+        .assert()
+        .success();
+
+    let row = wait_for_machine(&agent, "pi", "up");
+    assert!(row.contains(&sshd.target()), "{row}");
+    assert!(row.contains(&sshd.fingerprint()), "{row}");
+}
+
+/// M8: without `--host-key`, `machine add` shows the fingerprint of the
+/// host key the Machine presents and pins it only once that's confirmed.
+#[test]
+fn a_machine_added_without_its_host_key_is_pinned_only_once_confirmed() {
+    let Some(sshd) = Sshd::start(181) else {
+        return;
+    };
+    let Some(agent) = Agent::start_without_kvm(181) else {
+        return;
+    };
+    authorize_agent(&agent, &sshd);
+    let add = || {
+        let mut cmd = agent.cirro();
+        cmd.args(["machine", "add", "pi", "--ssh", &sshd.target()]);
+        cmd
+    };
+
+    let declined = add().write_stdin("n\n").assert().failure();
+    assert!(stdout(declined).contains(&sshd.fingerprint()));
+    let ls = stdout(agent.cirro().args(["machine", "ls"]).assert().success());
+    assert!(row(&ls, "pi").is_none(), "declined but added:\n{ls}");
+
+    let confirmed = add().write_stdin("y\n").assert().success();
+    assert!(stdout(confirmed).contains(&sshd.fingerprint()));
+    let row = wait_for_machine(&agent, "pi", "up");
+    assert!(row.contains(&sshd.fingerprint()), "{row}");
+}
+
+/// M8: a Machine that presents another host key, can't be reached, or
+/// won't let the agent's key in is refused, as are bad targets and names,
+/// and none of them is left registered.
+#[test]
+fn a_machine_that_cant_be_trusted_or_reached_is_not_added() {
+    let Some(sshd) = Sshd::start(182) else {
+        return;
+    };
+    let Some(agent) = Agent::start_without_kvm(182) else {
+        return;
+    };
+    let add = |name: &str, ssh: &str, host_key: &str| {
+        let out = agent
+            .cirro()
+            .args([
+                "machine",
+                "add",
+                name,
+                &format!("--ssh={ssh}"),
+                "--host-key",
+                host_key,
+            ])
+            .assert()
+            .failure();
+        String::from_utf8_lossy(&out.get_output().stderr).into_owned()
+    };
+    let target = sshd.target();
+    let fingerprint = sshd.fingerprint();
+
+    // Not yet in authorized_keys.
+    let refused = add("pi", &target, &fingerprint);
+    assert!(refused.contains("authorized_keys"), "{refused}");
+
+    authorize_agent(&agent, &sshd);
+    let wrong = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let mismatch = add("pi", &target, wrong);
+    assert!(mismatch.contains(&fingerprint), "{mismatch}");
+
+    // Nothing listens on port 1.
+    let user = std::env::var("USER").unwrap();
+    let unreachable = add("pi", &format!("{user}@127.0.0.1:1"), &fingerprint);
+    assert!(unreachable.contains("no SSH server"), "{unreachable}");
+
+    let injected = add("pi", "-oProxyCommand=touch@x", &fingerprint);
+    assert!(injected.contains("invalid SSH target"), "{injected}");
+    let bad_name = add("Pi_1", &target, &fingerprint);
+    assert!(bad_name.contains("invalid Machine name"), "{bad_name}");
+
+    let ls = stdout(agent.cirro().args(["machine", "ls"]).assert().success());
+    assert_eq!(ls.lines().count(), 1, "something was added:\n{ls}");
+
+    agent
+        .cirro()
+        .args([
+            "machine",
+            "add",
+            "pi",
+            "--ssh",
+            &target,
+            "--host-key",
+            &fingerprint,
+        ])
+        .assert()
+        .success();
+    let taken = add("pi", &target, &fingerprint);
+    assert!(taken.contains("already exists"), "{taken}");
+}
+
+/// The agent's `ssh` processes for this test's state dir: their command
+/// lines name its known_hosts file.
+fn machine_ssh_processes(agent: &Agent) -> String {
+    let known_hosts = agent.state_dir.join("known_hosts");
+    let out = std::process::Command::new("pgrep")
+        .arg("-af")
+        .arg(format!("UserKnownHostsFile={}", known_hosts.display()))
+        .output()
+        .expect("run pgrep");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn wait_for_no_machine_ssh(agent: &Agent) {
+    let deadline = Instant::now() + TIMEOUT;
+    while !machine_ssh_processes(agent).is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "ssh still running:\n{}",
+            machine_ssh_processes(agent)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// M8: a Machine outlives an agent restart and comes back up; `rm` then
+/// leaves no record, pinned key or `ssh` behind. The agent's private key
+/// is root's alone.
+#[test]
+fn a_machine_survives_a_restart_and_rm_leaves_nothing() {
+    let Some(sshd) = Sshd::start(183) else {
+        return;
+    };
+    let Some(mut agent) = Agent::start_without_kvm(183) else {
+        return;
+    };
+    authorize_agent(&agent, &sshd);
+    let key = std::fs::read(agent.state_dir.join("ssh_key"));
+    assert!(
+        key.is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied),
+        "the agent's private key is readable by others"
+    );
+    agent
+        .cirro()
+        .args(["machine", "add", "pi", "--ssh", &sshd.target()])
+        .args(["--host-key", &sshd.fingerprint()])
+        .assert()
+        .success();
+    wait_for_machine(&agent, "pi", "up");
+
+    agent.restart();
+    wait_for_machine(&agent, "pi", "up");
+    assert!(
+        !machine_ssh_processes(&agent).is_empty(),
+        "no ssh found for an up Machine, so the checks below prove nothing"
+    );
+
+    // A crashed agent's ssh dies with it, and the next agent reconnects.
+    agent.crash_agent();
+    wait_for_no_machine_ssh(&agent);
+    agent.spawn().expect("start the agent again");
+    wait_for_machine(&agent, "pi", "up");
+
+    agent
+        .cirro()
+        .args(["machine", "rm", "pi"])
+        .assert()
+        .success();
+    let ls = stdout(agent.cirro().args(["machine", "ls"]).assert().success());
+    assert!(row(&ls, "pi").is_none(), "still listed:\n{ls}");
+    let known_hosts = std::fs::read_to_string(agent.state_dir.join("known_hosts")).unwrap();
+    assert!(known_hosts.is_empty(), "still pinned: {known_hosts}");
+    wait_for_no_machine_ssh(&agent);
+    agent
+        .cirro()
+        .args(["machine", "rm", "pi"])
+        .assert()
+        .failure();
 }

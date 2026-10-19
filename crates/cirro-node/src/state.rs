@@ -22,6 +22,17 @@ pub(crate) struct Record {
     pub(crate) process: Option<ProcessId>,
 }
 
+/// A Machine as `cirro machine add` pinned it.
+pub(crate) struct MachineRecord {
+    pub(crate) name: String,
+    /// `user@host[:port]`.
+    pub(crate) ssh: String,
+    /// The pinned host key, `<type> <base64>`.
+    pub(crate) pinned_key: String,
+    /// `pinned_key`'s fingerprint, `SHA256:...`.
+    pub(crate) fingerprint: String,
+}
+
 pub(crate) struct Store {
     conn: Connection,
 }
@@ -54,6 +65,12 @@ impl Store {
                  route_host TEXT,
                  route_port INTEGER,
                  route_idle_park INTEGER
+             );
+             CREATE TABLE IF NOT EXISTS machines (
+                 name        TEXT PRIMARY KEY,
+                 ssh         TEXT NOT NULL,
+                 pinned_key  TEXT NOT NULL,
+                 fingerprint TEXT NOT NULL
              )",
         )
         .map_err(io_error)?;
@@ -178,6 +195,49 @@ impl Store {
     pub(crate) fn delete(&self, name: &str) -> io::Result<()> {
         self.conn
             .execute("DELETE FROM vms WHERE name = ?1", params![name])
+            .map(drop)
+            .map_err(io_error)
+    }
+
+    /// Every Machine's record.
+    pub(crate) fn load_machines(&self) -> io::Result<Vec<MachineRecord>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT name, ssh, pinned_key, fingerprint FROM machines ORDER BY name")
+            .map_err(io_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(MachineRecord {
+                    name: row.get(0)?,
+                    ssh: row.get(1)?,
+                    pinned_key: row.get(2)?,
+                    fingerprint: row.get(3)?,
+                })
+            })
+            .map_err(io_error)?;
+        rows.collect::<Result<_, _>>().map_err(io_error)
+    }
+
+    /// Records a Machine just added; its name must be free.
+    pub(crate) fn insert_machine(&self, machine: &MachineRecord) -> io::Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO machines (name, ssh, pinned_key, fingerprint)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    machine.name,
+                    machine.ssh,
+                    machine.pinned_key,
+                    machine.fingerprint
+                ],
+            )
+            .map(drop)
+            .map_err(io_error)
+    }
+
+    pub(crate) fn delete_machine(&self, name: &str) -> io::Result<()> {
+        self.conn
+            .execute("DELETE FROM machines WHERE name = ?1", params![name])
             .map(drop)
             .map_err(io_error)
     }

@@ -17,6 +17,10 @@ _Avoid_: daemon, VM manager, node service
 The control-plane role (`cirro server`) that owns desired state across Nodes.
 _Avoid_: controller, master
 
+**Machine**:
+A computer the Node agent reaches over SSH, with a key of its own and a host key pinned when the Machine was added. It doesn't run the agent and needn't have KVM; Apps can run on it.
+_Avoid_: device, remote, host, server
+
 ## Workloads
 
 **VM**:
@@ -39,8 +43,12 @@ _Avoid_: disk image, root disk
 A named, long-lived workload that owns a Route and has at most one VM at a time. On a single Node it is a VM started with a Route; the Route stays with the name through park, wake and the VM ending, until `rm` or a new `run` under the name, which brings its own Route or none.
 _Avoid_: service, deployment
 
+**Machine-backed App**:
+An App whose Route goes to a port on a Machine's own localhost instead of to a VM. Cirrocumulus doesn't run what listens there, so it can't stop, park or wake it.
+_Avoid_: remote app, external app
+
 **Route**:
-A hostname and the port inside the App's VM that requests for it go to. A hostname belongs to at most one App on a Node.
+A hostname and the port that requests for it go to: inside the App's VM, or on a Machine's localhost for a Machine-backed App. A hostname belongs to at most one App on a Node.
 _Avoid_: ingress, virtual host, mapping
 
 **Park / wake**:

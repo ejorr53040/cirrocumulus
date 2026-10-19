@@ -28,8 +28,9 @@ use cirro_edge::acme::{Acme, is_public};
 use cirro_edge::tls::NodeCa;
 use cirro_edge::{Lease, Resolution, Router};
 use cirro_proto::{
-    EndReason, Ended, ErrorBody, LOG_CHUNK, MAX_MEM_MIB, MAX_VCPUS, MIN_MEM_MIB, MIN_VCPUS, Route,
-    RunRequest, Stats, StopRequest, VM_STATE_HEADER, VmInfo, VmStats,
+    AddMachine, EndReason, Ended, ErrorBody, LOG_CHUNK, MAX_MEM_MIB, MAX_VCPUS, MIN_MEM_MIB,
+    MIN_VCPUS, MachineHostKey, MachineScan, Route, RunRequest, Stats, StopRequest, VM_STATE_HEADER,
+    VmInfo, VmStats,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -52,6 +53,8 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 use tracing::{Instrument, error, info, info_span, warn};
+
+mod machine;
 
 /// How long a graceful stop waits for the VM to end before killing it,
 /// unless the request says otherwise.
@@ -238,6 +241,7 @@ struct Agent {
     ca: Option<Arc<NodeCa>>,
     /// Where public hostnames' certificates come from, when ACME is on.
     acme: Option<Arc<Acme>>,
+    machines: machine::Machines,
 }
 
 /// Tells requests held for a start, wake or park that it has finished,
@@ -317,8 +321,10 @@ pub async fn run(config: Config) -> io::Result<()> {
         wake_failures: Mutex::new(BTreeMap::new()),
         ca,
         acme,
+        machines: machine::Machines::new(&config.state_dir),
     });
     agent.reconcile().await?;
+    agent.machines.restore(&agent.store)?;
     let idle_parker = tokio::spawn(agent.clone().park_idle_apps());
     let renewer = agent
         .acme
@@ -482,7 +488,12 @@ impl Agent {
         // Path names are validated here, once, so no handler echoes an
         // unvalidated string back. `run_vm` validates the name in its body.
         if let ["vms", name, ..] = segments.as_slice()
-            && let Err(e) = validate_name(name)
+            && let Err(e) = validate_name("VM", name)
+        {
+            return json(e.0, &ErrorBody { error: e.1 });
+        }
+        if let ["machines", name, ..] = segments.as_slice()
+            && let Err(e) = validate_name("Machine", name)
         {
             return json(e.0, &ErrorBody { error: e.1 });
         }
@@ -520,6 +531,35 @@ impl Agent {
                 offset.and_then(|offset| self.logs(name, offset.unwrap_or(0)))
             }
             (&Method::DELETE, ["vms", name]) => self.remove(name),
+            (&Method::GET, ["ssh-key"]) => self.machines.public_key().map(|key| {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/plain")
+                    .body(Full::new(Bytes::from(key)))
+                    .expect("build key response")
+            }),
+            (&Method::GET, ["machines"]) => Ok(json(StatusCode::OK, &self.machines.list())),
+            (&Method::POST, ["machines", "scan"]) => match read_json::<MachineScan>(req).await {
+                Ok(scan) => self
+                    .machines
+                    .scan(&scan.ssh)
+                    .await
+                    .map(|host_key| json(StatusCode::OK, &MachineHostKey { host_key })),
+                Err(e) => Err(e),
+            },
+            (&Method::POST, ["machines"]) => match read_json::<AddMachine>(req).await {
+                Ok(add) => self
+                    .machines
+                    .add(add, &self.store)
+                    .await
+                    .map(|info| json(StatusCode::CREATED, &info)),
+                Err(e) => Err(e),
+            },
+            (&Method::DELETE, ["machines", name]) => self
+                .machines
+                .remove(name, &self.store)
+                .await
+                .map(|()| no_content()),
             _ => Err(ApiError(
                 StatusCode::NOT_FOUND,
                 format!("no such endpoint: {method} {path}"),
@@ -600,7 +640,7 @@ impl Agent {
         run: RunRequest,
         cred: UCred,
     ) -> Result<ApiResponse, ApiError> {
-        validate_name(&run.name)?;
+        validate_name("VM", &run.name)?;
         let guest = guest_config(&run)?;
         if !run.rootfs.is_absolute() {
             return Err(bad_request("the rootfs path must be absolute"));
@@ -1336,10 +1376,7 @@ impl Agent {
                     .map_err(|e| internal(format!("remove the record of {name:?}: {e}")))?;
                 let _ = std::fs::remove_file(log);
                 vms.remove(name);
-                Ok(Response::builder()
-                    .status(StatusCode::NO_CONTENT)
-                    .body(Full::new(Bytes::new()))
-                    .expect("build empty response"))
+                Ok(no_content())
             }
             Some(_) => Err(ApiError(
                 StatusCode::CONFLICT,
@@ -1352,6 +1389,7 @@ impl Agent {
     /// a record. Running VMs are left running: they outlive the agent.
     async fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
+        self.machines.disconnect_all();
         while self
             .vms
             .lock()
@@ -1622,9 +1660,10 @@ fn guest_config(run: &RunRequest) -> Result<GuestConfig, ApiError> {
     })
 }
 
-/// VM names are 1-32 characters of lowercase letters, digits and hyphens,
+/// VM and Machine names are 1-32 characters of lowercase letters, digits and hyphens,
 /// so they're safe in file names, URLs and log lines.
-fn validate_name(name: &str) -> Result<(), ApiError> {
+/// `kind` names what the name is for, in the error: VM or Machine.
+fn validate_name(kind: &str, name: &str) -> Result<(), ApiError> {
     let valid = (1..=32).contains(&name.len())
         && name
             .bytes()
@@ -1633,7 +1672,7 @@ fn validate_name(name: &str) -> Result<(), ApiError> {
         Ok(())
     } else {
         Err(bad_request(&format!(
-            "invalid VM name {name:?}: a name is 1-32 characters of lowercase letters, \
+            "invalid {kind} name {name:?}: a name is 1-32 characters of lowercase letters, \
              digits and hyphens"
         )))
     }
@@ -1699,6 +1738,13 @@ async fn read_json<T: serde::de::DeserializeOwned>(req: Request<Incoming>) -> Re
         .map_err(|e| bad_request(&format!("read request body: {e}")))?
         .to_bytes();
     serde_json::from_slice(&body).map_err(|e| bad_request(&format!("invalid request body: {e}")))
+}
+
+fn no_content() -> ApiResponse {
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Full::new(Bytes::new()))
+        .expect("build empty response")
 }
 
 fn json(status: StatusCode, body: &impl serde::Serialize) -> ApiResponse {

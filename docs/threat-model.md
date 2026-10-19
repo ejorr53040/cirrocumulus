@@ -12,6 +12,7 @@ what it does not try to stop. Report a hole in any of this through
 | **`cirro` group member** | Every VM on the Node: start, stop, park, wake, read console logs, claim hostnames. *Not* host root. | The agent's Unix socket (`root:cirro`, `0660`) |
 | **App code (the guest)** | Its own VM only | Its VM's virtio devices, its network namespace, vsock |
 | **Internet clients** | Nothing | The edge (HTTP/HTTPS) |
+| **A Machine** | Nothing: it's checked against the host key pinned when it was added | Only the connection the agent opens to it over SSH |
 
 A `cirro` group member is trusted the way a `docker` group member is trusted
 with a Docker daemon, with one difference: Cirrocumulus means for that trust to
@@ -65,6 +66,30 @@ A parked VM's snapshot holds its guest memory, so it sits in a root-only
 directory (`0700`) under the state dir. Snapshots are not encrypted at rest:
 anyone with root or the raw disk reads guests' memory. Snapshots and the state
 database aren't fsynced (ADR 0006), so a power cut can lose a parked VM.
+
+## Machines
+
+A Machine is a computer the agent logs in to over SSH (ADR 0010); nothing on
+it runs Cirrocumulus code.
+
+- **The agent's SSH key** opens every Machine that lists it in
+  `authorized_keys`. It sits root-only in the state dir, so whoever has the
+  Node's root has every Machine too. Give it a dedicated, unprivileged user
+  on each Machine.
+- **Host keys are pinned** when a Machine is added, by the fingerprint the
+  operator gave or confirmed. A Machine that later presents another key is
+  never logged in to. `cirro machine add` without `--host-key` trusts what
+  the network says at that moment, so check the fingerprint on the Machine.
+- **A `cirro` group member** can make the root agent open SSH connections to
+  any host and port, as any user name, with its key, and learn whether the
+  key was accepted. Targets are checked so none becomes an `ssh` option, and
+  `ssh` runs with no config file of root's.
+- **Traffic to a Machine** will cross the network inside the agent's SSH
+  connection: the edge's TLS ends at the Node, so the Machine sees plain
+  HTTP from `ssh` on its own localhost, and only its localhost ports are
+  reachable that way.
+- **What a Machine runs** is outside Cirrocumulus: a compromised Machine is
+  compromised whatever the Node does.
 
 ## Out of scope
 

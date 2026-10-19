@@ -7,7 +7,8 @@ use cirro_node::agent;
 use cirro_node::release::ReleaseBinaries;
 use cirro_node::subnet::Subnet;
 use cirro_proto::{
-    LOG_CHUNK, Route, RunRequest, Stats, StopRequest, User, VM_STATE_HEADER, VmInfo,
+    AddMachine, LOG_CHUNK, MachineHostKey, MachineInfo, MachineScan, Route, RunRequest, Stats,
+    StopRequest, User, VM_STATE_HEADER, VmInfo,
 };
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use hyper::Method;
@@ -51,6 +52,10 @@ enum Command {
     /// Pull, list and remove cached images
     #[command(subcommand)]
     Image(ImageCommand),
+    /// Add, list and remove Machines: computers the Node agent reaches over
+    /// SSH
+    #[command(subcommand)]
+    Machine(MachineCommand),
     /// List VMs
     Ps {
         /// Also list Ended VMs, with when and why they ended
@@ -277,6 +282,29 @@ enum ImageCommand {
 }
 
 #[derive(Subcommand)]
+enum MachineCommand {
+    /// Add a computer the Node agent reaches over SSH, pinning its host key
+    Add {
+        /// The Machine's name
+        name: String,
+        /// Who the agent logs in as, and where
+        #[arg(long, value_name = "USER@HOST[:PORT]")]
+        ssh: String,
+        /// The fingerprint (SHA256:...) of the host key the Machine must
+        /// present [default: show the one it presents and ask]
+        #[arg(long, value_name = "FINGERPRINT")]
+        host_key: Option<String>,
+    },
+    /// List Machines and whether the agent's connection to each is up
+    Ls,
+    /// Remove a Machine and its pinned host key
+    Rm { name: String },
+    /// Print the Node agent's SSH public key, for a Machine's
+    /// authorized_keys
+    Key,
+}
+
+#[derive(Subcommand)]
 enum ServerCommand {
     /// Create the CA, state database and admin token
     Init,
@@ -345,6 +373,7 @@ fn main() -> ExitCode {
             Command::Top { once: true } => top_once(&cli.socket).await,
             Command::Top { once: false } => top(&cli.socket).await,
             Command::Image(command) => image_command(command).await,
+            Command::Machine(command) => machine_command(&cli.socket, command).await,
             Command::Ps { all } => ps(&cli.socket, all).await,
             Command::Logs { follow, name } => logs(&cli.socket, &name, follow).await,
             Command::Stop {
@@ -912,6 +941,89 @@ async fn wake(socket: &Path, name: &str) -> Result<(), String> {
             Ok(())
         }
         None => Err("the Node agent answered the wake with no VM address".into()),
+    }
+}
+
+async fn machine_command(socket: &Path, command: MachineCommand) -> Result<(), String> {
+    match command {
+        MachineCommand::Add {
+            name,
+            ssh,
+            host_key,
+        } => {
+            let host_key = match host_key {
+                Some(host_key) => host_key,
+                None => confirm_host_key(socket, &ssh).await?,
+            };
+            let add = AddMachine {
+                name,
+                ssh,
+                host_key,
+            };
+            client::call::<MachineInfo>(socket, Method::POST, "/machines", Some(&add))
+                .await
+                .map(drop)
+        }
+        MachineCommand::Ls => {
+            let machines: Vec<MachineInfo> =
+                client::call(socket, Method::GET, "/machines", None::<&()>)
+                    .await?
+                    .unwrap_or_default();
+            println!(
+                "{:<32} {:<32} {:<50} {:<11}  ERROR",
+                "NAME", "SSH", "HOST KEY", "STATUS"
+            );
+            for m in machines {
+                println!(
+                    "{:<32} {:<32} {:<50} {:<11}  {}",
+                    m.name,
+                    m.ssh,
+                    m.host_key,
+                    m.status.as_str(),
+                    m.last_error.as_deref().unwrap_or("-")
+                );
+            }
+            Ok(())
+        }
+        MachineCommand::Rm { name } => client::call::<()>(
+            socket,
+            Method::DELETE,
+            &format!("/machines/{name}"),
+            None::<&()>,
+        )
+        .await
+        .map(drop),
+        MachineCommand::Key => {
+            let (_, key) = client::send(socket, Method::GET, "/ssh-key", None::<&()>).await?;
+            std::io::stdout()
+                .write_all(&key)
+                .map_err(|e| format!("write the key: {e}"))
+        }
+    }
+}
+
+/// Shows the fingerprint of the host key the Machine at `ssh` presents and
+/// returns it once the user says it's the Machine's.
+async fn confirm_host_key(socket: &Path, ssh: &str) -> Result<String, String> {
+    let scan = MachineScan { ssh: ssh.into() };
+    let found: MachineHostKey = client::call(socket, Method::POST, "/machines/scan", Some(&scan))
+        .await?
+        .ok_or("the Node agent returned no host key")?;
+    print!(
+        "{ssh} presents the host key {}\nCheck it on the Machine with `ssh-keygen -lf \
+         /etc/ssh/ssh_host_ed25519_key.pub`. Trust it? [y/N] ",
+        found.host_key
+    );
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("write the prompt: {e}"))?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| format!("read the answer: {e}"))?;
+    match answer.trim() {
+        "y" | "Y" | "yes" => Ok(found.host_key),
+        _ => Err("not added: the host key wasn't confirmed".into()),
     }
 }
 
