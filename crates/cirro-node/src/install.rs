@@ -132,6 +132,13 @@ fn cgroup_fs_type(path: &str) -> Option<String> {
 /// module doc.
 pub fn install(cfg: &InstallConfig) -> io::Result<()> {
     check_prereqs()?;
+    // Only Machines need it, so its absence doesn't stop the install.
+    if Command::new("ssh").arg("-V").output().is_err() {
+        eprintln!(
+            "cirro: warning: no `ssh` found; Machines (`cirro machine add`) need OpenSSH's \
+             ssh, ssh-keygen and ssh-keyscan"
+        );
+    }
 
     fs::create_dir_all(&cfg.state_dir)?;
 

@@ -12,6 +12,16 @@
 //! | `POST /vms/{name}/wake`        |                 | `201` [`VmInfo`]         |
 //! | `GET /vms/{name}/logs?offset=N`|                 | `200` console bytes      |
 //! | `DELETE /vms/{name}`           |                 | `204`                    |
+//! | `GET /ssh-key`                 |                 | `200` public key text    |
+//! | `POST /machines`               | [`AddMachine`]  | `201` [`MachineInfo`]    |
+//! | `GET /machines`                |                 | `200` `[`[`MachineInfo`]`]` |
+//! | `POST /machines/scan`          | [`MachineScan`] | `200` [`MachineHostKey`] |
+//! | `DELETE /machines/{name}`      |                 | `204`                    |
+//!
+//! `GET /ssh-key` is the agent's own SSH public key, made on first use: a
+//! Machine lets the agent in by listing it in `authorized_keys`. A scan
+//! asks a Machine for its host key without trusting it, so `cirro machine
+//! add` can show the fingerprint for confirming before it's pinned.
 //!
 //! `GET /vms` lists running VMs; `all=true` adds Ended VMs. A parked VM is
 //! an Ended VM whose reason is [`EndReason::Parked`]; waking it starts a new
@@ -154,6 +164,62 @@ pub struct StopRequest {
     /// anyway. The agent's default applies when unset.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+}
+
+/// Register a Machine: a computer the Node agent reaches over SSH, which
+/// doesn't run the agent itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddMachine {
+    /// 1-32 characters of lowercase letters, digits and hyphens.
+    pub name: String,
+    /// `user@host[:port]`, port 22 when unset.
+    pub ssh: String,
+    /// The fingerprint (`SHA256:...`) of the host key the Machine must
+    /// present. The agent pins that key; a Machine presenting another one
+    /// is never trusted.
+    pub host_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineInfo {
+    pub name: String,
+    pub ssh: String,
+    /// The pinned host key's fingerprint.
+    pub host_key: String,
+    pub status: MachineStatus,
+    /// Why the Machine is unreachable, as SSH said it.
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineScan {
+    /// `user@host[:port]`, as in [`AddMachine`].
+    pub ssh: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineHostKey {
+    /// The fingerprint (`SHA256:...`) of the host key the Machine
+    /// presented: its Ed25519 key's when it has one.
+    pub host_key: String,
+}
+
+/// Whether the agent's SSH connection to a Machine is up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MachineStatus {
+    Up,
+    Unreachable,
+}
+
+impl MachineStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MachineStatus::Up => "up",
+            MachineStatus::Unreachable => "unreachable",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
