@@ -2120,18 +2120,7 @@ fn edge_get_path(agent: &Agent, host: &str, path: &str) -> std::io::Result<Strin
 /// Retries `edge_get` until the App answers with a 200: `run` returns a
 /// moment before the fixture is listening.
 fn wait_for_edge(agent: &Agent, host: &str) -> String {
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        let result = edge_get(agent, host);
-        match &result {
-            Ok(response) if response.starts_with("HTTP/1.1 200") => return response.clone(),
-            _ => assert!(
-                Instant::now() < deadline,
-                "{host} never answered through the edge within {TIMEOUT:?}: {result:?}"
-            ),
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    wait_for_edge_status(agent, host, "HTTP/1.1 200", TIMEOUT)
 }
 
 /// `cirro run --name <name> --host <host> --port 8080 <rootfs> -- <command...>`.
@@ -2625,10 +2614,13 @@ fn an_app_with_a_public_hostname_is_served_with_an_acme_certificate() {
 }
 
 /// A throwaway `sshd` on 127.0.0.1, run as the test user, standing in for a
-/// Machine: its own host key and `authorized_keys`, both in a temp dir.
-/// Dropping it kills `sshd` and removes the dir.
+/// Machine: its own host key and `authorized_keys`, both in a temp dir. It
+/// can go down and come back, like a Machine. Dropping it stops `sshd` and
+/// removes the dir.
 struct Sshd {
-    child: Child,
+    /// The listener; `None` while it's stopped.
+    child: Option<Child>,
+    bin: PathBuf,
     dir: PathBuf,
     port: u16,
 }
@@ -2638,9 +2630,9 @@ impl Sshd {
     /// `None` (after saying why) when there's no `sshd` to run.
     fn start(octet: u8) -> Option<Sshd> {
         // Arch has it in /usr/bin; Debian and Fedora in /usr/sbin.
-        let Some(sshd) = ["/usr/bin/sshd", "/usr/sbin/sshd"]
+        let Some(bin) = ["/usr/bin/sshd", "/usr/sbin/sshd"]
             .into_iter()
-            .map(Path::new)
+            .map(PathBuf::from)
             .find(|p| p.exists())
         else {
             eprintln!("skipping: no sshd in /usr/bin or /usr/sbin");
@@ -2650,16 +2642,9 @@ impl Sshd {
         let dir = std::env::temp_dir().join(format!("cirro-sshd-{}-{octet}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create sshd dir");
-        let status = std::process::Command::new("ssh-keygen")
-            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
-            .arg(dir.join("host_key"))
-            .status()
-            .expect("run ssh-keygen");
-        assert!(status.success(), "ssh-keygen failed");
         std::fs::write(dir.join("authorized_keys"), "").unwrap();
-        let config = dir.join("sshd_config");
         std::fs::write(
-            &config,
+            dir.join("sshd_config"),
             format!(
                 "Port {port}\nListenAddress 127.0.0.1\nHostKey {dir}/host_key\n\
                  AuthorizedKeysFile {dir}/authorized_keys\nPidFile none\nStrictModes no\n\
@@ -2668,19 +2653,91 @@ impl Sshd {
             ),
         )
         .unwrap();
-        let child = std::process::Command::new(sshd)
+        let mut sshd = Sshd {
+            child: None,
+            bin,
+            dir,
+            port,
+        };
+        sshd.new_host_key();
+        sshd.start_again();
+        Some(sshd)
+    }
+
+    /// Starts the stopped `sshd` and waits for it to listen.
+    fn start_again(&mut self) {
+        let child = std::process::Command::new(&self.bin)
             .arg("-f")
-            .arg(&config)
+            .arg(self.dir.join("sshd_config"))
             .args(["-D", "-e"])
             .stderr(Stdio::null())
             .spawn()
             .expect("start sshd");
+        self.child = Some(child);
         let deadline = Instant::now() + TIMEOUT;
-        while TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(Instant::now() < deadline, "sshd never listened on {port}");
+        while TcpStream::connect(("127.0.0.1", self.port)).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "sshd never listened on {}",
+                self.port
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
-        Some(Sshd { child, dir, port })
+    }
+
+    /// Takes the Machine down: the listener and every login. Each login is
+    /// a session of its own (sshd setsids it), so killing the listener
+    /// alone would leave the agent's connection up.
+    fn stop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        // Listed first (they leave the listener once it's gone), killed
+        // after it, so no new login slips in between.
+        let logins = std::process::Command::new("pgrep")
+            .args(["-P", &child.id().to_string()])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            .unwrap_or_default();
+        let _ = child.kill();
+        let _ = child.wait();
+        for login in logins.split_whitespace() {
+            let _ = std::process::Command::new("pkill")
+                .args(["-KILL", "-s", login])
+                .status();
+        }
+    }
+
+    /// Gives it a new host key, as a reinstalled Machine or an impostor
+    /// would have; it presents the new one from its next start.
+    fn new_host_key(&self) {
+        let key = self.dir.join("host_key");
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(key.with_extension("pub"));
+        let status = std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(&key)
+            .status()
+            .expect("run ssh-keygen");
+        assert!(status.success(), "ssh-keygen failed");
+    }
+
+    /// A copy of its host key, private and public, for
+    /// [`Sshd::restore_host_key`].
+    fn save_host_key(&self) -> (Vec<u8>, Vec<u8>) {
+        let key = self.dir.join("host_key");
+        (
+            std::fs::read(&key).unwrap(),
+            std::fs::read(key.with_extension("pub")).unwrap(),
+        )
+    }
+
+    /// Puts back a host key [`Sshd::save_host_key`] copied; it presents
+    /// it from its next start.
+    fn restore_host_key(&self, (private, public): &(Vec<u8>, Vec<u8>)) {
+        let key = self.dir.join("host_key");
+        std::fs::write(&key, private).unwrap();
+        std::fs::write(key.with_extension("pub"), public).unwrap();
     }
 
     /// The `--ssh` target that logs in to it as the test user.
@@ -2711,28 +2768,14 @@ impl Sshd {
 
 impl Drop for Sshd {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.stop();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
 /// `cirro machine ls`'s row for `name` once it shows `status`.
 fn wait_for_machine(agent: &Agent, name: &str, status: &str) -> String {
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        let ls = stdout(agent.cirro().args(["machine", "ls"]).assert().success());
-        if let Some(row) = row(&ls, name)
-            && row.split_whitespace().any(|field| field == status)
-        {
-            return row.to_string();
-        }
-        assert!(
-            Instant::now() < deadline,
-            "Machine {name} never showed {status}:\n{ls}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    wait_for_machine_text(agent, name, &format!(" {status} "), TIMEOUT)
 }
 
 /// Lets the agent's SSH key log in to `sshd`.
@@ -3194,4 +3237,133 @@ fn a_machine_backed_app_with_a_public_hostname_gets_an_acme_certificate() {
         std::thread::sleep(Duration::from_millis(250));
     };
     assert_eq!(answer, "hello from pi");
+}
+
+/// How long a Machine may take to come back: its `ssh` retries with a
+/// backoff capped at 30 seconds.
+const RECONNECT: Duration = Duration::from_secs(40);
+
+/// `machine ls`'s row for `name` once it contains `text`, within `within`.
+fn wait_for_machine_text(agent: &Agent, name: &str, text: &str, within: Duration) -> String {
+    let deadline = Instant::now() + within;
+    loop {
+        let ls = stdout(agent.cirro().args(["machine", "ls"]).assert().success());
+        if let Some(row) = row(&ls, name)
+            && row.contains(text)
+        {
+            return row.to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Machine {name} never showed {text:?} within {within:?}:\n{ls}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// `GET /` through the edge for `host` until the answer starts with
+/// `status`, within `within`.
+fn wait_for_edge_status(agent: &Agent, host: &str, status: &str, within: Duration) -> String {
+    let deadline = Instant::now() + within;
+    loop {
+        let answer = edge_get(agent, host).unwrap_or_default();
+        if answer.starts_with(status) {
+            return answer;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{host} never answered {status} within {within:?}: {answer:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// M8: while its Machine is down a Machine-backed App answers 503 naming
+/// the Machine, and once the Machine is back the agent reconnects by
+/// itself.
+#[test]
+fn a_machine_that_goes_down_is_reconnected_once_it_is_back() {
+    let Some(mut sshd) = Sshd::start(188) else {
+        return;
+    };
+    let Some(agent) = Agent::start_without_kvm(188) else {
+        return;
+    };
+    add_machine(&agent, &sshd, "pi");
+    let port = 23188;
+    serve_http(port, "hello from pi");
+    run_on_machine(&agent, "web", "pi", "pi.test", port).success();
+    wait_for_edge(&agent, "pi.test");
+
+    sshd.stop();
+    let down = wait_for_edge_status(&agent, "pi.test", "HTTP/1.1 503", TIMEOUT);
+    assert!(
+        down.contains("pi"),
+        "the 503 doesn't name the Machine: {down:?}"
+    );
+    wait_for_machine(&agent, "pi", "unreachable");
+
+    sshd.start_again();
+    wait_for_machine_text(&agent, "pi", " up ", RECONNECT);
+    let back = wait_for_edge_status(&agent, "pi.test", "HTTP/1.1 200", TIMEOUT);
+    assert!(back.ends_with("hello from pi"), "{back:?}");
+}
+
+/// M8: a Machine that comes back with another host key is never trusted:
+/// it stays down, saying why, and gets no traffic.
+#[test]
+fn a_machine_whose_host_key_changed_stays_down() {
+    let Some(mut sshd) = Sshd::start(189) else {
+        return;
+    };
+    let Some(agent) = Agent::start_without_kvm(189) else {
+        return;
+    };
+    add_machine(&agent, &sshd, "pi");
+    let port = 23189;
+    serve_http(port, "hello from pi");
+    run_on_machine(&agent, "web", "pi", "pi.test", port).success();
+    wait_for_edge(&agent, "pi.test");
+
+    sshd.stop();
+    let pinned = sshd.save_host_key();
+    sshd.new_host_key();
+    sshd.start_again();
+    let row = wait_for_machine_text(&agent, "pi", "host key changed", RECONNECT);
+    assert!(row.contains("unreachable"), "{row}");
+    let answer = edge_get(&agent, "pi.test").expect("ask the edge");
+    assert!(answer.starts_with("HTTP/1.1 503"), "{answer:?}");
+
+    // Were the agent to connect again it would now get in, so staying down
+    // shows it doesn't: not by itself, nor when an App on the Machine
+    // changes.
+    sshd.stop();
+    sshd.restore_host_key(&pinned);
+    sshd.start_again();
+    run_on_machine(&agent, "api", "pi", "api.test", port).success();
+    std::thread::sleep(Duration::from_secs(5));
+    let row = wait_for_machine_text(&agent, "pi", "host key changed", TIMEOUT);
+    assert!(row.contains("unreachable"), "{row}");
+}
+
+/// M8: an agent that starts while a Machine is down starts anyway, lists
+/// the Machine unreachable, and connects once it's back.
+#[test]
+fn an_agent_starts_while_a_machine_is_down() {
+    let Some(mut sshd) = Sshd::start(190) else {
+        return;
+    };
+    let Some(mut agent) = Agent::start_without_kvm(190) else {
+        return;
+    };
+    add_machine(&agent, &sshd, "pi");
+    agent.stop_agent();
+    sshd.stop();
+
+    agent
+        .spawn()
+        .expect("start the agent while the Machine is down");
+    wait_for_machine(&agent, "pi", "unreachable");
+    sshd.start_again();
+    wait_for_machine_text(&agent, "pi", " up ", RECONNECT);
 }

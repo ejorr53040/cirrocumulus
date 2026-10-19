@@ -18,6 +18,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
@@ -66,6 +67,9 @@ impl Drop for Machine {
 struct Link {
     status: MachineStatus,
     last_error: Option<String>,
+    /// The Machine presented a host key other than the pinned one, so no
+    /// `ssh` runs to it again until it's removed and added.
+    host_key_changed: bool,
 }
 
 impl Machines {
@@ -318,10 +322,16 @@ impl Machines {
         let public_key = self.public_key()?;
         self.write_known_hosts(&self.entries.lock().unwrap(), Some(&record))
             .map_err(|e| internal(format!("pin the host key of {}: {e}", record.name)))?;
-        let refused = match self
-            .ssh(&record.name, &target, &[], &["true"])
-            .output()
-            .await
+        let refused = match ssh_command(
+            &self.key,
+            &self.known_hosts,
+            &record.name,
+            &target,
+            &[],
+            &["true"],
+        )
+        .output()
+        .await
         {
             Ok(out) if out.status.success() => None,
             Ok(out) => Some(last_line(&String::from_utf8_lossy(&out.stderr))),
@@ -409,6 +419,7 @@ impl Machines {
             link: Arc::new(Mutex::new(Link {
                 status: MachineStatus::Unreachable,
                 last_error: None,
+                host_key_changed: false,
             })),
             tunnel: tokio::spawn(async {}),
         };
@@ -437,13 +448,20 @@ impl Machines {
                 app.local_port, app.route.port
             ));
         }
+        if machine.link.lock().unwrap().host_key_changed {
+            return Ok(());
+        }
         machine.tunnel.abort();
         machine.link = Arc::new(Mutex::new(Link {
             status: MachineStatus::Unreachable,
             last_error: None,
+            host_key_changed: false,
         }));
+        let (key, known_hosts) = (self.key.clone(), self.known_hosts.clone());
+        let name = machine.record.name.clone();
         machine.tunnel = tokio::spawn(run_tunnel(
-            self.ssh(&machine.record.name, &target, &options, &[]),
+            name.clone(),
+            move || ssh_command(&key, &known_hosts, &name, &target, &options, &[]),
             machine.link.clone(),
         ));
         Ok(())
@@ -465,45 +483,50 @@ impl Machines {
             .collect();
         std::fs::write(&self.known_hosts, lines)
     }
+}
 
-    /// `ssh` to the Machine `name` with the agent's key, trusting only its
-    /// pinned host key and ignoring root's own SSH config.
-    fn ssh(&self, name: &str, target: &Target, options: &[String], command: &[&str]) -> Command {
-        let mut cmd = Command::new("ssh");
-        cmd.args(["-F", "/dev/null", "-T"])
-            .args(["-o", "BatchMode=yes"])
-            .args(["-o", "StrictHostKeyChecking=yes"])
-            .args(["-o", "GlobalKnownHostsFile=/dev/null"])
-            .arg("-o")
-            .arg(format!("UserKnownHostsFile={}", self.known_hosts.display()))
-            .arg("-o")
-            .arg(format!("HostKeyAlias={name}"))
-            .args(["-o", "IdentitiesOnly=yes"])
-            .arg("-i")
-            .arg(&self.key)
-            .args(["-o", "ConnectTimeout=10"])
-            .args(["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"])
-            // VERBOSE, for the "Authenticated to" line that says it's up.
-            .args(["-o", "LogLevel=VERBOSE"])
-            .args(options)
-            .args(["-p", &target.port.to_string(), "-l", &target.user, "--"])
-            .arg(&target.host)
-            .args(command)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        // SAFETY: the closure only calls prctl(PR_SET_PDEATHSIG), which is
-        // async-signal-safe and touches no locks or allocator state, so it
-        // is sound between fork and exec. A crashed agent's `ssh` dies with
-        // it instead of holding a tunnel nothing owns.
-        unsafe {
-            cmd.pre_exec(|| {
-                nix::sys::prctl::set_pdeathsig(Signal::SIGKILL).map_err(io::Error::from)
-            });
-        }
-        cmd
+/// `ssh` to the Machine `name` with the agent's key (`key`), trusting only
+/// its pinned host key in `known_hosts` and ignoring root's own SSH config.
+fn ssh_command(
+    key: &Path,
+    known_hosts: &Path,
+    name: &str,
+    target: &Target,
+    options: &[String],
+    command: &[&str],
+) -> Command {
+    let mut cmd = Command::new("ssh");
+    cmd.args(["-F", "/dev/null", "-T"])
+        .args(["-o", "BatchMode=yes"])
+        .args(["-o", "StrictHostKeyChecking=yes"])
+        .args(["-o", "GlobalKnownHostsFile=/dev/null"])
+        .arg("-o")
+        .arg(format!("UserKnownHostsFile={}", known_hosts.display()))
+        .arg("-o")
+        .arg(format!("HostKeyAlias={name}"))
+        .args(["-o", "IdentitiesOnly=yes"])
+        .arg("-i")
+        .arg(key)
+        .args(["-o", "ConnectTimeout=10"])
+        .args(["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"])
+        // VERBOSE, for the "Authenticated to" line that says it's up.
+        .args(["-o", "LogLevel=VERBOSE"])
+        .args(options)
+        .args(["-p", &target.port.to_string(), "-l", &target.user, "--"])
+        .arg(&target.host)
+        .args(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    // SAFETY: the closure only calls prctl(PR_SET_PDEATHSIG), which is
+    // async-signal-safe and touches no locks or allocator state, so it
+    // is sound between fork and exec. A crashed agent's `ssh` dies with
+    // it instead of holding a tunnel nothing owns.
+    unsafe {
+        cmd.pre_exec(|| nix::sys::prctl::set_pdeathsig(Signal::SIGKILL).map_err(io::Error::from));
     }
+    cmd
 }
 
 impl Machine {
@@ -519,36 +542,100 @@ impl Machine {
     }
 }
 
+/// How long a Machine's `ssh` waits before it's run again the first time
+/// after logging in; each failed try doubles it, up to [`RETRY_MAX`].
+const RETRY_FIRST: Duration = Duration::from_secs(1);
+const RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// What OpenSSH says, as its last word, when the Machine's host key isn't
+/// the pinned one: since known_hosts always holds the pin, this is the one
+/// line that tells a changed key apart. If its wording ever changes, a
+/// changed key is retried like any failure, still never trusted.
+const HOST_KEY_FAILED: &str = "Host key verification failed.";
+
+/// Keeps the Machine `name`'s `ssh` running, marking the Machine up while
+/// it's logged in. A host key that doesn't match the pinned one ends it for
+/// good: the Machine is never trusted again until it's removed and added.
+// ponytail: retries reuse the forwards' ports; if something else took one,
+// every retry fails until an App on the Machine is added or removed, which
+// picks fresh ones.
+async fn run_tunnel(name: String, ssh: impl Fn() -> Command, link: Arc<Mutex<Link>>) {
+    let mut wait = RETRY_FIRST;
+    loop {
+        let ended = run_ssh(ssh(), &link).await;
+        let why = if ended.host_key_changed {
+            "host key changed: it isn't the one pinned when the Machine was added; if \
+             that's expected, `cirro machine rm` it and add it again"
+                .to_string()
+        } else {
+            ended.last
+        };
+        warn!(machine = %name, "Machine unreachable: {why}");
+        *link.lock().unwrap() = Link {
+            status: MachineStatus::Unreachable,
+            last_error: Some(why),
+            host_key_changed: ended.host_key_changed,
+        };
+        if ended.host_key_changed {
+            return;
+        }
+        if ended.logged_in {
+            wait = RETRY_FIRST;
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(RETRY_MAX);
+    }
+}
+
+/// How one `ssh` went.
+struct Ended {
+    logged_in: bool,
+    host_key_changed: bool,
+    /// The last thing it said that wasn't chatter: why it ended.
+    last: String,
+}
+
 /// Runs `ssh` until it exits, marking the Machine up once it has logged in.
-// ponytail: one try; an `ssh` that exits leaves the Machine unreachable
-// until the agent restarts. Reconnecting with backoff is #44.
-async fn run_tunnel(mut ssh: Command, link: Arc<Mutex<Link>>) {
+async fn run_ssh(mut ssh: Command, link: &Mutex<Link>) -> Ended {
+    let mut ended = Ended {
+        logged_in: false,
+        host_key_changed: false,
+        last: "ssh exited".into(),
+    };
     let mut child = match ssh.spawn() {
         Ok(child) => child,
         Err(e) => {
-            link.lock().unwrap().last_error = Some(format!("run ssh: {e}"));
-            return;
+            ended.last = format!("run ssh: {e}");
+            return ended;
         }
     };
-    let mut last = None;
     if let Some(stderr) = child.stderr.take() {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             if line.starts_with("Authenticated to ") {
+                ended.logged_in = true;
                 *link.lock().unwrap() = Link {
                     status: MachineStatus::Up,
                     last_error: None,
+                    host_key_changed: false,
                 };
-            } else if !line.trim().is_empty() {
-                last = Some(line);
+            } else if line == HOST_KEY_FAILED {
+                ended.host_key_changed = true;
+            } else if !is_chatter(&line) {
+                ended.last = line;
             }
         }
     }
     let _ = child.wait().await;
-    *link.lock().unwrap() = Link {
-        status: MachineStatus::Unreachable,
-        last_error: Some(last.unwrap_or_else(|| "ssh exited".into())),
-    };
+    ended
+}
+
+/// What `ssh` says at `LogLevel=VERBOSE` that isn't why it failed.
+fn is_chatter(line: &str) -> bool {
+    line.trim().is_empty()
+        || ["Authenticated to ", "Transferred: ", "Bytes per second: "]
+            .iter()
+            .any(|p| line.starts_with(p))
 }
 
 /// Where a Machine's `sshd` is and who to log in as: `user@host[:port]`.
@@ -677,8 +764,8 @@ fn app_with_host(entries: &BTreeMap<String, Machine>, host: &str) -> Option<Stri
 /// `n` different ports free on the Node's 127.0.0.1 a moment ago: all
 /// held at once while they're chosen, so none is handed out twice.
 // ponytail: something else can take one before `ssh` binds it; `ssh` then
-// exits (ExitOnForwardFailure) and the Machine shows unreachable until #44
-// reconnects it on fresh ports.
+// exits (ExitOnForwardFailure) and the Machine shows unreachable until an
+// App on it is added or removed (see run_tunnel).
 fn free_local_ports(n: usize) -> io::Result<Vec<u16>> {
     let held = (0..n)
         .map(|_| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)))
@@ -691,7 +778,7 @@ fn last_line(stderr: &str) -> String {
     stderr
         .lines()
         .rev()
-        .find(|l| !l.trim().is_empty())
+        .find(|l| !is_chatter(l))
         .unwrap_or("ssh failed")
         .to_string()
 }
