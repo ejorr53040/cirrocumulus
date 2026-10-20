@@ -18,7 +18,7 @@ use assert_cmd::Command;
 use std::path::PathBuf;
 
 mod common;
-use common::{home, latest_kernel, repo_root, test_agent, test_agent_path};
+use common::{home, latest_kernel, repo_root, rootfs, test_agent, test_agent_path};
 
 /// One test's throwaway install target: a unique group, unit name, subnet
 /// and state dir, all named from this test's pid so parallel test runs
@@ -31,11 +31,13 @@ struct Install {
     group: String,
     unit_name: String,
     subnet: String,
+    /// The edge's ports are `18000 + edge` and `19000 + edge`.
+    edge: u16,
     installed: bool,
 }
 
 impl Install {
-    fn new(label: &str) -> Option<Install> {
+    fn new(label: &str, edge: u16) -> Option<Install> {
         if test_agent().is_none() {
             eprintln!(
                 "skipping: `sudo -n {} --version` failed -- see this test's module doc",
@@ -49,6 +51,7 @@ impl Install {
             group: format!("cirro-test-{label}-{pid}"),
             unit_name: format!("cirro-test-{label}-{pid}"),
             subnet: format!("10.78.{}.0/24", pid % 200 + 20),
+            edge,
             installed: false,
         })
     }
@@ -61,6 +64,8 @@ impl Install {
             .arg(agent_bin)
             .args(["node", "install", "--state-dir"])
             .arg(&self.state_dir)
+            .arg("--socket")
+            .arg(self.socket())
             .args(["--group", &self.group])
             .args(["--unit-name", &self.unit_name])
             .args(["--subnet", &self.subnet])
@@ -69,7 +74,9 @@ impl Install {
             .arg("--jailer")
             .arg(repo.join("jailer"))
             .arg("--kernel")
-            .arg(latest_kernel());
+            .arg(latest_kernel())
+            .args(["--http", &format!("127.0.0.1:{}", 18000 + self.edge)])
+            .args(["--https", &format!("127.0.0.1:{}", 19000 + self.edge)]);
         cmd
     }
 
@@ -100,6 +107,23 @@ impl Install {
         }
     }
 
+    fn socket(&self) -> PathBuf {
+        self.state_dir.join("agent.sock")
+    }
+
+    /// The names of the namespaces and cgroups VMs in this install's subnet
+    /// hold: `cirro-` and the low 16 bits of the VM address, in hex.
+    fn vm_host_state(&self) -> Vec<String> {
+        let third: u8 = self.subnet.split('.').nth(2).unwrap().parse().unwrap();
+        let prefix = format!("cirro-{third:02x}");
+        ["/run/netns", "/sys/fs/cgroup/cirro"]
+            .into_iter()
+            .flat_map(|dir| std::fs::read_dir(dir).into_iter().flatten())
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|name| name.starts_with(&prefix) && name.len() == prefix.len() + 2)
+            .collect()
+    }
+
     fn unit_file(&self) -> PathBuf {
         PathBuf::from("/etc/systemd/system").join(format!("{}.service", self.unit_name))
     }
@@ -109,6 +133,18 @@ impl Install {
             .args(["is-enabled", &format!("{}.service", self.unit_name)])
             .output()
             .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "enabled")
+    }
+
+    /// Whether ufw's saved rules hold one routing this install's subnet,
+    /// or `None` on a host without ufw. Reads the rules file rather than
+    /// `ufw status`, which needs root.
+    fn ufw_routes_subnet(&self) -> Option<bool> {
+        let rules = std::fs::read_to_string("/etc/ufw/user.rules").ok()?;
+        Some(
+            rules
+                .lines()
+                .any(|l| l.starts_with("### tuple ### route:allow") && l.contains(&self.subnet)),
+        )
     }
 
     fn group_exists(&self) -> bool {
@@ -129,7 +165,7 @@ impl Drop for Install {
 
 #[test]
 fn install_creates_a_group_state_dir_and_enabled_unit_and_is_idempotent() {
-    let Some(mut install) = Install::new("basic") else {
+    let Some(mut install) = Install::new("basic", 299) else {
         return;
     };
 
@@ -149,6 +185,15 @@ fn install_creates_a_group_state_dir_and_enabled_unit_and_is_idempotent() {
         unit_contents.contains(&install.state_dir.display().to_string()),
         "unit doesn't reference the state dir: {unit_contents}"
     );
+    assert!(
+        unit_contents.contains("--http 127.0.0.1:18299 --https 127.0.0.1:19299"),
+        "unit doesn't start the agent's edge where install was told: {unit_contents}"
+    );
+    assert_ne!(
+        install.ufw_routes_subnet(),
+        Some(false),
+        "ufw is installed but has no rule letting the subnet's traffic be forwarded"
+    );
 
     // Re-running install with the same arguments is a no-op: it succeeds
     // again rather than erring on "already exists".
@@ -165,6 +210,11 @@ fn install_creates_a_group_state_dir_and_enabled_unit_and_is_idempotent() {
     );
     assert!(!install.is_enabled(), "unit still enabled after uninstall");
     assert!(!install.state_dir.exists(), "state dir survived uninstall");
+    assert_ne!(
+        install.ufw_routes_subnet(),
+        Some(true),
+        "ufw rule survived uninstall"
+    );
 }
 
 #[test]
@@ -200,4 +250,45 @@ fn install_requires_firecracker_jailer_and_kernel_together() {
     let mut cmd = Command::cargo_bin("cirro").unwrap();
     cmd.args(["node", "install", "--firecracker", "/tmp/nonexistent"]);
     cmd.assert().failure();
+}
+
+#[test]
+fn uninstall_force_kills_the_nodes_running_vms() {
+    let Some(mut install) = Install::new("force", 298) else {
+        return;
+    };
+    install.install().expect("install");
+
+    // As root: the test user isn't in the install's own group.
+    let run = std::process::Command::new("sudo")
+        .arg("-n")
+        .arg(test_agent().expect("checked at construction"))
+        .arg("--socket")
+        .arg(install.socket())
+        .args(["run", "--name", "web"])
+        .arg(&rootfs().guest_init)
+        .args(["--", "/app/http_app"])
+        .output()
+        .expect("run cirro run");
+    assert!(
+        run.status.success(),
+        "cirro run: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(
+        !install.vm_host_state().is_empty(),
+        "the running VM has no namespace or cgroup to look for"
+    );
+
+    install
+        .uninstall(false)
+        .expect_err("uninstall without --force");
+    install.uninstall(true).expect("uninstall --force");
+    install.installed = false;
+    assert_eq!(
+        install.vm_host_state(),
+        Vec::<String>::new(),
+        "uninstall --force left the VM running"
+    );
+    assert!(!install.state_dir.exists(), "state dir survived uninstall");
 }

@@ -8,7 +8,7 @@
 //! Console logs stay as files next to their record; the record names its file.
 
 use crate::vm::ProcessId;
-use cirro_proto::{EndReason, Ended, VmInfo};
+use cirro_proto::{EndReason, Ended, Route, VmInfo};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::io;
 use std::net::Ipv4Addr;
@@ -50,10 +50,14 @@ impl Store {
                  started_at INTEGER NOT NULL,
                  ended_at   INTEGER,
                  end_reason TEXT,
-                 log        TEXT NOT NULL
+                 log        TEXT NOT NULL,
+                 route_host TEXT,
+                 route_port INTEGER,
+                 route_idle_park INTEGER
              )",
         )
         .map_err(io_error)?;
+        add_missing_columns(&conn)?;
         let stored: Option<String> = conn
             .query_row("SELECT subnet FROM node", [], |row| row.get(0))
             .optional()
@@ -80,7 +84,7 @@ impl Store {
             .conn
             .prepare(
                 "SELECT name, vm_address, pid, pid_start, mem_mib, vcpus, started_at,
-                        ended_at, end_reason, log
+                        ended_at, end_reason, log, route_host, route_port, route_idle_park
                  FROM vms ORDER BY name",
             )
             .map_err(io_error)?;
@@ -92,6 +96,9 @@ impl Store {
                 let ended_at: Option<i64> = row.get(7)?;
                 let end_reason: Option<String> = row.get(8)?;
                 let log: String = row.get(9)?;
+                let route_host: Option<String> = row.get(10)?;
+                let route_port: Option<u16> = row.get(11)?;
+                let idle_park_secs: Option<u32> = row.get(12)?;
                 Ok(Record {
                     info: VmInfo {
                         name: row.get(0)?,
@@ -104,6 +111,11 @@ impl Store {
                                 at: from_sql(at),
                                 reason: parse_reason(&reason)?,
                             })
+                        }),
+                        route: route_host.zip(route_port).map(|(host, port)| Route {
+                            host,
+                            port,
+                            idle_park_secs,
                         }),
                     },
                     log: PathBuf::from(log),
@@ -128,8 +140,9 @@ impl Store {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO vms
-                     (name, vm_address, pid, pid_start, mem_mib, vcpus, started_at, log)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                     (name, vm_address, pid, pid_start, mem_mib, vcpus, started_at, log,
+                      route_host, route_port, route_idle_park)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     info.name,
                     info.vm_address.map(|a| a.to_string()),
@@ -139,6 +152,9 @@ impl Store {
                     info.vcpus,
                     to_sql(info.started_at),
                     log.to_string_lossy(),
+                    info.route.as_ref().map(|r| &r.host),
+                    info.route.as_ref().map(|r| r.port),
+                    info.route.as_ref().and_then(|r| r.idle_park_secs),
                 ],
             )
             .map(drop)
@@ -165,6 +181,34 @@ impl Store {
             .map(drop)
             .map_err(io_error)
     }
+}
+
+/// Adds the columns a database made by an older agent lacks, in one
+/// transaction, so a crash can't leave some added and others not.
+fn add_missing_columns(conn: &Connection) -> io::Result<()> {
+    // Added after the table's first release, in the order they came.
+    const ADDED: [(&str, &str); 3] = [
+        ("route_host", "TEXT"),
+        ("route_port", "INTEGER"),
+        ("route_idle_park", "INTEGER"),
+    ];
+    let mut statement = conn
+        .prepare("SELECT name FROM pragma_table_info('vms')")
+        .map_err(io_error)?;
+    let present: Vec<String> = statement
+        .query_map([], |row| row.get(0))
+        .and_then(|rows| rows.collect())
+        .map_err(io_error)?;
+    let alters: String = ADDED
+        .iter()
+        .filter(|(name, _)| !present.iter().any(|p| p == name))
+        .map(|(name, kind)| format!("ALTER TABLE vms ADD COLUMN {name} {kind};"))
+        .collect();
+    if alters.is_empty() {
+        return Ok(());
+    }
+    conn.execute_batch(&format!("BEGIN; {alters} COMMIT;"))
+        .map_err(io_error)
 }
 
 /// SQLite integers are signed; every number stored here (times, ticks) is

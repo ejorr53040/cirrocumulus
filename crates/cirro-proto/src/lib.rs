@@ -16,8 +16,8 @@
 //! `GET /vms` lists running VMs; `all=true` adds Ended VMs. A parked VM is
 //! an Ended VM whose reason is [`EndReason::Parked`]; waking it starts a new
 //! VM under its name from its snapshot. The logs
-//! response is the console log from byte `offset` on (default 0), as
-//! `text/plain`, with a [`VM_STATE_HEADER`] saying whether the VM is still
+//! response is the console log from byte `offset` on (default 0), at most
+//! [`LOG_CHUNK`] bytes of it, as `text/plain`, with a [`VM_STATE_HEADER`] saying whether the VM is still
 //! running, so a client can follow it by polling from its last offset.
 //!
 //! Every non-2xx response carries an [`ErrorBody`].
@@ -28,6 +28,10 @@ use std::path::PathBuf;
 
 /// Response header on the logs endpoint: `running` or `ended`.
 pub const VM_STATE_HEADER: &str = "cirro-vm-state";
+
+/// The most of a console log one logs response holds. A full one means
+/// more was already there; ask again from where it ended.
+pub const LOG_CHUNK: u64 = 1 << 20;
 
 /// Bounds on `RunRequest.mem_mib` and `RunRequest.vcpus`. The CLI and the
 /// agent both enforce them; the agent's check is the one that counts, since
@@ -60,6 +64,23 @@ pub struct RunRequest {
     /// Who the command runs as inside the guest; root when unset.
     #[serde(default)]
     pub user: Option<User>,
+    /// Makes the VM an App: the Node's edge sends requests for the route's
+    /// hostname to it.
+    #[serde(default)]
+    pub route: Option<Route>,
+}
+
+/// An App's route: requests to the Node's edge for `host` go to `port` on
+/// the App's VM. A hostname belongs to at most one App on the Node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Route {
+    /// A DNS name in lowercase, without a trailing dot.
+    pub host: String,
+    pub port: u16,
+    /// Park the App once no request has come through the edge for this
+    /// many seconds; never when unset.
+    #[serde(default)]
+    pub idle_park_secs: Option<u32>,
 }
 
 /// A numeric user and group inside the guest.
@@ -80,6 +101,9 @@ pub struct VmInfo {
     /// Seconds since the Unix epoch, on the Node's clock.
     pub started_at: u64,
     pub ended: Option<Ended>,
+    /// Set for an App, and kept while it is parked or ended, until `rm`.
+    #[serde(default)]
+    pub route: Option<Route>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

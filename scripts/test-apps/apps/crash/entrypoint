@@ -1,0 +1,11 @@
+#!/bin/sh
+# Exits with EXIT_CODE (default 3) after CRASH_AFTER seconds (default 5),
+# or kills itself with SIGNAL (SEGV, ABRT, ...) if that's set, to see how
+# the Node reports an App that dies.
+sleep "${CRASH_AFTER:-5}"
+if [ -n "$SIGNAL" ]; then
+    echo "crash: killing myself with SIG$SIGNAL"
+    kill "-$SIGNAL" $$
+fi
+echo "crash: exiting ${EXIT_CODE:-3}"
+exit "${EXIT_CODE:-3}"

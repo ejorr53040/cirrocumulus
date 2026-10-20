@@ -1,0 +1,55 @@
+# The tests that boot real Firecracker VMs, which GitHub's hosted runners
+# can't run (no KVM). They run on a self-hosted runner labelled `kvm`, and
+# only once the repository variable KVM_RUNNER is `true`, so forks and a
+# repository without such a runner aren't left with a job that never starts.
+#
+# The runner host needs what the tests' module docs list: /dev/kvm, cgroup
+# v2, the sudoers rule for the test agent, nftables, and the `firecracker`
+# and `jailer` binaries in $CIRRO_FIRECRACKER_DIR (the pinned release that
+# `cirro node install` fetches). The job fails if any test skips for want
+# of them, rather than passing without having run.
+
+name: VM tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One run at a time: the tests' Node subnets are fixed per test.
+  group: vm-tests
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  vm-tests:
+    name: Real Firecracker VMs
+    if: vars.KVM_RUNNER == 'true' && github.event.pull_request.head.repo.fork != true
+    runs-on: [self-hosted, linux, x64, kvm]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install && rustup show active-toolchain
+      - name: Firecracker, jailer and the guest kernel
+        run: |
+          cp "${CIRRO_FIRECRACKER_DIR:?set it in the environment of the runner}"/{firecracker,jailer} .
+          scripts/step0/fetch_kernel.sh
+      - name: Tests
+        run: |
+          cargo test --release --locked -p cirrocumulus --test node_agent --test node_install \
+            2>&1 | tee vm-tests.log
+          if grep -q "^skipping:" vm-tests.log; then
+            echo "::error::VM tests skipped instead of running; see the log for why"
+            exit 1
+          fi

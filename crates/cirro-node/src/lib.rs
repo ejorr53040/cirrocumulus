@@ -8,7 +8,6 @@ pub mod firecracker;
 pub mod install;
 pub mod jailer;
 pub mod metrics;
-pub mod network;
 pub mod release;
 pub mod rootfs_open;
 mod state;

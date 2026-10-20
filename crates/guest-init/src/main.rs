@@ -11,10 +11,9 @@
 //! of a fixed rootfs path, so the host can supply it at boot rather than
 //! baking it into the image.
 
-mod config;
 mod launch;
 
-use config::Config;
+use cirro_guest_init::config::{self, Config};
 use nix::errno::Errno;
 use nix::mount::{MsFlags, mount};
 use nix::sys::reboot::{RebootMode, reboot, set_cad_enabled};
@@ -29,17 +28,47 @@ use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
-/// Set from `handle_sigint` (async-signal-safe: a single atomic store) and
-/// polled from the reap loop, which is the only place it's safe to act on
-/// it -- forwarding a signal, unlike setting a flag, isn't guaranteed
-/// async-signal-safe by POSIX, and the tracked app's pid isn't available
-/// inside the handler anyway.
-static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// The tracked app's pid while it runs: 0 before it is forked and after it
+/// is reaped, so a late request can't hit a process that reused the pid.
+static APP_PID: AtomicI32 = AtomicI32::new(0);
 
+/// A host shutdown request that arrived before the app was forked, which
+/// `main` forwards as soon as `APP_PID` is set.
+static SHUTDOWN_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Printed to the console as a host shutdown request is forwarded.
+const FORWARDING_MARKER: &[u8] = b"GUEST_INIT_FORWARDING_SIGTERM\n";
+
+/// Forwards a host shutdown request to the app as `SIGTERM`, here in the
+/// handler rather than from the reap loop: a flag the loop checked only
+/// when `waitpid` was interrupted was lost when the signal landed between
+/// two `waitpid` calls. Before the app exists the request is kept as
+/// `SHUTDOWN_PENDING`; guest-init is single-threaded, so the handler runs
+/// whole between two of `main`'s steps and the request can't fall between
+/// the flag and `APP_PID`.
 extern "C" fn handle_sigint(_signal: nix::libc::c_int) {
-    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    let pid = APP_PID.load(Ordering::SeqCst);
+    if pid > 0 {
+        forward_shutdown(pid);
+    } else {
+        SHUTDOWN_PENDING.store(true, Ordering::SeqCst);
+    }
+}
+
+fn forward_shutdown(pid: nix::libc::pid_t) {
+    // SAFETY: `write(2)` and `kill(2)` are async-signal-safe (POSIX
+    // 2.4.3), the buffer is static, and an error (the app already gone)
+    // leaves nothing to undo.
+    unsafe {
+        nix::libc::write(
+            1,
+            FORWARDING_MARKER.as_ptr().cast(),
+            FORWARDING_MARKER.len(),
+        );
+        nix::libc::kill(pid, nix::libc::SIGTERM);
+    }
 }
 
 /// Guest-side vsock port guest-init listens on for its config, per
@@ -222,44 +251,30 @@ fn install_shutdown_request_handler() {
         SaFlags::empty(),
         SigSet::empty(),
     );
-    // SAFETY: `handle_sigint` only performs an atomic store, which is
-    // async-signal-safe.
+    // SAFETY: `handle_sigint` only touches atomics and makes
+    // async-signal-safe calls (see `forward_shutdown`).
     unsafe { signal::sigaction(Signal::SIGINT, &action) }.expect("install SIGINT handler");
 }
 
-/// Reaps every child until none remain, per RESEARCH.md M2 slice 4, and
-/// (slice 5) forwards a pending host shutdown request to the tracked app
-/// as a real `SIGTERM` along the way. A `waitpid` scoped to just the one
-/// tracked app pid (slices 2-3's approach) never touches any other
-/// child's exit -- a grandchild the app forked and didn't wait on, still
-/// running when the app exits, gets reparented to guest-init (PID 1) and
-/// would sit unreaped otherwise. `waitpid(-1)` reaps whichever child
-/// changes state next regardless of pid, so looping it until `ECHILD` (no
-/// children left) sweeps up the tracked app and any such orphan alike
-/// before shutdown runs.
+/// Reaps every child until none remain, per RESEARCH.md M2 slice 4. A
+/// `waitpid` scoped to just the one tracked app pid (slices 2-3's
+/// approach) never touches any other child's exit -- a grandchild the app
+/// forked and didn't wait on, still running when the app exits, gets
+/// reparented to guest-init (PID 1) and would sit unreaped otherwise.
+/// `waitpid(-1)` reaps whichever child changes state next regardless of
+/// pid, so looping it until `ECHILD` (no children left) sweeps up the
+/// tracked app and any such orphan alike before shutdown runs. Once `app`
+/// is reaped its pid is free for reuse, so `APP_PID` goes back to 0.
 ///
-/// `waitpid` returns `EINTR` when a signal (here, `SIGINT` from
-/// `install_shutdown_request_handler`'s handler) interrupts the blocking
-/// wait -- `SigAction::new` above doesn't set `SA_RESTART`, so this is the
-/// loop's cue to check the flag and forward, rather than a genuine error.
-fn reap_until_no_children(app_pid: Pid) {
+/// `waitpid` returns `EINTR` when `SIGINT` (see `handle_sigint`)
+/// interrupts the blocking wait, since `SA_RESTART` isn't set: not an
+/// error, just a reason to wait again.
+fn reap_until_no_children(app: Pid) {
     loop {
         match waitpid(Pid::from_raw(-1), None) {
-            Ok(_) => continue,
+            Ok(status) if status.pid() == Some(app) => APP_PID.store(0, Ordering::SeqCst),
+            Ok(_) | Err(Errno::EINTR) => continue,
             Err(Errno::ECHILD) => return,
-            Err(Errno::EINTR) => {
-                if SHUTDOWN_REQUESTED.swap(false, Ordering::SeqCst) {
-                    println!("GUEST_INIT_FORWARDING_SIGTERM");
-                    std::io::stdout().flush().expect("flush marker");
-                    // The app may already be gone (e.g. this races its own
-                    // exit) -- ESRCH there just means there's nothing left
-                    // to forward to, not a real failure.
-                    match signal::kill(app_pid, Signal::SIGTERM) {
-                        Ok(()) | Err(Errno::ESRCH) => {}
-                        Err(e) => panic!("kill app pid with SIGTERM: {e}"),
-                    }
-                }
-            }
             Err(e) => panic!("waitpid(-1): {e}"),
         }
     }
@@ -304,6 +319,10 @@ fn main() {
 
     let config = read_config_from_vsock();
     let app_pid = spawn_configured_app(&config);
+    APP_PID.store(app_pid.as_raw(), Ordering::SeqCst);
+    if SHUTDOWN_PENDING.load(Ordering::SeqCst) {
+        forward_shutdown(app_pid.as_raw());
+    }
     reap_until_no_children(app_pid);
 
     shutdown();

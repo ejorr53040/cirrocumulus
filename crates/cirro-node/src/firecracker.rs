@@ -111,9 +111,8 @@ impl Client {
         })
     }
 
-    /// Attaches a host tap device (already created and configured, e.g. via
-    /// `cirro_node::network::create_persistent_tap`) to the VM as a network
-    /// interface, per RESEARCH.md M3 slice 2. Must be called before `boot`
+    /// Attaches a host tap device (already created and configured) to the
+    /// VM as a network interface, per RESEARCH.md M3 slice 2. Must be called before `boot`
     /// -- like `/drives/rootfs`, `/network-interfaces/{iface_id}` is static
     /// device config the API only accepts pre-boot.
     pub async fn attach_tap(&self, iface_id: &str, host_dev_name: &str) -> Result<(), Error> {

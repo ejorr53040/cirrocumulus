@@ -29,88 +29,29 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const HTTP_PORT: u16 = 8080;
 const TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The port the agent on Node subnet `10.77.<octet>.0/24` serves its HTTP
+/// edge on, on 127.0.0.1: one per agent, so tests running at once don't
+/// share an edge.
+fn edge_port(octet: u8) -> u16 {
+    18000 + u16::from(octet)
+}
+
+/// Like [`edge_port`], for the HTTPS edge.
+fn tls_edge_port(octet: u8) -> u16 {
+    19000 + u16::from(octet)
+}
 
 /// The Node subnet octets of the agents currently running in this process.
 static LIVE_OCTETS: std::sync::Mutex<std::collections::BTreeSet<u8>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 mod common;
-use common::{home, latest_kernel, repo_root, test_agent, test_agent_path};
-
-/// The rootfs images the tests boot, built once per test run without root
-/// (`mkfs.ext4 -d`). Every image carries the fixture commands under `/app`.
-struct Rootfs {
-    /// guest-init as `/init`.
-    guest_init: PathBuf,
-    /// No `/init` at all, so the guest never starts guest-init.
-    no_init: PathBuf,
-    /// A `/init` that isn't guest-init and never takes a config.
-    wrong_init: PathBuf,
-}
-
-fn rootfs() -> &'static Rootfs {
-    static ROOTFS: OnceLock<Rootfs> = OnceLock::new();
-    ROOTFS.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("node-agent-rootfs");
-        let tree = dir.join("tree");
-        let _ = std::fs::remove_dir_all(&dir);
-        for sub in ["proc", "sys", "dev", "app"] {
-            std::fs::create_dir_all(tree.join(sub)).expect("create rootfs tree");
-        }
-        for fixture in [
-            "http_app",
-            "ignore_term",
-            "exit_later",
-            "probe",
-            "whoami",
-            "spin",
-            "counter",
-            "dialer",
-        ] {
-            let status = std::process::Command::new("rustc")
-                .args(["--target", "x86_64-unknown-linux-musl", "-O", "-o"])
-                .arg(tree.join("app").join(fixture))
-                .arg(
-                    Path::new(env!("CARGO_MANIFEST_DIR"))
-                        .join(format!("tests/fixtures/{fixture}.rs")),
-                )
-                .status()
-                .expect("run rustc");
-            assert!(status.success(), "building the {fixture} fixture failed");
-        }
-        let no_init = make_image(&tree, &dir.join("no-init.ext4"));
-        std::fs::copy(tree.join("app/ignore_term"), tree.join("init"))
-            .expect("copy ignore_term in as /init");
-        let wrong_init = make_image(&tree, &dir.join("wrong-init.ext4"));
-        let guest_init_bin = repo_root()
-            .join("target/guest-init-embed/x86_64-unknown-linux-musl/release/guest-init");
-        std::fs::copy(&guest_init_bin, tree.join("init")).expect("copy guest-init into tree");
-        let guest_init = make_image(&tree, &dir.join("guest-init.ext4"));
-        Rootfs {
-            guest_init,
-            no_init,
-            wrong_init,
-        }
-    })
-}
-
-fn make_image(tree: &Path, image: &Path) -> PathBuf {
-    let file = std::fs::File::create(image).expect("create rootfs image");
-    file.set_len(64 * 1024 * 1024).expect("size rootfs image");
-    let status = std::process::Command::new("mkfs.ext4")
-        .args(["-q", "-F", "-d"])
-        .arg(tree)
-        .arg(image)
-        .status()
-        .expect("run mkfs.ext4");
-    assert!(status.success(), "mkfs.ext4 failed");
-    image.to_path_buf()
-}
+use common::{home, latest_kernel, repo_root, rootfs, test_agent, test_agent_path};
 
 /// A throwaway Node agent on Node subnet `10.77.<octet>.0/24`. It can be
 /// stopped and restarted on the same state dir, like the real one. Dropping
@@ -123,6 +64,8 @@ struct Agent {
     socket_group: String,
     state_dir: PathBuf,
     socket: PathBuf,
+    /// More `cirro node agent` arguments, for tests that need them.
+    extra_args: Vec<String>,
 }
 
 impl Agent {
@@ -132,7 +75,20 @@ impl Agent {
         Agent::start_with_socket_group(octet, &getgid().as_raw().to_string())
     }
 
+    /// Like [`Agent::start`], with more `cirro node agent` arguments.
+    fn start_with_args(octet: u8, args: &[&str]) -> Option<Agent> {
+        Agent::start_with(
+            octet,
+            &getgid().as_raw().to_string(),
+            args.iter().map(|a| a.to_string()).collect(),
+        )
+    }
+
     fn start_with_socket_group(octet: u8, socket_group: &str) -> Option<Agent> {
+        Agent::start_with(octet, socket_group, Vec::new())
+    }
+
+    fn start_with(octet: u8, socket_group: &str, extra_args: Vec<String>) -> Option<Agent> {
         if !Path::new("/dev/kvm").exists() {
             eprintln!("skipping: /dev/kvm not present");
             return None;
@@ -166,6 +122,7 @@ impl Agent {
             socket_group: socket_group.to_string(),
             state_dir,
             socket,
+            extra_args,
         };
         agent.spawn().expect("start the Node agent");
         Some(agent)
@@ -209,12 +166,15 @@ impl Agent {
             .arg(&self.socket)
             .args(["--socket-group", &self.socket_group])
             .args(["--subnet", &format!("10.77.{octet}.0/24")])
+            .args(["--http", &format!("127.0.0.1:{}", edge_port(octet))])
+            .args(["--https", &format!("127.0.0.1:{}", tls_edge_port(octet))])
             .arg("--firecracker")
             .arg(repo.join("firecracker"))
             .arg("--jailer")
             .arg(repo.join("jailer"))
             .arg("--kernel")
-            .arg(latest_kernel());
+            .arg(latest_kernel())
+            .args(&self.extra_args);
         cmd
     }
 
@@ -973,6 +933,62 @@ fn graceful_stop_leaves_an_ended_vm_whose_logs_last_until_rm() {
 }
 
 #[test]
+fn logs_reads_a_long_console_log_whole_and_returns_while_it_still_grows() {
+    let Some(agent) = Agent::start(210) else {
+        return;
+    };
+
+    agent
+        .run("chatty", &rootfs().guest_init, &["/app/chatter"])
+        .success();
+    // Past the first of the agent's 1 MiB answers before reading. The
+    // console writes ~100-170 KB/s, so the log keeps growing as `logs`
+    // runs.
+    let log = agent.state_dir.join("logs/chatty.0.log");
+    let deadline = Instant::now() + 3 * TIMEOUT;
+    while std::fs::metadata(&log).map_or(0, |m| m.len()) < 5 << 18 {
+        assert!(
+            Instant::now() < deadline,
+            "chatter wrote only {:?} bytes",
+            std::fs::metadata(&log).map(|m| m.len())
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let logs = stdout(
+        agent
+            .cirro()
+            .args(["logs", "chatty"])
+            .timeout(TIMEOUT)
+            .assert()
+            .success(),
+    );
+    // The log was mid-write as it was read, so its last line can be cut.
+    let complete = &logs[..=logs.rfind('\n').expect("a whole line")];
+    let lines: Vec<&str> = complete
+        .lines()
+        .filter(|l| l.starts_with("CHATTER "))
+        .collect();
+    assert!(
+        logs.len() > 1 << 20,
+        "logs stopped inside the first 1 MiB answer: {} bytes",
+        logs.len()
+    );
+    // No line lost or doubled where one answer ends and the next begins.
+    for (n, line) in lines.iter().enumerate() {
+        assert_eq!(*line, format!("CHATTER {n:012}"));
+    }
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "chatty"])
+        .assert()
+        .success();
+    agent.cirro().args(["rm", "chatty"]).assert().success();
+    agent.assert_no_cirro_state();
+}
+
+#[test]
 fn graceful_stop_forces_a_vm_that_ignores_sigterm_after_its_timeout() {
     let Some(agent) = Agent::start(253) else {
         return;
@@ -1467,6 +1483,76 @@ fn vms_reach_the_internet_but_not_smtp_each_other_or_the_lan() {
         .args(["stop", "--force", "target"])
         .assert()
         .success();
+    agent.assert_no_cirro_state();
+}
+
+/// A guest can send from any address it likes. Its forged datagrams must
+/// reach neither another VM nor the Node.
+///
+/// A strict rp_filter (1) on the Node, or a host firewall that drops
+/// VM-to-VM forwarding and VM-to-Node input (ufw's defaults), also stops
+/// them, so on such a Node this passes without Cirrocumulus's own rules. To
+/// see it fail without them: `sysctl -w net.ipv4.conf.{all,default}.rp_filter=2`,
+/// `ufw route allow in on cirro-+ out on cirro-+` and
+/// `ufw allow in on cirro-+ to any port 31217 proto udp`.
+#[test]
+fn a_vm_cant_get_past_the_egress_policy_by_forging_its_source_address() {
+    let Some(agent) = Agent::start(217) else {
+        return;
+    };
+    let node = std::net::UdpSocket::bind("0.0.0.0:31217").expect("bind a UDP port on the Node");
+    node.set_nonblocking(true).unwrap();
+    let listener = stdout(
+        agent
+            .run(
+                "listener",
+                &rootfs().guest_init,
+                &["/app/udp", "listen", "9000"],
+            )
+            .success(),
+    )
+    .trim()
+    .to_string();
+    wait_for_log(&agent, "listener", "UDP_LISTENING");
+
+    let other_vm = format!("{listener}:9000");
+    agent
+        .run(
+            "spoofer",
+            &rootfs().guest_init,
+            &[
+                "/app/udp",
+                "spoof",
+                // A documentation address (RFC 5737), so a packet that did
+                // escape would impersonate no one.
+                "203.0.113.7",
+                &other_vm,
+                "10.77.217.1:31217",
+            ],
+        )
+        .success();
+    wait_for_log(&agent, "spoofer", "UDP_SENT 20");
+
+    let heard = stdout(agent.cirro().args(["logs", "listener"]).assert().success());
+    assert!(
+        !heard.contains("UDP_FROM"),
+        "a forged source reached another VM:\n{heard}"
+    );
+    let mut buf = [0; 64];
+    let node_heard = std::iter::from_fn(|| node.recv_from(&mut buf).ok().map(|(_, from)| from))
+        .collect::<Vec<_>>();
+    assert!(
+        node_heard.is_empty(),
+        "a forged source reached the Node: {node_heard:?}"
+    );
+
+    for name in ["listener", "spoofer"] {
+        agent
+            .cirro()
+            .args(["stop", "--force", name])
+            .assert()
+            .success();
+    }
     agent.assert_no_cirro_state();
 }
 
@@ -1981,5 +2067,533 @@ fn a_running_agent_still_starts_vms_after_its_binary_is_replaced() {
         .args(["stop", "--force", "web"])
         .assert()
         .success();
+    agent.assert_no_cirro_state();
+}
+
+/// `GET /` through the agent's HTTP edge, asking for `host`.
+fn edge_get(agent: &Agent, host: &str) -> std::io::Result<String> {
+    edge_get_path(agent, host, "/")
+}
+
+/// `GET <path>` through the agent's HTTP edge, asking for `host`.
+fn edge_get_path(agent: &Agent, host: &str, path: &str) -> std::io::Result<String> {
+    let mut stream = TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], edge_port(agent.octet))),
+        Duration::from_secs(1),
+    )?;
+    stream.set_read_timeout(Some(TIMEOUT))?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
+}
+
+/// Retries `edge_get` until the App answers with a 200: `run` returns a
+/// moment before the fixture is listening.
+fn wait_for_edge(agent: &Agent, host: &str) -> String {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let result = edge_get(agent, host);
+        match &result {
+            Ok(response) if response.starts_with("HTTP/1.1 200") => return response.clone(),
+            _ => assert!(
+                Instant::now() < deadline,
+                "{host} never answered through the edge within {TIMEOUT:?}: {result:?}"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// `cirro run --name <name> --host <host> --port 8080 <rootfs> -- <command...>`.
+fn run_app(agent: &Agent, name: &str, host: &str, command: &[&str]) -> assert_cmd::assert::Assert {
+    agent
+        .cirro()
+        .args(["run", "--name", name, "--host", host, "--port"])
+        .arg(HTTP_PORT.to_string())
+        .arg(&rootfs().guest_init)
+        .arg("--")
+        .args(command)
+        .assert()
+}
+
+/// M7: an App is a VM with a route, and the Node's edge sends requests for
+/// the route's hostname to it. The route outlives an agent restart; one
+/// whose VM has ended answers 503 until `rm` removes it.
+#[test]
+fn the_edge_routes_requests_by_hostname_to_the_apps_vm() {
+    let Some(mut agent) = Agent::start(216) else {
+        return;
+    };
+    run_app(&agent, "tally", "counter.test", &["/app/counter"]).success();
+    let before = count(&wait_for_edge(&agent, "counter.test"));
+
+    let unknown = edge_get(&agent, "nobody.test").expect("ask the edge for an unknown host");
+    assert!(
+        unknown.starts_with("HTTP/1.1 404"),
+        "an unknown host should get a 404: {unknown:?}"
+    );
+    let taken = stderr(run_app(&agent, "other", "counter.test", &["/app/counter"]).failure());
+    assert!(
+        taken.contains("counter.test") && taken.contains("tally"),
+        "a second App can't take a hostname, and should be told who has it: {taken}"
+    );
+    let ps = agent.ps(true);
+    assert!(
+        row(&ps, "other").is_none(),
+        "the refused App is listed:\n{ps}"
+    );
+
+    agent.restart();
+    let after = count(&wait_for_edge(&agent, "counter.test"));
+    assert!(
+        after > before,
+        "the route went to a different VM after a restart"
+    );
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "tally"])
+        .assert()
+        .success();
+    let ended = edge_get(&agent, "counter.test").expect("ask the edge for an ended App");
+    assert!(
+        ended.starts_with("HTTP/1.1 503"),
+        "an App whose VM ended should get a 503: {ended:?}"
+    );
+    // An ended App keeps its hostname until it's removed.
+    run_app(&agent, "other", "counter.test", &["/app/counter"]).failure();
+    agent.cirro().args(["rm", "tally"]).assert().success();
+    let gone = edge_get(&agent, "counter.test").expect("ask the edge for a removed App");
+    assert!(
+        gone.starts_with("HTTP/1.1 404"),
+        "a removed App's hostname should get a 404: {gone:?}"
+    );
+    agent.assert_no_cirro_state();
+}
+
+/// M7: a request for a parked App is held while the App wakes, then
+/// answered. Requests that arrive together share one wake: every answer
+/// comes from the same woken guest, which carries on counting.
+#[test]
+fn requests_for_a_parked_app_wake_it_once_and_are_all_answered() {
+    let Some(mut agent) = Agent::start(215) else {
+        return;
+    };
+    run_app(&agent, "tally", "parked.test", &["/app/counter"]).success();
+    let before = count(&wait_for_edge(&agent, "parked.test"));
+    agent.cirro().args(["park", "tally"]).assert().success();
+
+    let responses: Vec<String> = std::thread::scope(|scope| {
+        let requests: Vec<_> = (0..4)
+            .map(|_| scope.spawn(|| edge_get(&agent, "parked.test")))
+            .collect();
+        requests
+            .into_iter()
+            .map(|r| r.join().unwrap().expect("ask the edge for a parked App"))
+            .collect()
+    });
+    let mut counts: Vec<u64> = responses
+        .iter()
+        .map(|response| {
+            assert!(
+                response.starts_with("HTTP/1.1 200"),
+                "a request for a parked App should be answered once it wakes: {response:?}"
+            );
+            count(response)
+        })
+        .collect();
+    counts.sort_unstable();
+    assert_eq!(
+        counts,
+        (before + 1..=before + 4).collect::<Vec<_>>(),
+        "the requests weren't all answered by the one woken guest"
+    );
+    let ps = agent.ps(false);
+    assert!(
+        row(&ps, "tally").is_some(),
+        "the woken App isn't running:\n{ps}"
+    );
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "tally"])
+        .assert()
+        .success();
+    agent.cirro().args(["rm", "tally"]).assert().success();
+    agent.assert_no_cirro_state();
+    agent.assert_no_snapshots();
+}
+
+/// M7: requests for an App that can't be woken are answered at once with a
+/// 503 that says why, rather than held, and none of them tries again.
+#[test]
+fn requests_for_an_app_that_cant_wake_get_a_503_saying_why() {
+    let Some(mut agent) = Agent::start(214) else {
+        return;
+    };
+    run_app(&agent, "lost", "lost.test", &["/app/counter"]).success();
+    wait_for_edge(&agent, "lost.test");
+    agent.cirro().args(["park", "lost"]).assert().success();
+    // As in the M6 test: the parked dir is root's, but renaming it within
+    // the state dir, which is ours, hides the snapshot.
+    agent.stop_agent();
+    let parked = agent.state_dir.join("parked");
+    let hidden = agent.state_dir.join("parked.hidden");
+    std::fs::rename(&parked, &hidden).expect("hide the parked dir");
+    agent.spawn().expect("start the agent again");
+
+    let asked = Instant::now();
+    let responses: Vec<String> = std::thread::scope(|scope| {
+        let requests: Vec<_> = (0..3)
+            .map(|_| scope.spawn(|| edge_get(&agent, "lost.test")))
+            .collect();
+        requests
+            .into_iter()
+            .map(|r| {
+                r.join()
+                    .unwrap()
+                    .expect("ask the edge for an App that can't wake")
+            })
+            .collect()
+    });
+    for response in &responses {
+        assert!(
+            response.starts_with("HTTP/1.1 503") && response.contains("snapshot is gone"),
+            "a request for an App that can't wake should get a 503 saying why: {response:?}"
+        );
+    }
+    assert!(
+        asked.elapsed() < Duration::from_secs(5),
+        "the requests were held for {:?} for an App that can't wake",
+        asked.elapsed()
+    );
+
+    agent.cirro().args(["rm", "lost"]).assert().success();
+    agent.stop_agent();
+    std::fs::rename(&hidden, &parked).expect("put the parked dir back");
+    agent.spawn().expect("start the agent again");
+    agent.assert_no_cirro_state();
+    agent.assert_no_snapshots();
+}
+
+/// M7: an App run with `--idle-park` is parked once no request has come
+/// for that long and none is in flight, freeing everything it held, and the
+/// next request wakes it. The woken guest's kernel reseeds its RNG (VMGenID), so wakes of one
+/// snapshot never share random numbers.
+#[test]
+fn an_idle_app_is_parked_and_the_next_request_wakes_it_reseeded() {
+    let Some(mut agent) = Agent::start(213) else {
+        return;
+    };
+    let printed = stdout(
+        agent
+            .cirro()
+            .args(["run", "--name", "tally", "--host", "idle.test", "--port"])
+            .arg(HTTP_PORT.to_string())
+            .args(["--idle-park", "2"])
+            .arg(&rootfs().guest_init)
+            .args(["--", "/app/counter"])
+            .assert()
+            .success(),
+    );
+    let (_, host) = vm_address(&printed);
+    let before = count(&wait_for_edge(&agent, "idle.test"));
+
+    // A request still in flight past the idle time keeps the App running.
+    let slow = std::thread::scope(|scope| {
+        let slow = scope.spawn(|| edge_get_path(&agent, "idle.test", "/slow"));
+        std::thread::sleep(Duration::from_secs(3));
+        let ps = agent.ps(true);
+        assert!(
+            row(&ps, "tally").is_some_and(|r| r.contains("running")),
+            "the App was parked with a request in flight:\n{ps}"
+        );
+        slow.join()
+            .unwrap()
+            .expect("the slow request through the edge")
+    });
+    assert_eq!(count(&slow), before + 1, "the slow request wasn't answered");
+
+    let deadline = Instant::now() + TIMEOUT;
+    while !row(&agent.ps(true), "tally").is_some_and(|r| r.contains("parked")) {
+        assert!(
+            Instant::now() < deadline,
+            "the idle App wasn't parked within {TIMEOUT:?}:\n{}",
+            agent.ps(true)
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        host_state_of(213, host).is_empty(),
+        "an idle-parked App still holds host state: {:?}",
+        host_state_of(213, host)
+    );
+
+    let after = count(&edge_get(&agent, "idle.test").expect("ask the edge for the idle App"));
+    assert_eq!(after, before + 2, "the woken App didn't carry on counting");
+    let logs = stdout(agent.cirro().args(["logs", "tally"]).assert().success());
+    assert!(
+        logs.contains("crng reseeded due to virtual machine fork"),
+        "the woken guest's kernel didn't reseed its RNG:\n{logs}"
+    );
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "tally"])
+        .assert()
+        .success();
+    agent.cirro().args(["rm", "tally"]).assert().success();
+    agent.assert_no_cirro_state();
+    agent.assert_no_snapshots();
+}
+
+/// `curl` over HTTPS to the agent's TLS edge for `host`, trusting only the
+/// CA at `ca`: its stdout, or its stderr if it failed.
+fn tls_get(agent: &Agent, host: &str, ca: &Path) -> Result<String, String> {
+    tls_get_with(agent, host, ca, &[])
+}
+
+/// [`tls_get`] with more `curl` arguments.
+fn tls_get_with(agent: &Agent, host: &str, ca: &Path, extra: &[&str]) -> Result<String, String> {
+    let port = tls_edge_port(agent.octet);
+    let output = std::process::Command::new("curl")
+        .args(["--silent", "--show-error", "--max-time", "10", "--cacert"])
+        .arg(ca)
+        .args(extra)
+        .args(["--resolve", &format!("{host}:{port}:127.0.0.1")])
+        .arg(format!("https://{host}:{port}/"))
+        .output()
+        .expect("run curl");
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+}
+
+/// M7: the edge serves HTTPS with certificates from a CA of the Node's own,
+/// which `cirro node ca` prints for clients to trust. Certificates are only
+/// issued for hostnames an App has, and the CA outlives agent restarts.
+#[test]
+fn the_tls_edge_serves_apps_with_certificates_from_the_nodes_ca() {
+    let Some(mut agent) = Agent::start(212) else {
+        return;
+    };
+    run_app(&agent, "tally", "tls.test", &["/app/counter"]).success();
+    wait_for_edge(&agent, "tls.test");
+    let ca_pem = stdout(agent.cirro().args(["node", "ca"]).assert().success());
+    assert!(
+        ca_pem.starts_with("-----BEGIN CERTIFICATE-----"),
+        "`cirro node ca` should print the CA certificate as PEM: {ca_pem:?}"
+    );
+    let ca = agent.state_dir.join("test-ca.pem");
+    std::fs::write(&ca, &ca_pem).expect("write the CA for curl");
+
+    let answer = tls_get(&agent, "tls.test", &ca).expect("HTTPS to the App through the edge");
+    let before = count(&answer);
+    let refused = tls_get(&agent, "nobody.test", &ca);
+    assert!(
+        refused.is_err(),
+        "the edge shouldn't serve a certificate for a hostname no App has: {refused:?}"
+    );
+    // A connection made for one App can't ask for another.
+    let status = tls_get_with(
+        &agent,
+        "tls.test",
+        &ca,
+        &[
+            "--header",
+            "Host: other.test",
+            "--write-out",
+            "%{http_code}",
+            "--output",
+            "/dev/null",
+        ],
+    );
+    assert_eq!(
+        status.as_deref(),
+        Ok("421"),
+        "a request whose Host isn't the connection's SNI should get a 421"
+    );
+
+    agent.restart();
+    let after_restart = stdout(agent.cirro().args(["node", "ca"]).assert().success());
+    assert_eq!(
+        after_restart, ca_pem,
+        "the Node's CA changed across a restart"
+    );
+    let after = count(&tls_get(&agent, "tls.test", &ca).expect("HTTPS after a restart"));
+    assert!(
+        after > before,
+        "the HTTPS route went somewhere else after a restart"
+    );
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "tally"])
+        .assert()
+        .success();
+    agent.cirro().args(["rm", "tally"]).assert().success();
+    agent.assert_no_cirro_state();
+}
+
+/// Pebble, Let's Encrypt's ACME test server, with its mock DNS answering
+/// 127.0.0.1 for every name, so it validates HTTP-01 challenges against
+/// the agent's own edge. Built with `go install` into the test agent's
+/// directory; the test skips without it.
+struct Pebble {
+    servers: Vec<Child>,
+    /// Pebble's own TLS certificate's CA, which the agent must trust.
+    minica: PathBuf,
+    directory: String,
+    management: String,
+    config: PathBuf,
+}
+
+impl Pebble {
+    /// Pebble on ports derived from `octet`, validating HTTP-01 against
+    /// the edge of the agent on that octet.
+    fn start(octet: u8) -> Option<Pebble> {
+        let bin = home().join(".local/lib/cirro-test/go");
+        let source = std::fs::read_dir(home().join("go/pkg/mod/github.com/letsencrypt/pebble"))
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .max();
+        let (Some(source), true) = (source, bin.join("pebble").exists()) else {
+            eprintln!(
+                "skipping: no Pebble -- `GOBIN={} go install \
+                 github.com/letsencrypt/pebble/v2/cmd/pebble{{,-challtestsrv}}@latest`",
+                bin.display()
+            );
+            return None;
+        };
+        let port = |base: u16| (base + u16::from(octet)).to_string();
+        let dns = format!("127.0.0.1:{}", port(20000));
+        let challtestsrv = std::process::Command::new(bin.join("pebble-challtestsrv"))
+            .args(["-defaultIPv4", "127.0.0.1", "-defaultIPv6", ""])
+            .args(["-dnsserver", &dns])
+            .args(["-management", &format!("127.0.0.1:{}", port(20300))])
+            .args(["-http01", "", "-https01", "", "-tlsalpn01", "", "-doh", ""])
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("start pebble-challtestsrv");
+        let certs = source.join("test/certs");
+        let listen = format!("127.0.0.1:{}", port(20600));
+        let management = format!("127.0.0.1:{}", port(20900));
+        let config = serde_json::json!({ "pebble": {
+            "listenAddress": listen,
+            "managementListenAddress": management,
+            "certificate": certs.join("localhost/cert.pem"),
+            "privateKey": certs.join("localhost/key.pem"),
+            "httpPort": edge_port(octet),
+            "tlsPort": tls_edge_port(octet),
+            "ocspResponderURL": "",
+            "externalAccountBindingRequired": false,
+        }});
+        let config_path =
+            std::env::temp_dir().join(format!("cirro-pebble-{}-{octet}.json", std::process::id()));
+        std::fs::write(&config_path, config.to_string()).expect("write Pebble's config");
+        let pebble = std::process::Command::new(bin.join("pebble"))
+            .arg("-config")
+            .arg(&config_path)
+            .args(["-dnsserver", &dns])
+            .env("PEBBLE_VA_NOSLEEP", "1")
+            .env("PEBBLE_WFE_NONCEREJECT", "0")
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("start pebble");
+        let pebble = Pebble {
+            servers: vec![challtestsrv, pebble],
+            minica: certs.join("pebble.minica.pem"),
+            directory: format!("https://localhost:{}/dir", port(20600)),
+            management: format!("https://localhost:{}", port(20900)),
+            config: config_path,
+        };
+        let deadline = Instant::now() + TIMEOUT;
+        while TcpStream::connect(&listen).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "Pebble never listened on {listen}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Some(pebble)
+    }
+
+    /// The root the certificates Pebble issues chain to, written to `path`.
+    fn write_root(&self, path: &Path) {
+        let status = std::process::Command::new("curl")
+            .args(["--silent", "--fail", "--cacert"])
+            .arg(&self.minica)
+            .arg(format!("{}/roots/0", self.management))
+            .arg("--output")
+            .arg(path)
+            .status()
+            .expect("run curl");
+        assert!(status.success(), "fetching Pebble's root failed");
+    }
+}
+
+impl Drop for Pebble {
+    fn drop(&mut self) {
+        for server in &mut self.servers {
+            let _ = server.kill();
+            let _ = server.wait();
+        }
+        let _ = std::fs::remove_file(&self.config);
+    }
+}
+
+/// M7: with ACME on, an App whose hostname is public gets its certificate
+/// from the ACME CA, which validates the hostname over HTTP-01 through the
+/// Node's own edge, and is served with it.
+#[test]
+fn an_app_with_a_public_hostname_is_served_with_an_acme_certificate() {
+    let Some(pebble) = Pebble::start(211) else {
+        return;
+    };
+    let minica = pebble.minica.to_string_lossy().into_owned();
+    let Some(agent) = Agent::start_with_args(
+        211,
+        &[
+            "--acme-email",
+            "ops@cirro-test.dev",
+            "--acme-directory",
+            &pebble.directory,
+            "--acme-root",
+            &minica,
+        ],
+    ) else {
+        return;
+    };
+    run_app(&agent, "tally", "app.cirro-test.dev", &["/app/counter"]).success();
+    wait_for_edge(&agent, "app.cirro-test.dev");
+    let root = agent.state_dir.join("pebble-root.pem");
+    pebble.write_root(&root);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let answer = loop {
+        match tls_get(&agent, "app.cirro-test.dev", &root) {
+            Ok(answer) => break answer,
+            Err(e) => assert!(
+                Instant::now() < deadline,
+                "the App was never served with a certificate from the ACME CA: {e}"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    count(&answer);
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "tally"])
+        .assert()
+        .success();
+    agent.cirro().args(["rm", "tally"]).assert().success();
     agent.assert_no_cirro_state();
 }

@@ -315,6 +315,11 @@ fn enable_io_accounting() {
 
 /// The cgroup jailer creates every VM's own cgroup under. jailer creates
 /// it on first use; the Node agent removes it once it's empty.
+/// Where a Node keeps its VMs' jails ([`NodeConfig::jail_base`]).
+pub fn jail_base(state_dir: &Path) -> PathBuf {
+    state_dir.join("jail")
+}
+
 pub fn parent_cgroup() -> PathBuf {
     parent_cgroup_under(Path::new("/"))
 }
@@ -686,7 +691,7 @@ impl Vm {
         )
         .await?;
         in_netns(&id, &["sysctl", "-qw", "net.ipv4.ip_forward=1"]).await?;
-        nft_in(&id, &nat_ruleset(vm_address)).await?;
+        nft_in(&id, &namespace_ruleset(vm_address)).await?;
 
         // 4. Firecracker's API socket.
         let api_socket = root.join("run/firecracker.socket");
@@ -1089,11 +1094,17 @@ fn remove_if_present(result: std::io::Result<()>, path: &Path) -> Result<(), Err
     }
 }
 
-fn nat_ruleset(vm_address: Ipv4Addr) -> String {
+/// The VM's namespace's own table: 1:1 NAT between the Guest address and
+/// the VM address, and a drop of anything the guest sends from another
+/// source, so a forged source (even another VM's address) never leaves the
+/// namespace.
+fn namespace_ruleset(vm_address: Ipv4Addr) -> String {
     format!(
         "table ip cirro {{\n\
          \tchain prerouting {{ type nat hook prerouting priority dstnat; \
          ip daddr {vm_address} dnat to {GUEST_ADDRESS}; }}\n\
+         \tchain forward {{ type filter hook forward priority filter; \
+         iifname \"tap0\" ip saddr != {GUEST_ADDRESS} drop; }}\n\
          \tchain postrouting {{ type nat hook postrouting priority srcnat; \
          ip saddr {GUEST_ADDRESS} snat to {vm_address}; }}\n\
          }}\n"
