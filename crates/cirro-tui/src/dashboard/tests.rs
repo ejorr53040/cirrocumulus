@@ -1,5 +1,5 @@
 use super::*;
-use cirro_proto::{NodeRates, VmInfo, VmRates, VmStats};
+use cirro_proto::{MachineAppInfo, MachineStatus, NodeRates, Route, VmInfo, VmRates, VmStats};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
@@ -265,5 +265,50 @@ fn sparklines_show_the_newest_samples() {
         cells.contains('█'),
         "the busy half isn't shown:\n{}",
         screen[..4].join("\n")
+    );
+}
+
+fn machine_app(name: &str, port: u16, status: MachineStatus) -> MachineAppInfo {
+    MachineAppInfo {
+        name: name.into(),
+        machine: "pi".into(),
+        route: Route {
+            host: format!("{name}.test"),
+            port,
+            idle_park_secs: None,
+        },
+        status,
+    }
+}
+
+#[test]
+fn machine_backed_apps_show_their_machine_port_and_status_but_no_rates() {
+    let mut dashboard = Dashboard::default();
+    dashboard.set_stats(stats());
+    dashboard.set_machine_apps(vec![
+        machine_app("blog", 8080, MachineStatus::Up),
+        machine_app("api", 9000, MachineStatus::Unreachable),
+    ]);
+
+    let screen = screen(&dashboard);
+
+    let all = screen.join("\n");
+    let blog = row(&screen, "blog").unwrap_or_else(|| panic!("no blog row:\n{all}"));
+    assert!(blog.contains("pi:8080") && blog.contains(" up "), "{blog}");
+    let api = row(&screen, "api").unwrap_or_else(|| panic!("no api row:\n{all}"));
+    assert!(
+        api.contains("pi:9000") && api.contains("unreachable"),
+        "{api}"
+    );
+    for line in [blog, api] {
+        assert!(!line.contains('%') && !line.contains("/s"), "{line}");
+    }
+    // They're not VMs: the arrow keys never select one.
+    dashboard.key(KeyCode::Down);
+    dashboard.key(KeyCode::Down);
+    dashboard.key(KeyCode::Down);
+    assert_eq!(
+        dashboard.key(KeyCode::Char('l')),
+        Action::ShowLog("db".into())
     );
 }

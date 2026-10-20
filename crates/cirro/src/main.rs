@@ -772,9 +772,15 @@ async fn top_loop(socket: &Path, terminal: &mut ratatui::DefaultTerminal) -> Res
     let (stopped, mut stop_results) = tokio::sync::mpsc::unbounded_channel();
     loop {
         if std::time::Instant::now() >= next_refresh {
-            match client::call::<Stats>(socket, Method::GET, "/stats", None::<&()>).await {
-                Ok(stats) => {
+            let refreshed = async {
+                let stats = client::call::<Stats>(socket, Method::GET, "/stats", None::<&()>);
+                let apps = client::call(socket, Method::GET, "/machine-apps", None::<&()>);
+                Ok::<_, String>((stats.await?, apps.await?))
+            };
+            match refreshed.await {
+                Ok((stats, machine_apps)) => {
                     dashboard.set_stats(stats.unwrap_or_default());
+                    dashboard.set_machine_apps(machine_apps.unwrap_or_default());
                     if std::mem::take(&mut refresh_failed) {
                         dashboard.clear_status();
                     }
@@ -833,7 +839,11 @@ async fn top_once(socket: &Path) -> Result<(), String> {
     let stats: Stats = client::call(socket, Method::GET, "/stats", None::<&()>)
         .await?
         .unwrap_or_default();
-    print!("{}", cirro_tui::snapshot(&stats));
+    let machine_apps: Vec<MachineAppInfo> =
+        client::call(socket, Method::GET, "/machine-apps", None::<&()>)
+            .await?
+            .unwrap_or_default();
+    print!("{}", cirro_tui::snapshot(&stats, &machine_apps));
     Ok(())
 }
 

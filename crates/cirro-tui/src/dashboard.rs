@@ -1,8 +1,9 @@
 //! The live dashboard: a Node header with sparklines, a table of running
-//! VMs, and a detail pane for the selected one.
+//! VMs, a table of Machine-backed Apps, and a detail pane for the selected
+//! VM.
 
 use crate::{bytes, duration, per_sec, rate_cells};
-use cirro_proto::{Stats, VmStats};
+use cirro_proto::{MachineAppInfo, Stats, VmStats};
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -26,6 +27,9 @@ pub enum Action {
 #[derive(Default)]
 pub struct Dashboard {
     stats: Stats,
+    /// Listed under the VMs, never selected: nothing of them runs on the
+    /// Node to show a log of or stop.
+    machine_apps: Vec<MachineAppInfo>,
     /// The VM the detail pane shows, by name, so it stays selected when a
     /// refresh or a sort moves its row.
     selected: Option<String>,
@@ -84,6 +88,11 @@ impl Dashboard {
                 .sort_by_key(|vm| std::cmp::Reverse(latest(vm).memory_bytes)),
             Sort::Name => self.stats.vms.sort_by(|a, b| a.info.name.cmp(&b.info.name)),
         }
+    }
+
+    /// Shows `apps` with their Machines' status.
+    pub fn set_machine_apps(&mut self, apps: Vec<MachineAppInfo>) {
+        self.machine_apps = apps;
     }
 
     /// Shows the end of `log` for VM `name` in the detail pane.
@@ -152,15 +161,23 @@ impl Dashboard {
 
     /// Draws everything into `frame`.
     pub fn draw(&self, frame: &mut Frame) {
-        let [header, table, detail, help] = Layout::vertical([
+        // Borders and a header row around the Machine Apps; none at all
+        // when there are none.
+        let apps_height = match self.machine_apps.len() {
+            0 => 0,
+            n => u16::try_from(n).unwrap_or(u16::MAX).saturating_add(3),
+        };
+        let [header, table, apps, detail, help] = Layout::vertical([
             Constraint::Length(4),
             Constraint::Min(5),
+            Constraint::Max(apps_height),
             Constraint::Length(6),
             Constraint::Length(1),
         ])
         .areas(frame.area());
         self.draw_header(frame, header);
         self.draw_table(frame, table);
+        self.draw_machine_apps(frame, apps);
         self.draw_detail(frame, detail);
         let footer = match (&self.confirming_stop, &self.status) {
             (Some(name), _) => format!(" stop {name}? y/n"),
@@ -262,6 +279,32 @@ impl Dashboard {
             .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         let mut state = TableState::default().with_selected(self.selected_row());
         frame.render_stateful_widget(table, area, &mut state);
+    }
+
+    fn draw_machine_apps(&self, frame: &mut Frame, area: Rect) {
+        if self.machine_apps.is_empty() {
+            return;
+        }
+        let header = Row::new(["NAME", "MACHINE", "STATUS"])
+            .style(Style::default().add_modifier(Modifier::BOLD));
+        let rows = self.machine_apps.iter().map(|app| {
+            Row::new([
+                app.name.clone(),
+                format!("{}:{}", app.machine, app.route.port),
+                app.status.as_str().to_string(),
+            ])
+        });
+        let widths = [
+            Constraint::Min(12),
+            Constraint::Length(24),
+            Constraint::Length(11),
+        ];
+        let table = Table::new(rows, widths).header(header).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Machine Apps "),
+        );
+        frame.render_widget(table, area);
     }
 
     fn draw_detail(&self, frame: &mut Frame, area: Rect) {

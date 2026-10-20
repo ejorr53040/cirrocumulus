@@ -3367,3 +3367,45 @@ fn an_agent_starts_while_a_machine_is_down() {
     sshd.start_again();
     wait_for_machine_text(&agent, "pi", " up ", RECONNECT);
 }
+
+/// `cirro top --once`'s row for `name` once it contains `text`, within
+/// `within`.
+fn wait_for_top_text(agent: &Agent, name: &str, text: &str, within: Duration) -> String {
+    let deadline = Instant::now() + within;
+    loop {
+        let top = stdout(agent.cirro().args(["top", "--once"]).assert().success());
+        if let Some(row) = row(&top, name)
+            && row.contains(text)
+        {
+            return row.to_string();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "top never showed {text:?} for {name} within {within:?}:\n{top}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// M8: `top` lists a Machine-backed App with its Machine, port and
+/// status, and no CPU or memory, and follows its Machine down and back.
+#[test]
+fn top_shows_a_machine_backed_app_and_its_machines_status() {
+    let Some(mut sshd) = Sshd::start(191) else {
+        return;
+    };
+    let Some(agent) = Agent::start_without_kvm(191) else {
+        return;
+    };
+    add_machine(&agent, &sshd, "pi");
+    run_on_machine(&agent, "web", "pi", "pi.test", 23191).success();
+
+    let web = wait_for_top_text(&agent, "web", " up", TIMEOUT);
+    assert!(web.contains("pi:23191"), "{web}");
+    assert!(!web.contains('%') && !web.contains(" - "), "{web}");
+
+    sshd.stop();
+    wait_for_top_text(&agent, "web", "unreachable", TIMEOUT);
+    sshd.start_again();
+    wait_for_top_text(&agent, "web", " up", RECONNECT);
+}
