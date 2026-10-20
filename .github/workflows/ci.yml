@@ -107,8 +107,10 @@ jobs:
           esac
           scripts/ci/check-commits.sh "$range"
 
+      # Dependabot's titles are generated from package names and can't be kept
+      # under 72 chars; its commits are already exempt in check-commits.sh.
       - name: PR title (becomes the commit subject on squash-merge)
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && github.event.pull_request.user.login != 'dependabot[bot]'
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
