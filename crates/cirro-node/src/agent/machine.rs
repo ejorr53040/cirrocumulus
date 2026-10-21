@@ -4,7 +4,6 @@
 //! OpenSSH `ssh` per Machine running to know whether the Machine is up.
 
 use super::{ApiError, bad_request, internal};
-use tracing::warn;
 use crate::state::{MachineRecord, Store};
 use cirro_proto::{AddMachine, MachineInfo, MachineStatus};
 use hyper::StatusCode;
@@ -18,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
+use tracing::warn;
 
 pub(super) struct Machines {
     /// The agent's SSH private key, root-only (`ssh-keygen` makes it
