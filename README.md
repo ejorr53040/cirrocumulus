@@ -132,7 +132,14 @@ key in, as a dedicated non-root user, then add it:
 cirro machine key | ssh pi@10.0.0.5 'cat >> ~/.ssh/authorized_keys'
 cirro machine add pi --ssh pi@10.0.0.5     # shows the host key and asks
 cirro machine ls                           # each Machine's connection: up or unreachable
+cirro run --name hi --machine pi --host hi.example.com --port 8000
 ```
+
+`run --machine` makes a Machine-backed App: the edge sends requests for
+`--host` to `--port` on the Machine's own localhost, so the service needn't
+listen anywhere else. Cirrocumulus doesn't run that service, so `stop`,
+`park`, `wake`, `logs` and `--idle-park` don't apply; `cirro rm` takes the
+App off the edge, and a Machine with Apps on it can't be removed.
 
 `machine add` pins the Machine's host key, given with `--host-key SHA256:...`
 or confirmed after a scan; check it on the Machine with
@@ -147,6 +154,7 @@ cirro run --name <name> [--mem 256M] [--vcpus 1] [-e KEY=VALUE]... [-w DIR] [-u 
           <image> [-- <command> [args...]]
 cirro run --name <name> [flags...] <rootfs> -- <command> [args...]
 cirro run --name <name> --host <hostname> --port <port> [--idle-park <secs>] <image>   # an App
+cirro run --name <name> --machine <machine> --host <hostname> --port <port>   # a Machine-backed App
 cirro image pull <image>          # pull and build ahead of time
 cirro image ls                    # cached images
 cirro image rm <image|digest>
