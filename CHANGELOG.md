@@ -46,6 +46,14 @@ HTTP(S) to Apps by hostname.
 - **TLS.** The HTTPS edge serves certificates from a CA of the Node's own
   (`cirro node ca` prints it), and with `--acme-email` gets public
   hostnames' certificates from Let's Encrypt over HTTP-01 (ADR 0008).
+- **Machines.** `cirro machine add | ls | rm | key` registers a computer the
+  Node agent reaches over SSH, such as a Raspberry Pi, pinning its host key
+  (ADR 0010). `cirro run --machine pi --host hi.example.com --port 8000`
+  serves a service on the Machine's localhost through the edge, with the
+  same certificates as a VM-backed App, and a 503 while the Machine is
+  unreachable. The agent reconnects a Machine that comes back, never one
+  whose host key changed. `cirro ps` and `cirro top` show Machine-backed
+  Apps.
 - **Docs.** [Threat model](docs/threat-model.md), [security
   policy](SECURITY.md), ADRs 0001–0009, and a docs site (mdBook, `docs/`).
 - **Releases.** Tagging `vX.Y.Z` builds `cirro` and publishes it with its
