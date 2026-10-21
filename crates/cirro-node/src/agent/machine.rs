@@ -4,6 +4,7 @@
 //! OpenSSH `ssh` per Machine running to know whether the Machine is up.
 
 use super::{ApiError, bad_request, internal};
+use tracing::warn;
 use crate::state::{MachineRecord, Store};
 use cirro_proto::{AddMachine, MachineInfo, MachineStatus};
 use hyper::StatusCode;
@@ -67,7 +68,11 @@ impl Machines {
     pub(super) fn restore(&self, store: &Mutex<Store>) -> io::Result<()> {
         let records = store.lock().unwrap().load_machines()?;
         for record in records {
-            self.connect(record)?;
+            // One Machine that can't be set up mustn't stop the agent starting.
+            let name = record.name.clone();
+            if let Err(e) = self.connect(record) {
+                warn!("restore Machine {name:?}: {e}");
+            }
         }
         Ok(())
     }

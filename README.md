@@ -122,6 +122,24 @@ curl https://blog.example.com/
   HTTP-01, which needs the HTTP edge reachable on port 80
   ([ADR 0008](docs/adr/0008-acme-over-http-01-from-the-edge.md)).
 
+## Machines
+
+A Machine is a computer the Node agent reaches over SSH, such as a Raspberry
+Pi or a VPS. It needs only `sshd`, not KVM or Cirrocumulus. Let the agent's
+key in, as a dedicated non-root user, then add it:
+
+```sh
+cirro machine key | ssh pi@10.0.0.5 'cat >> ~/.ssh/authorized_keys'
+cirro machine add pi --ssh pi@10.0.0.5     # shows the host key and asks
+cirro machine ls                           # each Machine's connection: up or unreachable
+```
+
+`machine add` pins the Machine's host key, given with `--host-key SHA256:...`
+or confirmed after a scan; check it on the Machine with
+`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`. A Machine that later
+presents another key is never logged in to until it's removed and added
+again ([ADR 0010](docs/adr/0010-machines-through-a-supervised-openssh-tunnel.md)).
+
 ## Usage
 
 ```sh
@@ -140,6 +158,10 @@ cirro rm <name>                   # delete an Ended VM's record and log, or a pa
 cirro park <name>                 # snapshot a VM to disk and free its RAM
 cirro wake <name>                 # start it again from its snapshot; prints its VM address
 cirro bench [--runs 10] <image|rootfs> [-- <command>]   # time boot, park and wake
+cirro machine add <name> --ssh <user@host[:port]> [--host-key <fingerprint>]
+cirro machine ls                  # Machines and whether each is reachable
+cirro machine rm <name>           # forget a Machine and its pinned host key
+cirro machine key                 # the agent's SSH public key, for authorized_keys
 cirro node ca                     # the CA the HTTPS edge's certificates come from
 cirro node uninstall [--force]    # reverse `node install`
 ```
