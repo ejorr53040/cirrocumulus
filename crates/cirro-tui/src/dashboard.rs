@@ -161,7 +161,7 @@ impl Dashboard {
 
     /// Draws everything into `frame`.
     pub fn draw(&self, frame: &mut Frame) {
-        // Borders and a header row around the Machine Apps; none at all
+        // Borders and a header row around the Machine-backed Apps; none at all
         // when there are none.
         let apps_height = match self.machine_apps.len() {
             0 => 0,
@@ -302,7 +302,7 @@ impl Dashboard {
         let table = Table::new(rows, widths).header(header).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Machine Apps "),
+                .title(" Machine-backed Apps "),
         );
         frame.render_widget(table, area);
     }
