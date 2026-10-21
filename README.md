@@ -39,7 +39,7 @@ small, identical cells.
   54 ms p99
 - Apps: route a hostname to a VM; it wakes on request and parks when idle
 - HTTPS with certificates from the Node's own CA, or Let's Encrypt
-- An egress policy that keeps VMs off the LAN, each other, and SMTP
+- An egress policy that keeps VMs off private-range LANs, each other, and SMTP port 25
 - One `cirro` binary (plus the upstream Firecracker it installs), and VMs
   that outlive restarts of their agent
 
@@ -220,7 +220,7 @@ p99 over 10 runs of the earlier build).
 | jailer: chroot, namespaces, a uid per VM | An escaped VMM seeing the host's files or other VMs |
 | A network namespace per VM | A VM sniffing or spoofing another's traffic |
 | cgroup v2 | One VM starving the others of CPU or memory |
-| nftables egress policy | VMs reaching the LAN, each other, or SMTP |
+| nftables egress policy | VMs reaching a private-range LAN, each other, or SMTP port 25 |
 
 Members of the `cirro` group control every VM on the Node, but aren't host
 root. It doesn't protect against host-kernel 0-days, CPU side channels on

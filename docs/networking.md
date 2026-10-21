@@ -39,12 +39,18 @@ ARP timeout ([ADR 0005](adr/0005-fixed-tap-mac.md)).
 One Node-wide nftables table, `ip cirro`, applies to every VM. It
 masquerades VMs' traffic out of the Node's default route, and drops:
 
-- SMTP (TCP port 25), so a VM can't send spam from the Node's address;
+- SMTP (TCP port 25), so a VM can't send mail straight to other mail
+  servers from the Node's address. The submission ports (465, 587) stay
+  open, so a VM can still send through a mail provider it has an account
+  with;
 - traffic between VMs, which go through the edge or the internet like any
   other client;
 - traffic to private and link-local ranges (`10/8`, `100.64/10`,
-  `169.254/16`, `172.16/12`, `192.168/16`), so a VM can't reach the LAN, the
-  cloud metadata address, or the Node itself;
+  `169.254/16`, `172.16/12`, `192.168/16`), so a VM can't reach a LAN on
+  those ranges, the `169.254.169.254` cloud metadata address, or the Node
+  itself. Other addresses aren't blocked: a Node whose LAN uses public
+  addresses, Azure's `168.63.129.16`, and the rarer reserved ranges are all
+  reachable. Per-VM allowlists come in M11;
 - new connections from VMs to the Node.
 - anything a VM sends from an address that isn't its own, since a guest can
   forge its source address and every rule above matches on it.
