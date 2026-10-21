@@ -52,7 +52,8 @@ Push your image somewhere public, then `cirro run --name x <ref>`. See
    newer). Each VM gets its own copy, so writes don't leak between VMs.
 
 `build.sh` does all of this without root or Docker. Alpine's static `apk`
-installs packages into a plain directory. An unprivileged user namespace
+installs packages into a plain directory; it is downloaded over TLS with no
+checksum, so the build trusts Alpine's CDN for it. An unprivileged user namespace
 lets `busybox --install` run in a chroot. Then `mkfs.ext4 -d` packs the tree.
 
 **To add an App**, make `apps/<name>/entrypoint` (plus any other files, which

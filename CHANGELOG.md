@@ -29,7 +29,7 @@ HTTP(S) to Apps by hostname.
 - **Images.** `cirro image pull | ls | rm`: public `linux/amd64` images,
   built into a rootfs as the calling user, not root (ADR 0004).
 - **Egress policy.** One Node-wide nftables table masquerades VMs' traffic
-  and drops SMTP, VM-to-VM and LAN destinations, and anything a VM sends
+  and drops SMTP port 25, VM-to-VM and private-range LAN destinations, and anything a VM sends
   from an address that isn't its own.
 - **Dashboard.** `cirro top`: live CPU, memory, disk and network use of the
   Node and each VM, at 1 s.
