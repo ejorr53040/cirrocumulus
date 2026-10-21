@@ -556,7 +556,7 @@ const HOST_KEY_FAILED: &str = "Host key verification failed.";
 /// Keeps the Machine `name`'s `ssh` running, marking the Machine up while
 /// it's logged in. A host key that doesn't match the pinned one ends it for
 /// good: the Machine is never trusted again until it's removed and added.
-// ponytail: retries reuse the forwards' ports; if something else took one,
+// Retries reuse the forwards' ports; if something else took one,
 // every retry fails until an App on the Machine is added or removed, which
 // picks fresh ones.
 async fn run_tunnel(name: String, ssh: impl Fn() -> Command, link: Arc<Mutex<Link>>) {
@@ -763,7 +763,7 @@ fn app_with_host(entries: &BTreeMap<String, Machine>, host: &str) -> Option<Stri
 
 /// `n` different ports free on the Node's 127.0.0.1 a moment ago: all
 /// held at once while they're chosen, so none is handed out twice.
-// ponytail: something else can take one before `ssh` binds it; `ssh` then
+// Something else can take one before `ssh` binds it; `ssh` then
 // exits (ExitOnForwardFailure) and the Machine shows unreachable until an
 // App on it is added or removed (see run_tunnel).
 fn free_local_ports(n: usize) -> io::Result<Vec<u16>> {
