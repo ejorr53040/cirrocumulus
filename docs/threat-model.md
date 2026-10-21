@@ -84,10 +84,17 @@ it runs Cirrocumulus code.
   any host and port, as any user name, with its key, and learn whether the
   key was accepted. Targets are checked so none becomes an `ssh` option, and
   `ssh` runs with no config file of root's.
-- **Traffic to a Machine** will cross the network inside the agent's SSH
+- **Traffic to a Machine** crosses the network inside the agent's SSH
   connection: the edge's TLS ends at the Node, so the Machine sees plain
   HTTP from `ssh` on its own localhost, and only its localhost ports are
   reachable that way.
+- **Each Machine-backed App's forward** listens on the Node's 127.0.0.1, so
+  any local user or process on the Node can reach the App past the edge, as
+  it can a VM's address. VMs can't: nothing routes their traffic to the
+  Node's loopback (`route_localnet` stays off).
+- **Adding or removing an App** restarts its Machine's `ssh` with the new set
+  of forwards, so the Machine's other Apps answer 503 for the moment it takes
+  to log in again.
 - **What a Machine runs** is outside Cirrocumulus: a compromised Machine is
   compromised whatever the Node does.
 

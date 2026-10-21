@@ -501,9 +501,13 @@ impl Agent {
         if let ["vms", name, action] = segments.as_slice()
             && self.machines.has_app(name)
         {
+            let cant = match *action {
+                "logs" => "it has no log of it".to_string(),
+                action => format!("it can't {action} it"),
+            };
             let error = format!(
                 "{name:?} is a Machine-backed App: Cirrocumulus doesn't run what serves it, so \
-                 it can't {action} it; `cirro rm {name}` takes it off the edge"
+                 {cant}; `cirro rm {name}` takes it off the edge"
             );
             return json(StatusCode::CONFLICT, &ErrorBody { error });
         }
@@ -1725,9 +1729,9 @@ fn guest_config(run: &RunRequest) -> Result<GuestConfig, ApiError> {
     })
 }
 
-/// VM and Machine names are 1-32 characters of lowercase letters, digits and hyphens,
+/// VM, Machine and App names are 1-32 characters of lowercase letters, digits and hyphens,
 /// so they're safe in file names, URLs and log lines.
-/// `kind` names what the name is for, in the error: VM or Machine.
+/// `kind` names what the name is for, in the error: VM, Machine or App.
 fn validate_name(kind: &str, name: &str) -> Result<(), ApiError> {
     let valid = (1..=32).contains(&name.len())
         && name

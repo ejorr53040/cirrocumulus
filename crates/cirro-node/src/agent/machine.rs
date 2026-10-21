@@ -227,8 +227,11 @@ impl Machines {
             .delete_machine_app(name)
             .map_err(|e| internal(format!("remove the record of App {name:?}: {e}")))?;
         machine.apps.remove(name);
-        self.start_tunnel(machine)
-            .map_err(|e| internal(format!("reconnect Machine {:?}: {e}", machine.record.name)))?;
+        // The App is gone either way; a failed reconnect only leaves its
+        // forward open until the Machine's next change.
+        if let Err(e) = self.start_tunnel(machine) {
+            warn!("reconnect Machine {:?}: {e}", machine.record.name);
+        }
         Ok(true)
     }
 
