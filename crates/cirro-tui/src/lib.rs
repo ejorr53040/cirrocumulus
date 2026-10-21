@@ -42,7 +42,7 @@ pub fn snapshot(stats: &Stats, machine_apps: &[MachineAppInfo]) -> String {
         );
     }
     if !machine_apps.is_empty() {
-        let _ = writeln!(out, "{:<32} {:<24} STATUS", "MACHINE APP", "MACHINE");
+        let _ = writeln!(out, "{:<32} {:<24} STATUS", "MACHINE-BACKED APP", "MACHINE");
     }
     for app in machine_apps {
         let machine = format!("{}:{}", app.machine, app.route.port);
