@@ -29,7 +29,7 @@ it validates every request itself instead of trusting the CLI.
 | Firecracker seccomp filters | Restrict the VMM process's syscalls | A VMM escape getting a useful host syscall surface |
 | jailer | chroot, mount and PID namespaces, a per-VM unprivileged uid | An escaped VMM seeing the host filesystem or other VMs |
 | Per-VM network namespace (ADR 0001) | The tap lives in the VM's own namespace, joined to the Node by a veth | An escaped VMM sniffing or spoofing another VM's raw traffic |
-| cgroup v2 | CPU, memory and I/O limits per VM | Noisy neighbours, memory exhaustion of the Node |
+| cgroup v2 | CPU and memory limits per VM; I/O is counted, not limited | One VM's CPU or memory use crowding out the others. Nothing yet caps the total memory or snapshot disk of all VMs on a Node (M11) |
 | nftables egress policy (`ip cirro`) | Masquerade out; drop SMTP, VM-to-VM and LAN destinations | Spam, lateral movement to the LAN, the host, or other VMs |
 | VMGenID | The guest kernel reseeds its RNG when a snapshot is restored | Two wakes of one snapshot sharing RNG output |
 
@@ -114,7 +114,9 @@ it runs Cirrocumulus code.
 A manual source review on 2026-09-28 found one High (the agent would boot
 any host path as a rootfs; it now opens the rootfs as the caller, #14), three
 Mediums (resource bounds checked only in the CLI, an unverified guest kernel
-download, an unsigned demo package install), all fixed, and two Lows still open
+download, an unsigned demo package install), all fixed, though the demo's
+`apk.static`, the tool that checks those packages' signatures, is itself
+still fetched over TLS with no checksum. Two Lows are still open
 (the development sudoers rule's breadth, and `jailer::Jail`, which only
 the step 0 tests use, with its own `sudo` call; the other unused module is
 gone). The OCI layer parser and guest-init's config parser have

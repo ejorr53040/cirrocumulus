@@ -16,6 +16,10 @@ Dockerfile) is one-off for this app. It's kept as the pre-M4 proof: today,
 
 ## Why Alpine + `apk.static`, not Docker
 
+`build_rootfs.sh` checks every package's signature against this repo's copy
+of Alpine's keys, but `apk.static` itself, which does that checking, is
+downloaded over TLS with no checksum, so the build trusts Alpine's CDN for it.
+
 `guest-init` alone (a bare musl static binary, per M2) is enough for the
 fixture apps in `scripts/step0/`, but a real Flask app needs a real Python
 runtime, so this rootfs needs actual userspace packages, not just one
