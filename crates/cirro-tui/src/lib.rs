@@ -4,13 +4,14 @@ mod dashboard;
 
 pub use dashboard::{Action, Dashboard};
 
-use cirro_proto::{Stats, VmRates};
+use cirro_proto::{MachineAppInfo, Stats, VmRates};
 use std::fmt::Write;
 
 /// `stats` as plain text, for `cirro top --once`: a line for the Node,
 /// then a row per running VM with its latest rates (`-` until the agent has
-/// two samples of it).
-pub fn snapshot(stats: &Stats) -> String {
+/// two samples of it), then a row per Machine-backed App with its Machine,
+/// port and status, which take the place of rates: they run elsewhere.
+pub fn snapshot(stats: &Stats, machine_apps: &[MachineAppInfo]) -> String {
     let mut out = String::new();
     match stats.node.last() {
         Some(node) => {
@@ -38,6 +39,18 @@ pub fn snapshot(stats: &Stats) -> String {
         row(
             &mut out,
             [vm.info.name.clone(), cpu, mem, rx, tx, read, write],
+        );
+    }
+    if !machine_apps.is_empty() {
+        let _ = writeln!(out, "{:<32} {:<24} STATUS", "MACHINE-BACKED APP", "MACHINE");
+    }
+    for app in machine_apps {
+        let machine = format!("{}:{}", app.machine, app.route.port);
+        let _ = writeln!(
+            out,
+            "{:<32} {machine:<24} {}",
+            app.name,
+            app.status.as_str()
         );
     }
     out
@@ -149,7 +162,7 @@ mod tests {
             ],
         };
 
-        let text = snapshot(&stats);
+        let text = snapshot(&stats, &[]);
         let lines: Vec<Vec<&str>> = text
             .lines()
             .map(|l| l.split_whitespace().collect())
