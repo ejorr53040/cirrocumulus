@@ -394,7 +394,13 @@ dependencies = [
 name = "cirro-proto"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "hyperlocal",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -410,22 +416,17 @@ name = "cirrocumulus"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
- "bytes",
  "cirro-guest-init",
  "cirro-image",
  "cirro-node",
  "cirro-proto",
  "cirro-tui",
  "clap",
- "http-body-util",
  "hyper",
- "hyper-util",
- "hyperlocal",
  "nix 0.31.3",
  "predicates",
  "ratatui",
  "rusqlite",
- "serde",
  "serde_json",
  "tokio",
  "tracing-subscriber",
