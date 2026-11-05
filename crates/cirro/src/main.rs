@@ -1,4 +1,3 @@
-mod client;
 mod open_rootfs;
 
 use cirro_image::ImageCache;
@@ -6,6 +5,7 @@ use cirro_image::run_config::merge_env;
 use cirro_node::agent;
 use cirro_node::release::ReleaseBinaries;
 use cirro_node::subnet::Subnet;
+use cirro_proto::client;
 use cirro_proto::{
     AddMachine, LOG_CHUNK, MachineAppInfo, MachineAppRequest, MachineHostKey, MachineInfo,
     MachineScan, Route, RunRequest, Stats, StopRequest, User, VM_STATE_HEADER, VmInfo,

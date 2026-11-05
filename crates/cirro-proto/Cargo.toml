@@ -6,8 +6,18 @@ version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# The HTTP client for the Node agent's socket, for the CLI (and the coming desktop GUI, ADR 0012).
+client = ["dep:bytes", "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:hyperlocal", "dep:serde_json"]
+
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
+bytes = { workspace = true, optional = true }
+http-body-util = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+hyperlocal = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 [lints]
 workspace = true

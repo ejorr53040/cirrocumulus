@@ -1,8 +1,8 @@
-//! The CLI's side of the Node agent API (`cirro-proto`): one HTTP request
-//! per call over the agent's Unix socket.
+//! A client of the Node agent API for the CLI (and the coming desktop GUI, ADR 0012):
+//! one HTTP request per call over the agent's Unix socket.
 
+use crate::ErrorBody;
 use bytes::Bytes;
-use cirro_proto::ErrorBody;
 use http_body_util::{BodyExt, Full};
 use hyper::header::HeaderMap;
 use hyper::{Method, Request};
@@ -13,8 +13,8 @@ use serde::de::DeserializeOwned;
 use std::path::Path;
 
 /// Sends one request and decodes a JSON response body, `None` when the
-/// body is empty. Any failure comes back as the message the CLI prints.
-pub(crate) async fn call<T: DeserializeOwned>(
+/// body is empty. Any failure comes back as a message to show the user.
+pub async fn call<T: DeserializeOwned>(
     socket: &Path,
     method: Method,
     path: &str,
@@ -31,7 +31,7 @@ pub(crate) async fn call<T: DeserializeOwned>(
 
 /// Sends one request and returns a successful response's headers and raw
 /// body.
-pub(crate) async fn send(
+pub async fn send(
     socket: &Path,
     method: Method,
     path: &str,

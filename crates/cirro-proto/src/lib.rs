@@ -37,6 +37,11 @@
 //! running, so a client can follow it by polling from its last offset.
 //!
 //! Every non-2xx response carries an [`ErrorBody`].
+//!
+//! The `client` feature adds [`client`], which sends these requests over the socket.
+
+#[cfg(feature = "client")]
+pub mod client;
 
 use serde::{Deserialize, Serialize};
 use std::net::Ipv4Addr;
