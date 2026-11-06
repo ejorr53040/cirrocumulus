@@ -9,24 +9,20 @@ const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/s
 /// The app's environment: `env` as given, plus `PATH` and `HOME=/` when it
 /// doesn't set them, as Docker does.
 pub(crate) fn app_env(env: &[String]) -> Vec<String> {
-    let has = |key: &str| {
-        env.iter()
-            .any(|e| e.split_once('=').is_some_and(|(k, _)| k == key))
-    };
     let mut out = env.to_vec();
-    if !has("PATH") {
+    if lookup(env, "PATH").is_none() {
         out.push(format!("PATH={DEFAULT_PATH}"));
     }
-    if !has("HOME") {
+    if lookup(env, "HOME").is_none() {
         out.push("HOME=/".to_string());
     }
     out
 }
 
-/// The value of `key` in `env`; the last entry wins, as in `execve`'s callers.
+/// The value of `key` in `env`; the first entry wins, as in the app's
+/// own `getenv`, so guest-init searches the `PATH` the app will see.
 pub(crate) fn lookup<'a>(env: &'a [String], key: &str) -> Option<&'a str> {
     env.iter()
-        .rev()
         .find_map(|e| e.split_once('=').filter(|(k, _)| *k == key).map(|(_, v)| v))
 }
 
@@ -60,7 +56,11 @@ mod tests {
 
         assert_eq!(
             env,
-            strings(&["A=1", &format!("PATH={DEFAULT_PATH}"), "HOME=/"])
+            strings(&[
+                "A=1",
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "HOME=/"
+            ])
         );
     }
 
@@ -75,12 +75,15 @@ mod tests {
     fn a_key_that_only_starts_with_path_is_not_path() {
         let env = app_env(&strings(&["PATHS=/x"]));
 
-        assert_eq!(lookup(&env, "PATH"), Some(DEFAULT_PATH));
+        assert_eq!(lookup(&env, "PATHS"), Some("/x"));
+        assert!(lookup(&env, "PATH").is_some_and(|p| p.split(':').any(|d| d == "/bin")));
     }
 
     #[test]
-    fn lookup_takes_the_last_entry() {
-        assert_eq!(lookup(&strings(&["A=1", "A=2"]), "A"), Some("2"));
+    fn lookup_takes_the_first_entry_like_getenv() {
+        let env = app_env(&strings(&["PATH=/first", "PATH=/second"]));
+
+        assert_eq!(lookup(&env, "PATH"), Some("/first"));
     }
 
     #[test]

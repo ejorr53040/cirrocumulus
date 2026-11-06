@@ -1,15 +1,13 @@
 //! `guest-init`: PID 1 inside the Firecracker guest. See RESEARCH.md M2.
 //!
-//! Slice 1: mount the pseudo-filesystems and print a boot marker. Slice 2:
-//! read the configured app from a fixed path, fork, and exec it in the
-//! child. Slice 3: power off cleanly once that app exits. Slice 4: reap
-//! every child, not just the tracked app. Slice 5: translate a
-//! host-triggered shutdown (Firecracker's `SendCtrlAltDel` action) into a
-//! real `SIGTERM` for the app, instead of the kernel's default hard reset
-//! wiping out the guest before any userspace code -- including the app --
-//! gets to react. Slice 6 (current): read the config over vsock instead
-//! of a fixed rootfs path, so the host can supply it at boot rather than
-//! baking it into the image.
+//! It mounts the pseudo-filesystems, prints a boot marker, reads the app's
+//! config over vsock (so the host supplies it at boot rather than baking it
+//! into the image), and forks and execs the app as its configured user.
+//! Until no children are left it reaps every one, the app's orphans
+//! included, and turns a host-triggered shutdown (Firecracker's
+//! `SendCtrlAltDel` action) into a `SIGTERM` for the app, instead of the
+//! kernel's default hard reset wiping out the guest before the app gets to
+//! react. Then it resets the VM, which Firecracker exits on.
 
 mod launch;
 
@@ -194,7 +192,7 @@ fn exec_app(config: &Config) -> String {
             return format!("switch to user {}:{}: {e}", user.uid, user.gid);
         }
     }
-    let path = launch::lookup(&env, "PATH").unwrap_or_default();
+    let path = launch::lookup(&env, "PATH").expect("app_env always sets PATH");
     let Some(file) = launch::resolve(&config.exec, path, is_executable) else {
         return format!("not found on PATH {path}");
     };
@@ -305,10 +303,7 @@ fn main() {
     // can still be draining this write into the UART when the next line
     // runs, and PID 1 returning from main is fatal (the kernel panics with
     // "Attempted to kill init!"), tearing down the console mid-write and
-    // truncating or dropping the marker entirely. Flush explicitly, then
-    // never return: reap/exec/shutdown land in later slices, but even this
-    // mount-only slice must hold PID 1 open, because a guest's init isn't
-    // allowed to exit at all.
+    // truncating or dropping the marker entirely. So flush explicitly.
     std::io::stdout().flush().expect("flush boot marker");
 
     let config = read_config_from_vsock();
