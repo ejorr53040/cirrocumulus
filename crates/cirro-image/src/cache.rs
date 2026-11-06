@@ -8,7 +8,7 @@
 
 use crate::run_config::{self, RunConfig};
 use crate::{Error, Flattened, err};
-use oci_client::client::{ClientConfig, ClientProtocol, linux_amd64_resolver};
+use oci_client::client::{ClientConfig, ClientProtocol};
 use oci_client::config::ConfigFile;
 use oci_client::errors::{OciDistributionError, OciErrorCode};
 use oci_client::manifest::OciManifest;
@@ -26,7 +26,6 @@ const PLATFORM: &str = "linux/amd64";
 pub struct CachedImage {
     /// The digest of the image's (single-platform) manifest.
     pub digest: String,
-    /// The ext4 rootfs.
     pub rootfs: PathBuf,
     /// What the image runs, and how, unless `cirro run` says otherwise.
     pub config: RunConfig,
@@ -184,7 +183,12 @@ impl ImageCache {
         let (manifest, digest) = match manifest {
             OciManifest::Image(manifest) => (manifest, digest),
             OciManifest::ImageIndex(index) => {
-                let Some(digest) = linux_amd64_resolver(&index.manifests) else {
+                let entry = index.manifests.iter().find(|m| {
+                    m.platform
+                        .as_ref()
+                        .is_some_and(|p| platform(&p.os, &p.architecture) == PLATFORM)
+                });
+                let Some(digest) = entry.map(|m| m.digest.clone()) else {
                     let found: Vec<String> = index
                         .manifests
                         .iter()
@@ -364,13 +368,12 @@ fn pull_error(reference: &Reference, what: &str, e: OciDistributionError) -> Err
 
 /// `<pid>-<n>`, different for every call in every process, so concurrent
 /// pulls never share a scratch dir or a half-written record.
-fn unique() -> String {
+pub(crate) fn unique() -> String {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     format!("{}-{n}", std::process::id())
 }
 
-/// `linux/amd64` and the like.
 fn platform(os: &impl std::fmt::Display, architecture: &impl std::fmt::Display) -> String {
     format!("{os}/{architecture}")
 }
@@ -406,6 +409,7 @@ struct Scratch(PathBuf);
 impl Scratch {
     fn new(cache: &Path) -> Result<Scratch, Error> {
         let path = cache.join(format!(".pull-{}", unique()));
+        // Left by an earlier process with this pid that didn't get to clean up.
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).map_err(|e| err("create the pull's scratch dir", e))?;
         Ok(Scratch(path))

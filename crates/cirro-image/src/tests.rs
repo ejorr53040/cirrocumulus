@@ -1,12 +1,9 @@
 use super::*;
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 fn tempdir() -> PathBuf {
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("cirro-image-{}-{n}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("cirro-image-{}", cache::unique()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
