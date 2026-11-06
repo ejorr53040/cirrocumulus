@@ -20,13 +20,23 @@
 //! group is (safely) denied here too -- narrower than "open as them", but
 //! it never reopens the hole this module exists to close.
 
-use nix::sys::socket::{ControlMessageOwned, MsgFlags, recvmsg};
-use nix::unistd::{Gid, Uid, setgroups, setresgid, setresuid};
-use std::io::{self, IoSliceMut};
+use nix::fcntl::{self, FcntlArg, OFlag};
+use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
+use nix::unistd::{Gid, Uid, getgid, getuid, setgroups, setresgid, setresuid};
+use std::io::{self, IoSlice, IoSliceMut};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitCode, Stdio};
+
+/// The hidden `cirro` subcommand that is the helper.
+pub const HELPER: &str = "__open-rootfs";
+/// The helper's exit status when it ran as the caller and refused the
+/// rootfs.
+const DENIED: u8 = 1;
+/// The helper's exit status when the credential drop itself went wrong.
+const FAILED: u8 = 2;
 
 /// The running process's own binary, even once its path names another file.
 const SELF_EXE: &str = "/proc/self/exe";
@@ -57,7 +67,7 @@ pub(crate) fn open_as(uid: u32, gid: u32, path: &Path) -> Result<std::fs::File, 
     // after dropping to the caller's uid.
     let mut cmd = Command::new(SELF_EXE);
     cmd.arg0("cirro")
-        .arg("__open-rootfs")
+        .arg(HELPER)
         .arg(uid.to_string())
         .arg(gid.to_string())
         .arg(path)
@@ -86,11 +96,15 @@ pub(crate) fn open_as(uid: u32, gid: u32, path: &Path) -> Result<std::fs::File, 
         .map_err(|e| Error::Failed(format!("wait for the rootfs-open helper: {e}")))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(Error::Denied(if stderr.is_empty() {
+        let why = if stderr.is_empty() {
             format!("the rootfs-open helper exited with {}", output.status)
         } else {
             stderr
-        }));
+        };
+        return Err(match output.status.code() {
+            Some(code) if code == i32::from(DENIED) => Error::Denied(why),
+            _ => Error::Failed(why),
+        });
     }
 
     let mut buf = [0u8; 1];
@@ -115,4 +129,65 @@ pub(crate) fn open_as(uid: u32, gid: u32, path: &Path) -> Result<std::fs::File, 
     // sent over `parent_sock`, so it's a valid, open fd nothing else in
     // this process has seen or owns yet.
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// The helper itself, run as `cirro __open-rootfs <uid> <gid> <path>` once
+/// `open_as`'s `pre_exec` has dropped it to `uid`/`gid`: opens `path`,
+/// refuses anything but a regular file, and sends the fd back over stdin.
+pub fn helper(uid: u32, gid: u32, path: &Path) -> ExitCode {
+    // Belt and suspenders: the Node agent's `pre_exec` should already have
+    // dropped this process to exactly `uid`/`gid` before it execed into us.
+    // If that mechanism ever silently regressed, refusing here -- instead
+    // of opening `path` as whoever we actually turned out to be -- is what
+    // catches it (#14).
+    let (actual_uid, actual_gid) = (getuid().as_raw(), getgid().as_raw());
+    if actual_uid != uid || actual_gid != gid {
+        eprintln!(
+            "refusing to open {}: running as {actual_uid}:{actual_gid}, expected {uid}:{gid}",
+            path.display()
+        );
+        return ExitCode::from(FAILED);
+    }
+
+    // O_NOFOLLOW: a final symlink component was never part of the path the
+    // caller was trusted to name. O_NONBLOCK: opening a FIFO for reading
+    // otherwise blocks until a writer connects, which would let a rootfs
+    // pointed at a named pipe hang this open before the not-a-regular-file
+    // check below ever runs (#14) -- cleared again once that check passes,
+    // since a regular file has no business being opened non-blocking.
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(OFlag::O_NOFOLLOW.bits() | OFlag::O_NONBLOCK.bits())
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("open {}: {e}", path.display());
+            return ExitCode::from(DENIED);
+        }
+    };
+    match file.metadata() {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => {
+            eprintln!("{} is not a regular file", path.display());
+            return ExitCode::from(DENIED);
+        }
+        Err(e) => {
+            eprintln!("stat {}: {e}", path.display());
+            return ExitCode::from(DENIED);
+        }
+    }
+    if let Err(e) = fcntl::fcntl(&file, FcntlArg::F_SETFL(OFlag::empty())) {
+        eprintln!("clear O_NONBLOCK on {}: {e}", path.display());
+        return ExitCode::from(FAILED);
+    }
+
+    let fds = [file.as_raw_fd()];
+    let iov = [IoSlice::new(&[0u8])];
+    let cmsg = [ControlMessage::ScmRights(&fds)];
+    if let Err(e) = sendmsg::<()>(0, &iov, &cmsg, MsgFlags::empty(), None) {
+        eprintln!("send the opened rootfs to the Node agent: {e}");
+        return ExitCode::from(FAILED);
+    }
+    ExitCode::SUCCESS
 }

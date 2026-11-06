@@ -8,7 +8,7 @@
 
 use crate::run_config::{self, RunConfig};
 use crate::{Error, Flattened, err};
-use oci_client::client::{ClientConfig, ClientProtocol, linux_amd64_resolver};
+use oci_client::client::{ClientConfig, ClientProtocol};
 use oci_client::config::ConfigFile;
 use oci_client::errors::{OciDistributionError, OciErrorCode};
 use oci_client::manifest::OciManifest;
@@ -26,7 +26,6 @@ const PLATFORM: &str = "linux/amd64";
 pub struct CachedImage {
     /// The digest of the image's (single-platform) manifest.
     pub digest: String,
-    /// The ext4 rootfs.
     pub rootfs: PathBuf,
     /// What the image runs, and how, unless `cirro run` says otherwise.
     pub config: RunConfig,
@@ -75,7 +74,6 @@ impl ImageCache {
         self.remember(&reference.whole(), &digest)
     }
 
-    /// Every image in the cache.
     pub fn list(&self) -> Result<Vec<CachedImage>, Error> {
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(entries) => entries,
@@ -89,10 +87,10 @@ impl ImageCache {
             let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
                 continue;
             };
-            if let Some(image) = stem
-                .split_once('-')
-                .and_then(|(algorithm, hex)| self.cached(&format!("{algorithm}:{hex}")))
-            {
+            let Some((algorithm, hex)) = stem.split_once('-') else {
+                continue;
+            };
+            if let Some(image) = self.cached(&format!("{algorithm}:{hex}"))? {
                 images.push(image);
             }
         }
@@ -153,7 +151,7 @@ impl ImageCache {
                 self.write_record(&image)?;
             }
         }
-        self.cached(digest)
+        self.cached(digest)?
             .ok_or_else(|| Error(format!("{digest} vanished from {}", self.dir.display())))
     }
 
@@ -184,7 +182,12 @@ impl ImageCache {
         let (manifest, digest) = match manifest {
             OciManifest::Image(manifest) => (manifest, digest),
             OciManifest::ImageIndex(index) => {
-                let Some(digest) = linux_amd64_resolver(&index.manifests) else {
+                let entry = index.manifests.iter().find(|m| {
+                    m.platform
+                        .as_ref()
+                        .is_some_and(|p| platform(&p.os, &p.architecture) == PLATFORM)
+                });
+                let Some(digest) = entry.map(|m| m.digest.clone()) else {
                     let found: Vec<String> = index
                         .manifests
                         .iter()
@@ -198,7 +201,7 @@ impl ImageCache {
                         found.join(", ")
                     )));
                 };
-                if self.cached(&digest).is_some() {
+                if self.cached(&digest)?.is_some() {
                     return Ok(digest);
                 }
                 let image = reference.clone_with_digest(digest.clone());
@@ -213,7 +216,7 @@ impl ImageCache {
                 }
             }
         };
-        if self.cached(&digest).is_some() {
+        if self.cached(&digest)?.is_some() {
             return Ok(digest);
         }
         if manifest
@@ -282,17 +285,31 @@ impl ImageCache {
 
     /// The image built from manifest `digest`, if it's in the cache. The
     /// rootfs is moved in last, so a record without one is a pull that
-    /// didn't finish and is pulled again.
-    fn cached(&self, digest: &str) -> Option<CachedImage> {
+    /// didn't finish and is pulled again. A record that can't be read is
+    /// an error, not a reason to pull again over it.
+    fn cached(&self, digest: &str) -> Result<Option<CachedImage>, Error> {
         let rootfs = self.path(digest, "ext4");
-        let record = std::fs::read(self.path(digest, "json")).ok()?;
-        let record: Record = serde_json::from_slice(&record).ok()?;
-        rootfs.is_file().then(|| CachedImage {
+        let path = self.path(digest, "json");
+        let record = match std::fs::read(&path) {
+            Ok(record) => record,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(err(&format!("read {}", path.display()), e)),
+        };
+        let record: Record = serde_json::from_slice(&record).map_err(|e| {
+            err(
+                &format!(
+                    "{} is corrupt (remove it to pull the image again)",
+                    path.display()
+                ),
+                e,
+            )
+        })?;
+        Ok(rootfs.is_file().then(|| CachedImage {
             digest: digest.to_string(),
             rootfs,
             config: record.config,
             references: record.references,
-        })
+        }))
     }
 
     fn client(&self) -> Client {
@@ -364,13 +381,12 @@ fn pull_error(reference: &Reference, what: &str, e: OciDistributionError) -> Err
 
 /// `<pid>-<n>`, different for every call in every process, so concurrent
 /// pulls never share a scratch dir or a half-written record.
-fn unique() -> String {
+pub(crate) fn unique() -> String {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
     format!("{}-{n}", std::process::id())
 }
 
-/// `linux/amd64` and the like.
 fn platform(os: &impl std::fmt::Display, architecture: &impl std::fmt::Display) -> String {
     format!("{os}/{architecture}")
 }
@@ -382,13 +398,15 @@ fn run_config(file: &ConfigFile, flat: &Flattened) -> Result<RunConfig, Error> {
         return Ok(RunConfig::default());
     };
     let text = |path| {
-        flat.read(path)
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
+        Ok::<_, Error>(
+            flat.read(path)?
+                .map(|b| String::from_utf8_lossy(&b).into_owned()),
+        )
     };
     let user = run_config::resolve_user(
         config.user.as_deref().unwrap_or(""),
-        text("/etc/passwd").as_deref(),
-        text("/etc/group").as_deref(),
+        text("/etc/passwd")?.as_deref(),
+        text("/etc/group")?.as_deref(),
     )?;
     Ok(RunConfig {
         entrypoint: config.entrypoint.clone().unwrap_or_default(),
@@ -406,6 +424,7 @@ struct Scratch(PathBuf);
 impl Scratch {
     fn new(cache: &Path) -> Result<Scratch, Error> {
         let path = cache.join(format!(".pull-{}", unique()));
+        // Left by an earlier process with this pid that didn't get to clean up.
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).map_err(|e| err("create the pull's scratch dir", e))?;
         Ok(Scratch(path))

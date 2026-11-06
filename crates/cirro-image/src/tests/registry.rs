@@ -131,7 +131,6 @@ impl Registry {
         digest
     }
 
-    /// Points `repo:tag` at the manifest or index `digest`.
     pub(super) fn tag(&self, repo: &str, tag: &str, digest: &str) {
         let mut content = self.content.lock().unwrap();
         let manifest = content.manifests[&format!("{repo}/{digest}")].clone();

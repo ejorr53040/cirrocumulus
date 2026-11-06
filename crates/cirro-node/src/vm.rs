@@ -30,6 +30,9 @@
 //! state of one that is gone or was never recorded with [`clean_up`].
 
 use crate::firecracker::{BootConfig, Client};
+pub(crate) use crate::process::ProcessId;
+use crate::subnet::Subnet;
+use cirro_guest_init::config::{CONFIG_PORT, Config as GuestConfig};
 use cirro_proto::EndReason;
 use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom};
@@ -44,7 +47,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
 /// The address every guest configures on `eth0` (ADR 0003).
-pub const GUEST_ADDRESS: Ipv4Addr = Ipv4Addr::new(172, 16, 0, 2);
+const GUEST_ADDRESS: Ipv4Addr = Ipv4Addr::new(172, 16, 0, 2);
 /// The guest's gateway: the tap's address inside the VM's namespace.
 const GUEST_GATEWAY: Ipv4Addr = Ipv4Addr::new(172, 16, 0, 1);
 /// The tap's MAC, the same in every namespace like the Guest address (ADR
@@ -61,8 +64,6 @@ const SNAPSHOT_FILES: [&str; 3] = ["vmstate", "mem", "rootfs.ext4"];
 const PARK_FILES: [&str; 3] = ["park.vmstate", "park.mem", "rootfs.ext4"];
 const WAKE_FILES: [&str; 3] = ["wake.vmstate", "wake.mem", "rootfs.ext4"];
 
-/// The fixed vsock port guest-init reads its config on (M2 protocol).
-const VSOCK_CONFIG_PORT: u32 = 52;
 /// The guest's vsock context id. Any id from 3 up works; each VM has its own
 /// vsock device, so every guest can use the same one.
 const VSOCK_GUEST_CID: u32 = 3;
@@ -79,6 +80,10 @@ const START_GRACE: Duration = Duration::from_secs(2);
 const ADOPTED_POLL: Duration = Duration::from_millis(200);
 /// Where a network namespace shows up, and where a host-side link does.
 const NETNS_DIR: &str = "/run/netns";
+/// Where Firecracker's API socket is, inside the jail's root.
+const API_SOCKET_IN_JAIL: &str = "run/firecracker.socket";
+/// What every host object a VM owns is named with, before its [`host_id`].
+pub(crate) const HOST_ID_PREFIX: &str = "cirro-";
 const NET_DEVICES_DIR: &str = "/sys/class/net";
 /// How often, and at most how many times, the cgroup of a VMM that has just
 /// been killed is checked for having emptied or become removable.
@@ -101,61 +106,66 @@ const PARENT_CGROUP: &str = "cirro";
 const VM_UID_BASE: u32 = 900_000;
 
 /// Node-wide settings every VM start needs.
-pub struct NodeConfig {
-    pub firecracker: PathBuf,
-    pub jailer: PathBuf,
-    pub kernel: PathBuf,
+pub(crate) struct NodeConfig {
+    pub(crate) firecracker: PathBuf,
+    pub(crate) jailer: PathBuf,
+    pub(crate) kernel: PathBuf,
     /// jailer's `--chroot-base-dir`. Must not be on a `nodev` mount, and must
     /// be short enough that jail socket paths fit in a `sockaddr_un`.
-    pub jail_base: PathBuf,
+    pub(crate) jail_base: PathBuf,
     /// The Node's own address in the Node subnet (`.1`).
-    pub node_address: Ipv4Addr,
+    pub(crate) node_address: Ipv4Addr,
     /// The `cirro` group's gid, so console logs can be made readable to it
     /// without being world-readable (#14).
-    pub cirro_gid: u32,
+    pub(crate) cirro_gid: u32,
 }
 
-/// What guest-init runs: its config, sent as JSON over vsock (M2 protocol).
-#[derive(Debug, serde::Serialize)]
-pub struct GuestConfig {
-    pub exec: String,
-    pub args: Vec<String>,
-    pub env: Vec<String>,
-    pub workdir: Option<String>,
-    pub user: Option<cirro_proto::User>,
+impl NodeConfig {
+    pub(crate) fn jails(&self) -> PathBuf {
+        jails(&self.jail_base, &self.firecracker)
+    }
+}
+
+/// Where jailer makes each VM's jail: under `jail_base`, in a directory
+/// named after the VMM binary it runs.
+pub(crate) fn jails(jail_base: &Path, firecracker: &Path) -> PathBuf {
+    let vmm = firecracker
+        .file_name()
+        .expect("the firecracker path names a file");
+    jail_base.join(vmm)
 }
 
 /// What to start: the VM address is allocated by the caller.
-pub struct VmSpec {
-    pub vm_address: Ipv4Addr,
+pub(crate) struct VmSpec {
+    pub(crate) vm_address: Ipv4Addr,
     /// Only used to name `rootfs_file` in error messages: the file itself
     /// is what actually gets copied, already opened as the caller (#14).
-    pub rootfs: PathBuf,
-    pub rootfs_file: std::fs::File,
-    pub mem_mib: u32,
-    pub vcpus: u8,
-    pub guest: GuestConfig,
+    pub(crate) rootfs: PathBuf,
+    pub(crate) rootfs_file: std::fs::File,
+    pub(crate) mem_mib: u32,
+    pub(crate) vcpus: u8,
+    pub(crate) guest: GuestConfig,
     /// Where the console goes. Created (or truncated) by `start` and never
     /// removed here: it outlives the VM as its Ended VM's log.
-    pub console_log: PathBuf,
+    pub(crate) console_log: PathBuf,
 }
 
 /// What a parked VM needs to wake: the VM address is allocated by the
 /// caller, and the rest must match what the VM was parked with.
-pub struct WakeSpec {
-    pub vm_address: Ipv4Addr,
-    pub mem_mib: u32,
-    pub vcpus: u8,
+pub(crate) struct WakeSpec {
+    pub(crate) vm_address: Ipv4Addr,
+    pub(crate) mem_mib: u32,
+    pub(crate) vcpus: u8,
     /// The parked VM's snapshot directory. Its files move into the jail, so
     /// a VM that wakes leaves it empty; a wake that fails puts them back.
-    pub snapshot: PathBuf,
+    pub(crate) snapshot: PathBuf,
     /// Appended to: the woken guest's console carries on from the parked one.
-    pub console_log: PathBuf,
+    pub(crate) console_log: PathBuf,
 }
 
 /// A request to [`Vm::supervise`] to stop the VM.
 #[derive(Debug)]
-pub enum Stop {
+pub(crate) enum Stop {
     /// Send Ctrl-Alt-Del (guest-init turns it into SIGTERM for the command),
     /// then kill the VMM if the VM hasn't ended within `timeout`.
     Graceful { timeout: Duration },
@@ -171,7 +181,7 @@ pub enum Stop {
 }
 
 #[derive(Debug)]
-pub struct Error(String);
+pub(crate) struct Error(String);
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -182,7 +192,7 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// A started VM, holding everything needed to tear it down.
-pub struct Vm {
+pub(crate) struct Vm {
     /// The VMM: jailer execs into Firecracker without forking, so this is
     /// Firecracker itself once spawned. Teardown kills it before unwinding
     /// `undo`, so no undo step runs under a live VMM, though some (the
@@ -195,41 +205,6 @@ pub struct Vm {
     console_log: PathBuf,
     /// The VMM's identity, known once it has started.
     process: Option<ProcessId>,
-}
-
-/// A VMM process, identified by its pid and start time together so that a
-/// pid reused by some other process is never mistaken for the VMM.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProcessId {
-    pub pid: u32,
-    /// The process's start time from `/proc/<pid>/stat`, in clock ticks
-    /// since boot.
-    pub start_time: u64,
-}
-
-impl ProcessId {
-    /// The identity of the running process `pid`.
-    pub(crate) fn of(pid: u32) -> Option<ProcessId> {
-        let (_, start_time) = proc_stat(pid)?;
-        Some(ProcessId { pid, start_time })
-    }
-
-    /// Whether this exact process is still running. A zombie has ended.
-    pub fn is_running(self) -> bool {
-        proc_stat(self.pid).is_some_and(|(state, start)| state != 'Z' && start == self.start_time)
-    }
-}
-
-/// The state and start time of a process, from `/proc/<pid>/stat`. Its
-/// fields follow the command name, which is in parentheses and may itself
-/// contain spaces and parentheses, so they are counted from the last `)`.
-fn proc_stat(pid: u32) -> Option<(char, u64)> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let mut fields = stat[stat.rfind(')')? + 1..].split_whitespace();
-    let state = fields.next()?.chars().next()?;
-    // `state` is field 3 and the start time field 22.
-    let start_time = fields.nth(18)?.parse().ok()?;
-    Some((state, start_time))
 }
 
 /// How the agent holds a VM's VMM.
@@ -296,9 +271,9 @@ impl Vmm {
 
 /// The name of every host object belonging to the VM at `vm_address`, e.g.
 /// `cirro-fa02` for `10.77.250.2`. Fits in `IFNAMSIZ`.
-pub fn host_id(vm_address: Ipv4Addr) -> String {
+pub(crate) fn host_id(vm_address: Ipv4Addr) -> String {
     let [_, _, c, d] = vm_address.octets();
-    format!("cirro-{c:02x}{d:02x}")
+    format!("{HOST_ID_PREFIX}{c:02x}{d:02x}")
 }
 
 /// Turns on the io controller for VMs' cgroups, so each has an `io.stat`
@@ -315,12 +290,7 @@ fn enable_io_accounting() {
 
 /// The cgroup jailer creates every VM's own cgroup under. jailer creates
 /// it on first use; the Node agent removes it once it's empty.
-/// Where a Node keeps its VMs' jails ([`NodeConfig::jail_base`]).
-pub fn jail_base(state_dir: &Path) -> PathBuf {
-    state_dir.join("jail")
-}
-
-pub fn parent_cgroup() -> PathBuf {
+pub(crate) fn parent_cgroup() -> PathBuf {
     parent_cgroup_under(Path::new("/"))
 }
 
@@ -334,7 +304,7 @@ impl Vm {
     /// its config and the VM has stayed up for a 2 s grace period. On failure,
     /// everything done so far is undone first, and the error says why the
     /// VM didn't start, with the tail of its console when there is one.
-    pub async fn start(node: &NodeConfig, spec: &VmSpec) -> Result<Vm, Error> {
+    pub(crate) async fn start(node: &NodeConfig, spec: &VmSpec) -> Result<Vm, Error> {
         let mut vm = Vm::empty(spec.console_log.clone());
         match vm.start_steps(node, spec).await {
             Ok(()) => Ok(vm),
@@ -348,7 +318,7 @@ impl Vm {
     /// Brings up a new VM from a parked VM's snapshot, returning once it
     /// runs. On failure, everything done so far is undone and the snapshot
     /// is put back, so the wake can be tried again.
-    pub async fn wake(node: &NodeConfig, spec: &WakeSpec) -> Result<Vm, Error> {
+    pub(crate) async fn wake(node: &NodeConfig, spec: &WakeSpec) -> Result<Vm, Error> {
         let mut vm = Vm::empty(spec.console_log.clone());
         match vm.wake_steps(node, spec).await {
             Ok(()) => Ok(vm),
@@ -377,21 +347,21 @@ impl Vm {
 
     /// Takes back a VM an earlier agent started, which is still running as
     /// `process`. Everything else it needs is named from its VM address.
-    pub fn adopt(
+    pub(crate) fn adopt(
         node: &NodeConfig,
         vm_address: Ipv4Addr,
         process: ProcessId,
         console_log: PathBuf,
     ) -> Vm {
         let id = host_id(vm_address);
-        let jail_root = jail_dir(node, &id).join("root");
+        let jail_root = jail_dir(&node.jails(), &id).join("root");
         Vm {
             vmm: Some(Vmm::Adopted {
                 process,
                 cgroup: parent_cgroup().join(&id),
             }),
-            undo: undo_steps(node, &id),
-            api_socket: jail_root.join("run/firecracker.socket"),
+            undo: undo_steps(&node.jails(), &id),
+            api_socket: jail_root.join(API_SOCKET_IN_JAIL),
             jail_root,
             console_log,
             process: Some(process),
@@ -400,7 +370,7 @@ impl Vm {
 
     /// Lets the guest's vCPUs run again, for a VM taken back with `adopt`: an
     /// agent that died part-way through a park can leave its VM paused.
-    pub async fn resume(&self) -> Result<(), Error> {
+    pub(crate) async fn resume(&self) -> Result<(), Error> {
         Client::new(&self.api_socket)
             .resume()
             .await
@@ -409,19 +379,19 @@ impl Vm {
 
     /// The VMM's identity, for recording it: after `start` succeeds, or on a
     /// VM taken back with `adopt`.
-    pub fn process(&self) -> ProcessId {
+    pub(crate) fn process(&self) -> ProcessId {
         self.process.expect("a started VM has a VMM process")
     }
 
     /// Kills a VM that started but can't be kept, and removes its host state.
-    pub async fn destroy(mut self) {
+    pub(crate) async fn destroy(mut self) {
         self.teardown().await;
     }
 
     /// Owns the VM until it ends, then removes all of its host state and
     /// says why it ended: on its own (exited or crashed), or because of a
     /// [`Stop`] from `stops`. A closed `stops` counts as [`Stop::Force`].
-    pub async fn supervise(mut self, mut stops: mpsc::Receiver<Stop>) -> EndReason {
+    pub(crate) async fn supervise(mut self, mut stops: mpsc::Receiver<Stop>) -> EndReason {
         let reason = self.run_until_ended(&mut stops).await;
         self.teardown().await;
         reason
@@ -591,19 +561,20 @@ impl Vm {
         let node_addr = node.node_address.to_string();
         let uid_s = uid.to_string();
 
+        // Every undo step counts an object that's already gone as undone, so
+        // all of them are registered before the first step runs.
+        self.undo = undo_steps(&node.jails(), &id);
+
         // 1. The VM's network namespace.
         ip(&["netns", "add", &id]).await?;
-        self.undo.push(Undo::netns(&id));
 
         // 2. jailer, in the namespace and under the VM's cgroup limits. It
         //    needs only the namespace to exist: Firecracker opens the tap at
         //    boot or snapshot load, not at start, so it starts now and the
         //    links below are set up while it does.
         enable_io_accounting();
-        let root = jail_dir(node, &id).join("root");
+        let root = jail_dir(&node.jails(), &id).join("root");
         self.jail_root = root.clone();
-        self.undo.push(Undo::jail_dir(node, &id));
-        self.undo.push(Undo::cgroup(&id));
         std::fs::create_dir_all(&node.jail_base).map_err(|e| err("create jail base dir", e))?;
         // 0640 from the moment it exists (never briefly at the create-call's
         // default mode) and root:cirro: console logs hold whatever the VM's
@@ -630,7 +601,7 @@ impl Vm {
             .arg("--chroot-base-dir")
             .arg(&node.jail_base)
             .arg("--netns")
-            .arg(Path::new("/run/netns").join(&id))
+            .arg(Path::new(NETNS_DIR).join(&id))
             .args(["--cgroup-version", "2", "--parent-cgroup", PARENT_CGROUP])
             .arg("--cgroup")
             .arg(format!("memory.max={memory_max}"))
@@ -649,22 +620,18 @@ impl Vm {
         // jailer execs into Firecracker without forking, so the pid and its
         // start time are Firecracker's from here on.
         self.process = child.id().and_then(ProcessId::of);
+        self.vmm = Some(Vmm::Child(child));
         if self.process.is_none() {
-            self.vmm = Some(Vmm::Child(child));
             return Err(Error(
                 "jailer exited before its process could be identified".into(),
             ));
         }
-        self.vmm = Some(Vmm::Child(child));
 
         // 3. The tap inside the namespace, a veth pair to the Node, 1:1 NAT
         //    between the Guest address and the VM address inside the
         //    namespace, and the Node's route to the VM address (deleting the
         //    veth removes it). One `ip -batch` on each side of the veth,
         //    since every `ip` run costs a fork and exec on the wake path.
-        // The veth's undo goes first: a batch that fails after `link add`
-        // leaves it, and deleting a link that isn't there is a no-op.
-        self.undo.push(Undo::link(&id));
         ip_batch(
             None,
             &[
@@ -694,7 +661,7 @@ impl Vm {
         nft_in(&id, &namespace_ruleset(vm_address)).await?;
 
         // 4. Firecracker's API socket.
-        let api_socket = root.join("run/firecracker.socket");
+        let api_socket = root.join(API_SOCKET_IN_JAIL);
         self.api_socket = api_socket.clone();
         let deadline = Instant::now() + API_SOCKET_TIMEOUT;
         while !api_socket.exists() {
@@ -966,22 +933,6 @@ enum Undo {
 }
 
 impl Undo {
-    fn netns(id: &str) -> Undo {
-        Undo::DeleteNetns(id.to_string())
-    }
-
-    fn link(id: &str) -> Undo {
-        Undo::DeleteLink(id.to_string())
-    }
-
-    fn jail_dir(node: &NodeConfig, id: &str) -> Undo {
-        Undo::RemoveDir(jail_dir(node, id))
-    }
-
-    fn cgroup(id: &str) -> Undo {
-        Undo::RemoveCgroup(parent_cgroup().join(id))
-    }
-
     /// Undoes the step, and counts a step whose object is already gone as
     /// undone: a later agent doesn't know how far an earlier one got.
     async fn run(self) -> Result<(), Error> {
@@ -1009,29 +960,27 @@ impl Undo {
     }
 }
 
-/// The jail directory of the VM named `id`.
-fn jail_dir(node: &NodeConfig, id: &str) -> PathBuf {
-    node.jail_base.join("firecracker").join(id)
+fn jail_dir(jails: &Path, id: &str) -> PathBuf {
+    jails.join(id)
 }
 
-/// Every step that undoes a fully started VM, in the order they run.
-fn undo_steps(node: &NodeConfig, id: &str) -> Vec<Undo> {
-    // Popped from the end, so the reverse of the order start pushes them.
+/// Every step that undoes a VM's host state, popped from the end.
+fn undo_steps(jails: &Path, id: &str) -> Vec<Undo> {
     vec![
-        Undo::netns(id),
-        Undo::jail_dir(node, id),
-        Undo::cgroup(id),
-        Undo::link(id),
+        Undo::DeleteNetns(id.to_string()),
+        Undo::RemoveDir(jail_dir(jails, id)),
+        Undo::RemoveCgroup(parent_cgroup().join(id)),
+        Undo::DeleteLink(id.to_string()),
     ]
 }
 
 /// Removes everything the VM at `vm_address` may have left on the Node, for
 /// a VM that is gone or was never recorded: kills whatever still runs in its
 /// cgroup, then removes its veth, cgroup, jail directory and namespace.
-pub async fn clean_up(node: &NodeConfig, vm_address: Ipv4Addr) {
+pub(crate) async fn clean_up(jails: &Path, vm_address: Ipv4Addr) {
     let id = host_id(vm_address);
     kill_cgroup(&parent_cgroup().join(&id)).await;
-    let mut steps = undo_steps(node, &id);
+    let mut steps = undo_steps(jails, &id);
     while let Some(step) = steps.pop() {
         if let Err(e) = step.run().await {
             tracing::warn!(id, "clean up: {e}");
@@ -1054,10 +1003,10 @@ async fn kill_cgroup(cgroup: &Path) {
     }
 }
 
-/// The low 16 bits of the VM address of every VM that has host state on
-/// this Node, in any form: a namespace, a veth, a jail directory or a
-/// cgroup. See [`host_id`] for the naming.
-pub fn host_state_owners(node: &NodeConfig) -> BTreeSet<u16> {
+/// The VM address in `subnet` of every VM that has host state on this
+/// Node, in any form: a namespace, a veth, a jail directory or a cgroup.
+/// See [`host_id`] for the naming.
+pub(crate) fn host_state_in(jails: &Path, subnet: &Subnet) -> BTreeSet<Ipv4Addr> {
     let names_in = |dir: PathBuf| -> Vec<String> {
         std::fs::read_dir(dir)
             .into_iter()
@@ -1068,18 +1017,18 @@ pub fn host_state_owners(node: &NodeConfig) -> BTreeSet<u16> {
     [
         names_in(PathBuf::from(NETNS_DIR)),
         names_in(PathBuf::from(NET_DEVICES_DIR)),
-        names_in(node.jail_base.join("firecracker")),
+        names_in(jails.to_path_buf()),
         names_in(parent_cgroup()),
     ]
     .into_iter()
     .flatten()
-    .filter_map(|name| parse_host_id(&name))
+    .filter_map(|name| subnet.vm_address_with_low16(parse_host_id(&name)?))
     .collect()
 }
 
 /// The inverse of [`host_id`]: the low 16 bits of the VM address.
 pub(crate) fn parse_host_id(name: &str) -> Option<u16> {
-    let hex = name.strip_prefix("cirro-")?;
+    let hex = name.strip_prefix(HOST_ID_PREFIX)?;
     if hex.len() != 4 {
         return None;
     }
@@ -1118,7 +1067,7 @@ async fn try_deliver_config(vsock: &Path, config: &str) -> Result<(), String> {
     let mut stream = BufReader::new(stream);
     stream
         .get_mut()
-        .write_all(format!("CONNECT {VSOCK_CONFIG_PORT}\n").as_bytes())
+        .write_all(format!("CONNECT {CONFIG_PORT}\n").as_bytes())
         .await
         .map_err(|e| e.to_string())?;
     let mut ack = String::new();

@@ -3,16 +3,18 @@
 //! `cirro node install`/`uninstall`.
 
 pub mod agent;
-pub mod egress;
+mod cmd;
+mod egress;
 pub mod firecracker;
 pub mod install;
-pub mod jailer;
-pub mod metrics;
+mod layout;
+mod metrics;
+mod process;
 pub mod release;
 pub mod rootfs_open;
 mod state;
 pub mod subnet;
-pub mod vm;
+mod vm;
 
 /// A fresh, empty temp dir per test, named `<prefix>-<pid>-<n>` so parallel
 /// threads and parallel test binaries never collide.

@@ -377,6 +377,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "cirro-edge",
+ "cirro-guest-init",
  "cirro-proto",
  "http-body-util",
  "hyper",

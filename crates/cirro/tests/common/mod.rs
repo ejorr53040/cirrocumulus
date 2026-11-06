@@ -9,6 +9,22 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::OnceLock;
 
+/// The lowest third octet of a `node_agent` agent's Node subnet; installs
+/// take the octets below it. A VM's host objects are named from its
+/// address's low 16 bits, so the two files must never share an octet.
+pub(crate) const AGENT_OCTETS_FROM: u8 = 180;
+
+/// The port test Node `n` serves its HTTP edge on, on 127.0.0.1: one per
+/// Node, so tests running at once don't share an edge.
+pub(crate) fn edge_port(n: u16) -> u16 {
+    18000 + n
+}
+
+/// Like [`edge_port`], for the HTTPS edge.
+pub(crate) fn tls_edge_port(n: u16) -> u16 {
+    19000 + n
+}
+
 pub(crate) fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -95,36 +111,24 @@ pub(crate) fn rootfs() -> &'static Rootfs {
         for sub in ["proc", "sys", "dev", "app"] {
             std::fs::create_dir_all(tree.join(sub)).expect("create rootfs tree");
         }
-        for fixture in [
-            "http_app",
-            "ignore_term",
-            "exit_later",
-            "probe",
-            "whoami",
-            "spin",
-            "counter",
-            "dialer",
-            "chatter",
-            "udp",
-        ] {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        for source in std::fs::read_dir(&fixtures).expect("list the fixtures") {
+            let source = source.expect("list the fixtures").path();
+            let fixture = source.file_stem().expect("a fixture file name");
             let status = std::process::Command::new("rustc")
                 .args(["--target", "x86_64-unknown-linux-musl", "-O", "-o"])
                 .arg(tree.join("app").join(fixture))
-                .arg(
-                    Path::new(env!("CARGO_MANIFEST_DIR"))
-                        .join(format!("tests/fixtures/{fixture}.rs")),
-                )
+                .arg(&source)
                 .status()
                 .expect("run rustc");
-            assert!(status.success(), "building the {fixture} fixture failed");
+            assert!(status.success(), "building the {fixture:?} fixture failed");
         }
         let no_init = make_image(&tree, &dir.join("no-init.ext4"));
         std::fs::copy(tree.join("app/ignore_term"), tree.join("init"))
             .expect("copy ignore_term in as /init");
         let wrong_init = make_image(&tree, &dir.join("wrong-init.ext4"));
-        let guest_init_bin = repo_root()
-            .join("target/guest-init-embed/x86_64-unknown-linux-musl/release/guest-init");
-        std::fs::copy(&guest_init_bin, tree.join("init")).expect("copy guest-init into tree");
+        let guest_init_bin = Path::new(env!("CIRRO_GUEST_INIT"));
+        std::fs::copy(guest_init_bin, tree.join("init")).expect("copy guest-init into tree");
         let guest_init = make_image(&tree, &dir.join("guest-init.ext4"));
         Rootfs {
             guest_init,

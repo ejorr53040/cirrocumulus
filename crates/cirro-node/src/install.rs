@@ -11,7 +11,9 @@
 //! same arguments, every step below finds its target already in the state
 //! it would have created and does nothing.
 
+use crate::cmd;
 use crate::egress;
+use crate::layout;
 use crate::release::{self, ReleaseBinaries};
 use crate::state::{Record, Store};
 use crate::subnet::Subnet;
@@ -22,9 +24,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const IP_FORWARD_RECORD: &str = "ip_forward.before";
-const NODE_CONFIG_FILE: &str = "node.json";
-const RELEASE_SUBDIR: &str = "release";
+/// Where a Node keeps its state unless told otherwise.
+pub const DEFAULT_STATE_DIR: &str = "/var/lib/cirro";
+/// The group allowed to use the agent socket unless told otherwise.
+pub const DEFAULT_GROUP: &str = "cirro";
+/// The Node subnet unless told otherwise.
+pub const DEFAULT_SUBNET: &str = "10.77.0.0/24";
 
 /// What `cirro node install` was given.
 pub struct InstallConfig {
@@ -69,9 +74,9 @@ impl EdgeConfig {
     }
 }
 
-/// Everything install resolved, persisted so uninstall (and a future
-/// `cirro node agent` launched by the systemd unit) can find it again
-/// without being told the same arguments twice.
+/// Everything install resolved, persisted so uninstall can find it again
+/// without being told the same arguments twice. The agent the systemd unit
+/// launches doesn't read it: it gets its arguments on the unit's command line.
 #[derive(Serialize, Deserialize)]
 struct NodeConfig {
     socket: PathBuf,
@@ -91,7 +96,7 @@ struct NodeConfig {
 /// crate already shells out to `ip`/`nft` elsewhere). Runs first and
 /// changes nothing, so a Node that fails here is exactly as it was before
 /// `install` was called.
-pub fn check_prereqs() -> io::Result<()> {
+fn check_prereqs() -> io::Result<()> {
     let kvm = Path::new("/dev/kvm");
     if !(kvm.exists() && is_rw(kvm)) {
         return Err(io::Error::other(
@@ -145,7 +150,7 @@ pub fn install(cfg: &InstallConfig) -> io::Result<()> {
     let release = match &cfg.release_override {
         Some(r) => r.clone(),
         None => {
-            let release_dir = cfg.state_dir.join(RELEASE_SUBDIR);
+            let release_dir = layout::release(&cfg.state_dir);
             fs::create_dir_all(&release_dir)?;
             release::fetch(&release_dir)?
         }
@@ -196,7 +201,7 @@ pub async fn uninstall(state_dir: &Path, force: bool) -> io::Result<()> {
     let _ = remove_group(&node_config.group);
     remove_from_host_firewall(&node_config.subnet);
     let _ = egress::remove_node_policy();
-    egress::restore_ip_forward(&state_dir.join(IP_FORWARD_RECORD))?;
+    egress::restore_ip_forward(&layout::ip_forward_record(state_dir))?;
 
     fs::remove_dir_all(state_dir)?;
     Ok(())
@@ -204,32 +209,21 @@ pub async fn uninstall(state_dir: &Path, force: bool) -> io::Result<()> {
 
 /// The records of every VM in `state_dir`, none before the agent first ran.
 fn records(state_dir: &Path, subnet: &str) -> io::Result<Vec<Record>> {
-    let db = state_dir.join("state.db");
+    let db = layout::state_db(state_dir);
     if !db.exists() {
         return Ok(Vec::new());
     }
     Store::open(&db, subnet)?.load()
 }
 
-/// Kills every VM the Node has a record of and removes its host state, as
-/// the agent does for a VM that is gone. Ended VMs too: one whose VMM died
-/// can still have its namespace, veth or cgroup until the agent next
-/// starts, and after uninstall it never will.
+/// Kills every VM in the Node subnet and removes its host state, recorded
+/// or not, as the agent's own sweep does for VMs that are gone: after
+/// uninstall, no agent ever will.
 async fn clean_up_vms(state_dir: &Path, config: &NodeConfig) -> io::Result<()> {
     let subnet: Subnet = config.subnet.parse().map_err(io::Error::other)?;
-    let node = vm::NodeConfig {
-        firecracker: config.release.firecracker.clone(),
-        jailer: config.release.jailer.clone(),
-        kernel: config.release.kernel.clone(),
-        jail_base: vm::jail_base(state_dir),
-        node_address: subnet.node_address(),
-        // Only used to hand a new VM's console log to the group.
-        cirro_gid: 0,
-    };
-    for record in records(state_dir, &config.subnet)? {
-        if let Some(vm_address) = record.info.vm_address {
-            vm::clean_up(&node, vm_address).await;
-        }
+    let jails = vm::jails(&layout::jail_base(state_dir), &config.release.firecracker);
+    for vm_address in vm::host_state_in(&jails, &subnet) {
+        vm::clean_up(&jails, vm_address).await;
     }
     Ok(())
 }
@@ -252,22 +246,20 @@ fn refuse_if_vms_running(state_dir: &Path, subnet: &str) -> io::Result<()> {
     }
 }
 
-/// `ensure_group`/`remove_group` are mirror images of each other: check
-/// whether `name` already matches the wanted existence state, and if not,
-/// run the command that would fix it.
 fn set_group_existence(name: &str, want_exists: bool, verb: &str) -> io::Result<()> {
     if nix::unistd::Group::from_name(name)?.is_some() == want_exists {
         return Ok(());
     }
-    run(Command::new(verb).arg(name))
+    cmd::run(Command::new(verb).arg(name), None).map(drop)
 }
 
 fn ensure_group(name: &str) -> io::Result<()> {
     set_group_existence(name, true, "groupadd")
 }
 
-/// Best-effort: a group that's already gone (or never created, e.g. an
-/// install that only ever used a numeric gid) isn't a failure to undo.
+/// Deletes the group with `groupdel`. A group that's already gone (or never
+/// created, e.g. an install that only ever used a numeric gid) is `Ok`;
+/// only a failing `groupdel` is an error.
 fn remove_group(name: &str) -> io::Result<()> {
     set_group_existence(name, false, "groupdel")
 }
@@ -284,7 +276,7 @@ const UFW_COMMENT: &str = "cirro Node VMs";
 /// firewall that is there refuses the rule.
 fn allow_through_host_firewall(subnet: &str) -> io::Result<()> {
     for mut command in host_firewall_commands(subnet, true) {
-        run(&mut command)?;
+        cmd::run(&mut command, None)?;
     }
     Ok(())
 }
@@ -293,7 +285,7 @@ fn allow_through_host_firewall(subnet: &str) -> io::Result<()> {
 /// of uninstall: a rule that's already gone isn't a failure.
 fn remove_from_host_firewall(subnet: &str) {
     for mut command in host_firewall_commands(subnet, false) {
-        let _ = run(&mut command);
+        let _ = cmd::run(&mut command, None);
     }
 }
 
@@ -331,17 +323,17 @@ fn host_firewall_commands(subnet: &str, allow: bool) -> Vec<Command> {
 }
 
 /// `ufw route [delete] allow ...` for the Node subnet.
-fn ufw_route_rule(subnet: &str, allow: bool) -> Vec<&str> {
+fn ufw_route_rule(subnet: &str, allow: bool) -> Vec<String> {
     let mut args = vec!["route"];
     if !allow {
         args.push("delete");
     }
-    args.extend(["allow", "in", "on", "cirro-+", "from", subnet]);
+    let vm_veths = format!("{}+", vm::HOST_ID_PREFIX);
+    args.extend(["allow", "in", "on", &vm_veths, "from", subnet]);
     args.extend(["comment", UFW_COMMENT]);
-    args
+    args.into_iter().map(String::from).collect()
 }
 
-/// Whether `program arg` runs and exits 0.
 fn succeeds(program: &str, arg: &str) -> bool {
     Command::new(program)
         .arg(arg)
@@ -351,11 +343,11 @@ fn succeeds(program: &str, arg: &str) -> bool {
 
 fn write_node_config(state_dir: &Path, config: &NodeConfig) -> io::Result<()> {
     let json = serde_json::to_string_pretty(config).map_err(io::Error::other)?;
-    fs::write(state_dir.join(NODE_CONFIG_FILE), json)
+    fs::write(layout::node_config(state_dir), json)
 }
 
 fn read_node_config(state_dir: &Path) -> io::Result<NodeConfig> {
-    let json = fs::read_to_string(state_dir.join(NODE_CONFIG_FILE))?;
+    let json = fs::read_to_string(layout::node_config(state_dir))?;
     serde_json::from_str(&json).map_err(io::Error::other)
 }
 
@@ -392,10 +384,14 @@ fn install_unit(config: &NodeConfig, state_dir: &Path) -> io::Result<()> {
     );
     let unit_path = unit_path(&config.unit_name);
     fs::write(&unit_path, unit)?;
-    run(Command::new("systemctl").arg("daemon-reload"))?;
-    run(Command::new("systemctl")
-        .args(["enable", "--now"])
-        .arg(format!("{}.service", config.unit_name)))
+    cmd::run(Command::new("systemctl").arg("daemon-reload"), None)?;
+    cmd::run(
+        Command::new("systemctl")
+            .args(["enable", "--now"])
+            .arg(format!("{}.service", config.unit_name)),
+        None,
+    )
+    .map(drop)
 }
 
 /// Stops, disables and removes the unit. Missing/not-enabled is fine --
@@ -410,39 +406,28 @@ fn remove_unit(unit_name: &str) -> io::Result<()> {
     if path.exists() {
         fs::remove_file(&path)?;
     }
-    run(Command::new("systemctl").arg("daemon-reload"))
+    cmd::run(Command::new("systemctl").arg("daemon-reload"), None).map(drop)
 }
 
 fn unit_path(unit_name: &str) -> PathBuf {
     PathBuf::from("/etc/systemd/system").join(format!("{unit_name}.service"))
 }
 
-fn run(command: &mut Command) -> io::Result<()> {
-    release::run_capturing(command).map(drop)
-}
-
 #[cfg(test)]
 mod tests {
+    //! Needs no root at all: a real SQLite state dir and the test's own
+    //! process (a real, genuinely running pid) standing in for a VM's
+    //! VMM, so [`ProcessId::is_running`] sees the truth without mocking
+    //! it. Exercises the refusal decision `uninstall` makes, independent
+    //! of the group/systemd-unit mutation the full CLI path needs root
+    //! for (covered instead by `crates/cirro/tests/node_install.rs`).
+
     use super::*;
-    use crate::vm::ProcessId;
+    use crate::process::ProcessId;
     use cirro_proto::{EndReason, Ended, VmInfo};
 
-    /// Needs no root at all: a real SQLite state dir and the test's own
-    /// process (a real, genuinely running pid) standing in for a VM's
-    /// VMM, so [`ProcessId::is_running`] sees the truth without mocking
-    /// it. Exercises the refusal decision `uninstall` makes, independent
-    /// of the group/systemd-unit mutation the full CLI path needs root
-    /// for (covered instead by `crates/cirro/tests/node_install.rs`).
     fn tempdir() -> PathBuf {
         crate::test_util::tempdir("cirro-install-test")
-    }
-
-    #[test]
-    fn ufw_rule_routes_the_subnet_in_from_vm_veths_to_anywhere() {
-        assert_eq!(
-            ufw_route_rule("10.77.0.0/24", true).join(" "),
-            "route allow in on cirro-+ from 10.77.0.0/24 comment cirro Node VMs"
-        );
     }
 
     #[test]

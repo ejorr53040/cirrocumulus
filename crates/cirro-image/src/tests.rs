@@ -1,12 +1,9 @@
 use super::*;
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 fn tempdir() -> PathBuf {
-    static NEXT: AtomicU32 = AtomicU32::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("cirro-image-{}-{n}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("cirro-image-{}", cache::unique()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -82,7 +79,7 @@ fn flatten(layers: &[Layer]) -> Result<Flattened, Error> {
 }
 
 fn paths(flat: &Flattened) -> Vec<&str> {
-    flat.tree.keys().map(String::as_str).collect()
+    flat.paths().collect()
 }
 
 #[test]
@@ -93,7 +90,7 @@ fn a_later_layer_replaces_a_file() {
     ])
     .unwrap();
 
-    assert_eq!(flat.read("/etc/motd").unwrap(), b"new");
+    assert_eq!(flat.read("/etc/motd").unwrap().unwrap(), b"new");
 }
 
 #[test]
@@ -105,7 +102,7 @@ fn leading_dot_slash_and_slash_are_the_same_path() {
     .unwrap();
 
     assert_eq!(paths(&flat), ["a"]);
-    assert_eq!(flat.read("a").unwrap(), b"2");
+    assert_eq!(flat.read("a").unwrap().unwrap(), b"2");
 }
 
 #[test]
@@ -127,7 +124,7 @@ fn a_whiteout_removes_a_file_or_a_whole_directory() {
 fn a_whiteout_hides_only_lower_layers() {
     let flat = flatten(&[Layer::default().file("x", "same layer").file(".wh.x", "")]).unwrap();
 
-    assert_eq!(flat.read("x").unwrap(), b"same layer");
+    assert_eq!(flat.read("x").unwrap().unwrap(), b"same layer");
 }
 
 #[test]
@@ -156,7 +153,7 @@ fn a_file_over_a_directory_removes_what_was_in_it() {
     .unwrap();
 
     assert_eq!(paths(&flat), ["d"]);
-    assert_eq!(flat.read("d").unwrap(), b"now a file");
+    assert_eq!(flat.read("d").unwrap().unwrap(), b"now a file");
 }
 
 #[test]
@@ -221,9 +218,18 @@ fn debugfs(image: &Path, request: &str) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+fn have_mke2fs() -> bool {
+    match check_mke2fs() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("skipping: {e}");
+            false
+        }
+    }
+}
+
 fn build(layers: &[Layer]) -> Option<PathBuf> {
-    if let Err(e) = check_mke2fs() {
-        eprintln!("skipping: {e}");
+    if !have_mke2fs() {
         return None;
     }
     let flat = flatten(layers).unwrap();
@@ -285,7 +291,7 @@ fn every_guest_gets_init_mountpoints_and_dns() {
 
 #[test]
 fn a_hardlink_to_a_whited_out_file_fails_the_build() {
-    if check_mke2fs().is_err() {
+    if !have_mke2fs() {
         return;
     }
     let flat = flatten(&[

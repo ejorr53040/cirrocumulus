@@ -1,11 +1,10 @@
 mod client;
-mod open_rootfs;
 
 use cirro_image::ImageCache;
 use cirro_image::run_config::merge_env;
-use cirro_node::agent;
 use cirro_node::release::ReleaseBinaries;
 use cirro_node::subnet::Subnet;
+use cirro_node::{agent, install};
 use cirro_proto::{
     AddMachine, LOG_CHUNK, MachineAppInfo, MachineAppRequest, MachineHostKey, MachineInfo,
     MachineScan, Route, RunRequest, Stats, StopRequest, User, VM_STATE_HEADER, VmInfo,
@@ -77,7 +76,7 @@ enum Command {
         #[arg(long)]
         force: bool,
         /// Seconds to wait for the VM to end before killing it
-        #[arg(long, default_value_t = 10, conflicts_with = "force")]
+        #[arg(long, default_value_t = cirro_proto::DEFAULT_STOP_TIMEOUT_SECS, conflicts_with = "force")]
         timeout: u64,
         name: String,
     },
@@ -101,7 +100,7 @@ enum Command {
     /// Internal: opens a rootfs path as the given uid/gid and sends the fd
     /// back over stdin with SCM_RIGHTS (the Node agent's rootfs
     /// credential drop, issue #14). Not for direct use.
-    #[command(name = "__open-rootfs", hide = true)]
+    #[command(name = cirro_node::rootfs_open::HELPER, hide = true)]
     OpenRootfs { uid: u32, gid: u32, path: PathBuf },
 }
 
@@ -182,13 +181,13 @@ enum NodeCommand {
     /// Fetch and verify firecracker and jailer, check KVM and cgroup v2
     Install {
         /// Where the agent keeps jails, console logs and its own config
-        #[arg(long, default_value = "/var/lib/cirro")]
+        #[arg(long, default_value = install::DEFAULT_STATE_DIR)]
         state_dir: PathBuf,
         /// The group created (if missing) and used for the agent socket
-        #[arg(long, default_value = "cirro")]
+        #[arg(long, default_value = install::DEFAULT_GROUP)]
         group: String,
         /// The Node subnet VM addresses come from
-        #[arg(long, default_value = "10.77.0.0/24")]
+        #[arg(long, default_value = install::DEFAULT_SUBNET)]
         subnet: Subnet,
         /// The systemd unit's name, without `.service`
         #[arg(long, default_value = "cirro")]
@@ -216,7 +215,7 @@ enum NodeCommand {
     /// Reverse `install`: refuses while a VM is running unless `--force`
     Uninstall {
         /// The state dir `install` was given
-        #[arg(long, default_value = "/var/lib/cirro")]
+        #[arg(long, default_value = install::DEFAULT_STATE_DIR)]
         state_dir: PathBuf,
         /// Uninstall even if VMs are still running, killing them
         #[arg(long)]
@@ -233,10 +232,10 @@ enum NodeCommand {
         #[arg(long)]
         state_dir: PathBuf,
         /// The group allowed to use the socket: a name or a numeric gid
-        #[arg(long, default_value = "cirro")]
+        #[arg(long, default_value = install::DEFAULT_GROUP)]
         socket_group: String,
         /// The Node subnet VM addresses come from
-        #[arg(long, default_value = "10.77.0.0/24")]
+        #[arg(long, default_value = install::DEFAULT_SUBNET)]
         subnet: Subnet,
         #[arg(long)]
         firecracker: PathBuf,
@@ -338,7 +337,7 @@ fn main() -> ExitCode {
     // it neither needs nor should share it with the process it was spawned
     // to serve.
     if let Command::OpenRootfs { uid, gid, path } = &cli.command {
-        return open_rootfs::run(*uid, *gid, path);
+        return cirro_node::rootfs_open::helper(*uid, *gid, path);
     }
     let runtime = tokio::runtime::Runtime::new().expect("start the tokio runtime");
     let result = runtime.block_on(async {
@@ -404,15 +403,15 @@ fn main() -> ExitCode {
                 https,
                 acme_email,
             }) => cirro_image::check_mke2fs()
-                .map_err(|e| io::Error::other(e.0))
+                .map_err(|e| io::Error::other(e.to_string()))
                 .and_then(|()| {
-                    cirro_node::install::install(&cirro_node::install::InstallConfig {
+                    install::install(&install::InstallConfig {
                         state_dir,
                         socket: cli.socket,
                         group,
                         subnet,
                         unit_name,
-                        edge: cirro_node::install::EdgeConfig {
+                        edge: install::EdgeConfig {
                             http,
                             https,
                             acme_email,
@@ -434,7 +433,7 @@ fn main() -> ExitCode {
                 .map_err(|e| format!("node install: {e}")),
             Command::Node(NodeCommand::Ca) => node_ca(&cli.socket).await,
             Command::Node(NodeCommand::Uninstall { state_dir, force }) => {
-                cirro_node::install::uninstall(&state_dir, force)
+                install::uninstall(&state_dir, force)
                     .await
                     .map_err(|e| format!("node uninstall: {e}"))
             }
@@ -511,9 +510,7 @@ async fn run(socket: &Path, args: RunArgs) -> Result<(), String> {
         route,
     )
     .await?;
-    let vm: VmInfo = client::call(socket, Method::POST, "/vms", Some(&request))
-        .await?
-        .ok_or("the Node agent returned no VM")?;
+    let vm: VmInfo = client::call(socket, Method::POST, "/vms", Some(&request)).await?;
     let address = vm
         .vm_address
         .ok_or("the Node agent returned no VM address")?;
@@ -714,7 +711,7 @@ async fn image_command(command: ImageCommand) -> Result<(), String> {
             println!("{:<40} {:<19} {:>5}", "REFERENCE", "DIGEST", "SIZE");
             for image in cache.list().map_err(|e| e.to_string())? {
                 let size = std::fs::metadata(&image.rootfs).map_or(0, |m| m.len());
-                let size = format_mem(u32::try_from(size >> 20).unwrap_or(u32::MAX));
+                let size = cirro_tui::bytes(size);
                 let digest: String = image.digest.chars().take("sha256:".len() + 12).collect();
                 let references: Vec<&str> = match image.references.as_slice() {
                     [] => vec!["-"],
@@ -766,7 +763,6 @@ async fn top_loop(socket: &Path, terminal: &mut ratatui::DefaultTerminal) -> Res
     use ratatui::crossterm::event::{self, Event, KeyEventKind};
     let mut dashboard = cirro_tui::Dashboard::default();
     let mut next_refresh = std::time::Instant::now();
-    let mut refresh_failed = false;
     // Stops run in the background (a graceful one can take its whole
     // timeout) and report back here.
     let (stopped, mut stop_results) = tokio::sync::mpsc::unbounded_channel();
@@ -779,16 +775,10 @@ async fn top_loop(socket: &Path, terminal: &mut ratatui::DefaultTerminal) -> Res
             };
             match refreshed.await {
                 Ok((stats, machine_apps)) => {
-                    dashboard.set_stats(stats.unwrap_or_default());
-                    dashboard.set_machine_apps(machine_apps.unwrap_or_default());
-                    if std::mem::take(&mut refresh_failed) {
-                        dashboard.clear_status();
-                    }
+                    dashboard.set_stats(stats);
+                    dashboard.set_machine_apps(machine_apps);
                 }
-                Err(e) => {
-                    refresh_failed = true;
-                    dashboard.set_status(e);
-                }
+                Err(e) => dashboard.set_refresh_error(e),
             }
             next_refresh = std::time::Instant::now() + Duration::from_secs(1);
         }
@@ -815,19 +805,22 @@ async fn top_loop(socket: &Path, terminal: &mut ratatui::DefaultTerminal) -> Res
         match dashboard.key(key.code) {
             cirro_tui::Action::None => {}
             cirro_tui::Action::Quit => return Ok(()),
-            cirro_tui::Action::ShowLog(name) => {
-                let path = format!("/vms/{name}/logs?offset=0");
-                match client::send(socket, Method::GET, &path, None::<&()>).await {
-                    Ok((_, log)) => dashboard.set_log(&name, &String::from_utf8_lossy(&log)),
-                    Err(e) => dashboard.set_status(e),
-                }
-            }
+            cirro_tui::Action::ShowLog(name) => match log_tail(socket, &name).await {
+                Ok(log) => dashboard.set_log(&name, &String::from_utf8_lossy(&log)),
+                Err(e) => dashboard.set_status(e),
+            },
             cirro_tui::Action::Stop(name) => {
                 dashboard.set_status(format!("stopping {name}…"));
                 let socket = socket.to_path_buf();
                 let stopped = stopped.clone();
                 tokio::spawn(async move {
-                    let result = stop(&socket, &name, false, 10).await;
+                    let result = stop(
+                        &socket,
+                        &name,
+                        false,
+                        cirro_proto::DEFAULT_STOP_TIMEOUT_SECS,
+                    )
+                    .await;
                     let _ = stopped.send((name, result));
                 });
             }
@@ -836,13 +829,9 @@ async fn top_loop(socket: &Path, terminal: &mut ratatui::DefaultTerminal) -> Res
 }
 
 async fn top_once(socket: &Path) -> Result<(), String> {
-    let stats: Stats = client::call(socket, Method::GET, "/stats", None::<&()>)
-        .await?
-        .unwrap_or_default();
+    let stats: Stats = client::call(socket, Method::GET, "/stats", None::<&()>).await?;
     let machine_apps: Vec<MachineAppInfo> =
-        client::call(socket, Method::GET, "/machine-apps", None::<&()>)
-            .await?
-            .unwrap_or_default();
+        client::call(socket, Method::GET, "/machine-apps", None::<&()>).await?;
     print!("{}", cirro_tui::snapshot(&stats, &machine_apps));
     Ok(())
 }
@@ -856,16 +845,12 @@ async fn node_ca(socket: &Path) -> Result<(), String> {
 
 async fn ps(socket: &Path, all: bool) -> Result<(), String> {
     let path = if all { "/vms?all=true" } else { "/vms" };
-    let vms: Vec<VmInfo> = client::call(socket, Method::GET, path, None::<&()>)
-        .await?
-        .unwrap_or_default();
+    let vms: Vec<VmInfo> = client::call(socket, Method::GET, path, None::<&()>).await?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let machine_apps: Vec<MachineAppInfo> =
-        client::call(socket, Method::GET, "/machine-apps", None::<&()>)
-            .await?
-            .unwrap_or_default();
+        client::call(socket, Method::GET, "/machine-apps", None::<&()>).await?;
     let mut header = ps_row([
         "NAME",
         "VM ADDRESS",
@@ -891,7 +876,7 @@ async fn ps(socket: &Path, all: bool) -> Result<(), String> {
         let mut row = ps_row([
             &vm.name,
             &address,
-            &format_mem(vm.mem_mib),
+            &cirro_tui::mem(vm.mem_mib.into()),
             &vm.vcpus.to_string(),
             &uptime,
             host,
@@ -917,7 +902,7 @@ async fn ps(socket: &Path, all: bool) -> Result<(), String> {
             "-",
             "-",
             &app.route.host,
-            &format!("{}:{}", app.machine, app.route.port),
+            &cirro_tui::machine_port(&app),
         ]);
         if all {
             row.push_str("  ");
@@ -967,6 +952,29 @@ async fn logs(socket: &Path, name: &str, follow: bool) -> Result<(), String> {
     }
 }
 
+/// The last [`LOG_CHUNK`] bytes of `name`'s console log, read through to
+/// its end: the agent hands out at most one chunk per request.
+// ponytail: reads the whole log to find its end; an offset-from-end query
+// on the agent would avoid that if `top` on huge logs gets slow.
+async fn log_tail(socket: &Path, name: &str) -> Result<Vec<u8>, String> {
+    let mut tail = Vec::new();
+    let mut offset = 0u64;
+    loop {
+        let path = format!("/vms/{name}/logs?offset={offset}");
+        let (_, bytes) = client::send(socket, Method::GET, &path, None::<&()>).await?;
+        let full = bytes.len() as u64 == LOG_CHUNK;
+        offset += bytes.len() as u64;
+        tail.extend_from_slice(&bytes);
+        let keep = LOG_CHUNK as usize;
+        if tail.len() > keep {
+            tail.drain(..tail.len() - keep);
+        }
+        if !full {
+            return Ok(tail);
+        }
+    }
+}
+
 async fn stop(socket: &Path, name: &str, force: bool, timeout_secs: u64) -> Result<(), String> {
     let request = StopRequest {
         force,
@@ -1000,8 +1008,7 @@ async fn wake(socket: &Path, name: &str) -> Result<(), String> {
         &format!("/vms/{name}/wake"),
         None::<&()>,
     )
-    .await?
-    .ok_or("the Node agent answered the wake with no VM")?;
+    .await?;
     match vm.vm_address {
         Some(address) => {
             println!("{address}");
@@ -1033,9 +1040,7 @@ async fn machine_command(socket: &Path, command: MachineCommand) -> Result<(), S
         }
         MachineCommand::Ls => {
             let machines: Vec<MachineInfo> =
-                client::call(socket, Method::GET, "/machines", None::<&()>)
-                    .await?
-                    .unwrap_or_default();
+                client::call(socket, Method::GET, "/machines", None::<&()>).await?;
             println!(
                 "{:<32} {:<32} {:<50} {:<11}  ERROR",
                 "NAME", "SSH", "HOST KEY", "STATUS"
@@ -1052,14 +1057,15 @@ async fn machine_command(socket: &Path, command: MachineCommand) -> Result<(), S
             }
             Ok(())
         }
-        MachineCommand::Rm { name } => client::call::<()>(
-            socket,
-            Method::DELETE,
-            &format!("/machines/{name}"),
-            None::<&()>,
-        )
-        .await
-        .map(drop),
+        MachineCommand::Rm { name } => {
+            client::call_empty(
+                socket,
+                Method::DELETE,
+                &format!("/machines/{name}"),
+                None::<&()>,
+            )
+            .await
+        }
         MachineCommand::Key => {
             let (_, key) = client::send(socket, Method::GET, "/ssh-key", None::<&()>).await?;
             std::io::stdout()
@@ -1073,9 +1079,8 @@ async fn machine_command(socket: &Path, command: MachineCommand) -> Result<(), S
 /// returns it once the user says it's the Machine's.
 async fn confirm_host_key(socket: &Path, ssh: &str) -> Result<String, String> {
     let scan = MachineScan { ssh: ssh.into() };
-    let found: MachineHostKey = client::call(socket, Method::POST, "/machines/scan", Some(&scan))
-        .await?
-        .ok_or("the Node agent returned no host key")?;
+    let found: MachineHostKey =
+        client::call(socket, Method::POST, "/machines/scan", Some(&scan)).await?;
     print!(
         "{ssh} presents the host key {}\nCheck it on the Machine with `ssh-keygen -lf \
          /etc/ssh/ssh_host_ed25519_key.pub`. Trust it? [y/N] ",
@@ -1095,9 +1100,7 @@ async fn confirm_host_key(socket: &Path, ssh: &str) -> Result<String, String> {
 }
 
 async fn rm(socket: &Path, name: &str) -> Result<(), String> {
-    client::call::<()>(socket, Method::DELETE, &format!("/vms/{name}"), None::<&()>)
-        .await
-        .map(drop)
+    client::call_empty(socket, Method::DELETE, &format!("/vms/{name}"), None::<&()>).await
 }
 
 /// Parses `--mem`: a count of MiB with an optional `M`/`G` suffix.
@@ -1138,14 +1141,6 @@ fn parse_user(s: &str) -> Result<User, String> {
         .and_then(|(u, g)| Some((u.parse().ok()?, g.parse().ok()?)))
         .ok_or_else(|| format!("{s:?} is not a numeric UID:GID like 1000:1000"))?;
     Ok(User { uid, gid })
-}
-
-fn format_mem(mib: u32) -> String {
-    if mib.is_multiple_of(1024) {
-        format!("{}G", mib / 1024)
-    } else {
-        format!("{mib}M")
-    }
 }
 
 #[cfg(test)]

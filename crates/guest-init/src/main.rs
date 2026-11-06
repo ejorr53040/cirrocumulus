@@ -1,18 +1,17 @@
 //! `guest-init`: PID 1 inside the Firecracker guest. See RESEARCH.md M2.
 //!
-//! Slice 1: mount the pseudo-filesystems and print a boot marker. Slice 2:
-//! read the configured app from a fixed path, fork, and exec it in the
-//! child. Slice 3: power off cleanly once that app exits. Slice 4: reap
-//! every child, not just the tracked app. Slice 5: translate a
-//! host-triggered shutdown (Firecracker's `SendCtrlAltDel` action) into a
-//! real `SIGTERM` for the app, instead of the kernel's default hard reset
-//! wiping out the guest before any userspace code -- including the app --
-//! gets to react. Slice 6 (current): read the config over vsock instead
-//! of a fixed rootfs path, so the host can supply it at boot rather than
-//! baking it into the image.
+//! It mounts the pseudo-filesystems, prints a boot marker, reads the app's
+//! config over vsock (so the host supplies it at boot rather than baking it
+//! into the image), and forks and execs the app as its configured user.
+//! Until no children are left it reaps every one, the app's orphans
+//! included, and turns a host-triggered shutdown (Firecracker's
+//! `SendCtrlAltDel` action) into a `SIGTERM` for the app, instead of the
+//! kernel's default hard reset wiping out the guest before the app gets to
+//! react. Then it resets the VM, which Firecracker exits on.
 
 mod launch;
 
+use cirro_guest_init::FORWARDING_MARKER;
 use cirro_guest_init::config::{self, Config};
 use nix::errno::Errno;
 use nix::mount::{MsFlags, mount};
@@ -37,9 +36,6 @@ static APP_PID: AtomicI32 = AtomicI32::new(0);
 /// A host shutdown request that arrived before the app was forked, which
 /// `main` forwards as soon as `APP_PID` is set.
 static SHUTDOWN_PENDING: AtomicBool = AtomicBool::new(false);
-
-/// Printed to the console as a host shutdown request is forwarded.
-const FORWARDING_MARKER: &[u8] = b"GUEST_INIT_FORWARDING_SIGTERM\n";
 
 /// Forwards a host shutdown request to the app as `SIGTERM`, here in the
 /// handler rather than from the reap loop: a flag the loop checked only
@@ -67,15 +63,10 @@ fn forward_shutdown(pid: nix::libc::pid_t) {
             FORWARDING_MARKER.as_ptr().cast(),
             FORWARDING_MARKER.len(),
         );
+        nix::libc::write(1, c"\n".as_ptr().cast(), 1);
         nix::libc::kill(pid, nix::libc::SIGTERM);
     }
 }
-
-/// Guest-side vsock port guest-init listens on for its config, per
-/// RESEARCH.md M2 slice 6. Arbitrary but fixed, matching the host side
-/// (`scripts/step0/push_vsock_config.sh`); same JSON shape slices 2-5's
-/// fixed-path file used, so `config::parse_config` doesn't change.
-const VSOCK_CONFIG_PORT: u32 = 52;
 
 /// Printed to the console (ttyS0) once the pseudo-filesystems are mounted,
 /// so the boot harness can confirm guest-init reached this point as PID 1.
@@ -124,8 +115,7 @@ fn mount_pseudo_filesystems() {
 /// CID.
 ///
 /// Reads until EOF: the host closes its end once the whole config has been
-/// written, the same "read to completion" contract the fixed-path file
-/// read (slices 2-5) had.
+/// written.
 fn read_config_from_vsock() -> Config {
     let listen_fd = socket(
         AddressFamily::Vsock,
@@ -135,7 +125,7 @@ fn read_config_from_vsock() -> Config {
     )
     .expect("create vsock socket");
 
-    let addr = VsockAddr::new(nix::libc::VMADDR_CID_ANY, VSOCK_CONFIG_PORT);
+    let addr = VsockAddr::new(nix::libc::VMADDR_CID_ANY, config::CONFIG_PORT);
     bind(listen_fd.as_raw_fd(), &addr).expect("bind vsock config port");
     listen(&listen_fd, Backlog::MAXCONN).expect("listen on vsock config port");
 
@@ -200,7 +190,7 @@ fn exec_app(config: &Config) -> String {
             return format!("switch to user {}:{}: {e}", user.uid, user.gid);
         }
     }
-    let path = launch::lookup(&env, "PATH").unwrap_or_default();
+    let path = launch::lookup(&env, "PATH").expect("app_env always sets PATH");
     let Some(file) = launch::resolve(&config.exec, path, is_executable) else {
         return format!("not found on PATH {path}");
     };
@@ -233,14 +223,12 @@ fn is_executable(path: &Path) -> bool {
 
 /// Makes a host-triggered shutdown request (Firecracker's `SendCtrlAltDel`
 /// action) observable to `main`'s reap loop instead of tearing the guest
-/// down before any userspace code runs, per RESEARCH.md M2 slice 5.
+/// down before any userspace code runs.
 ///
 /// By default Ctrl-Alt-Del is "hard": the kernel resets the machine
-/// straight from the keyboard-interrupt handler, the same instant reset
-/// path slice 1 and slice 3 already found Firecracker traps and cleanly
-/// exits on -- so the VM *does* shut down, but the app never gets a
-/// chance to react, indistinguishable from being killed out from under
-/// it. `set_cad_enabled(false)` switches the kernel to "soft" CAD, where
+/// straight from the keyboard-interrupt handler, a reset Firecracker traps
+/// and exits on -- so the VM shuts down, but the app never gets a chance
+/// to react. `set_cad_enabled(false)` switches the kernel to "soft" CAD, where
 /// the same keypress instead sends `SIGINT` to PID 1 specifically, which
 /// this installs a handler for.
 fn install_shutdown_request_handler() {
@@ -256,14 +244,10 @@ fn install_shutdown_request_handler() {
     unsafe { signal::sigaction(Signal::SIGINT, &action) }.expect("install SIGINT handler");
 }
 
-/// Reaps every child until none remain, per RESEARCH.md M2 slice 4. A
-/// `waitpid` scoped to just the one tracked app pid (slices 2-3's
-/// approach) never touches any other child's exit -- a grandchild the app
-/// forked and didn't wait on, still running when the app exits, gets
-/// reparented to guest-init (PID 1) and would sit unreaped otherwise.
-/// `waitpid(-1)` reaps whichever child changes state next regardless of
-/// pid, so looping it until `ECHILD` (no children left) sweeps up the
-/// tracked app and any such orphan alike before shutdown runs. Once `app`
+/// Reaps every child until none remain: a grandchild the app forked and
+/// didn't wait on is reparented to guest-init (PID 1), so waiting on the
+/// app's pid alone would leave it unreaped. `waitpid(-1)` until `ECHILD`
+/// sweeps up the app and any such orphan before shutdown runs. Once `app`
 /// is reaped its pid is free for reuse, so `APP_PID` goes back to 0.
 ///
 /// `waitpid` returns `EINTR` when `SIGINT` (see `handle_sigint`)
@@ -281,20 +265,14 @@ fn reap_until_no_children(app: Pid) {
 }
 
 /// Shuts the VM down. `reboot(2)` doesn't return on success -- the kernel
-/// tears the machine down mid-syscall -- which is exactly what PID 1
-/// needs: slice 1 already found that *returning* from this point (letting
-/// `main` end, or looping and getting killed) panics the guest kernel
+/// tears the machine down mid-syscall -- which is what PID 1 needs:
+/// *returning* from here (letting `main` end) panics the guest kernel
 /// ("Attempted to kill init!") instead of shutting down cleanly.
 ///
-/// `RB_POWER_OFF` (what RESEARCH.md's M2 method names) turned out not to
-/// work here: Firecracker's minimal device model has no ACPI power button,
-/// so the kernel finds no `pm_power_off` handler and just halts
-/// ("Power off not available: System halted instead") -- the CPU stops but
-/// the Firecracker process stays alive, doing nothing, forever. slice 1's
-/// panic trace already showed the mechanism Firecracker actually reacts
-/// to: a reboot (the same x86 reset path a kernel panic + `reboot=k`
-/// takes), which Firecracker traps and exits the VMM on. `RB_AUTOBOOT`
-/// takes that same path deliberately instead of via a panic.
+/// Not `RB_POWER_OFF`: Firecracker's minimal device model has no ACPI power
+/// button, so the kernel just halts ("Power off not available: System
+/// halted instead") and the Firecracker process stays alive forever. A
+/// reboot takes the x86 reset path Firecracker traps and exits the VMM on.
 fn shutdown() -> ! {
     match reboot(RebootMode::RB_AUTOBOOT) {
         Ok(never) => match never {},
@@ -311,10 +289,7 @@ fn main() {
     // can still be draining this write into the UART when the next line
     // runs, and PID 1 returning from main is fatal (the kernel panics with
     // "Attempted to kill init!"), tearing down the console mid-write and
-    // truncating or dropping the marker entirely. Flush explicitly, then
-    // never return: reap/exec/shutdown land in later slices, but even this
-    // mount-only slice must hold PID 1 open, because a guest's init isn't
-    // allowed to exit at all.
+    // truncating or dropping the marker entirely. So flush explicitly.
     std::io::stdout().flush().expect("flush boot marker");
 
     let config = read_config_from_vsock();

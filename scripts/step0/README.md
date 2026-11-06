@@ -45,11 +45,6 @@ stale passwordless `ip`/`nft` rule outlives the branch that added it.
 Internet egress is covered by `crates/cirro/tests/node_agent.rs`
 (`vms_reach_the_internet_but_not_smtp_each_other_or_the_lan`).
 
-`cirro-node`'s `Jail::spawn` (the `sudo jailer` path) is still here because
-`crates/cirro-node/tests/jailer.rs` exercises it against the `firecracker` and
-`jailer` binaries at the repo root. Nothing outside this dev harness reaches it.
-Retiring it means retiring those binaries and their fixtures too.
-
 Four seams are tested, each through the real Firecracker API socket (no
 mocks):
 

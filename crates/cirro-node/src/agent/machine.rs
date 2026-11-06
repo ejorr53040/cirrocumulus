@@ -4,6 +4,7 @@
 //! OpenSSH `ssh` per Machine running to know whether the Machine is up.
 
 use super::{ApiError, bad_request, internal};
+use crate::layout;
 use crate::state::{MachineAppRecord, MachineRecord, Store};
 use cirro_edge::{Lease, Resolution};
 use cirro_proto::{
@@ -36,6 +37,7 @@ pub(super) struct Machines {
     /// other's host key.
     adding: tokio::sync::Mutex<()>,
     entries: Mutex<BTreeMap<String, Machine>>,
+    store: Arc<Mutex<Store>>,
 }
 
 struct Machine {
@@ -72,22 +74,34 @@ struct Link {
     host_key_changed: bool,
 }
 
+impl Link {
+    /// Before its `ssh` has logged in.
+    fn down() -> Link {
+        Link {
+            status: MachineStatus::Unreachable,
+            last_error: None,
+            host_key_changed: false,
+        }
+    }
+}
+
 impl Machines {
-    pub(super) fn new(state_dir: &Path) -> Machines {
+    pub(super) fn new(state_dir: &Path, store: Arc<Mutex<Store>>) -> Machines {
         Machines {
-            key: state_dir.join("ssh_key"),
-            known_hosts: state_dir.join("known_hosts"),
+            key: layout::ssh_key(state_dir),
+            known_hosts: layout::known_hosts(state_dir),
             keygen: Mutex::new(()),
             adding: tokio::sync::Mutex::new(()),
             entries: Mutex::new(BTreeMap::new()),
+            store,
         }
     }
 
     /// Brings back the Machines a previous agent added, connecting to each
     /// in the background so an unreachable one holds nothing up.
-    pub(super) fn restore(&self, store: &Mutex<Store>) -> io::Result<()> {
+    pub(super) fn restore(&self) -> io::Result<()> {
         let (records, app_records) = {
-            let store = store.lock().unwrap();
+            let store = self.store.lock().unwrap();
             (store.load_machines()?, store.load_machine_apps()?)
         };
         for record in records {
@@ -129,12 +143,21 @@ impl Machines {
     }
 
     pub(super) fn has_app(&self, name: &str) -> bool {
-        has_app(&self.entries.lock().unwrap(), name)
+        self.entries
+            .lock()
+            .unwrap()
+            .values()
+            .any(|m| m.apps.contains_key(name))
     }
 
     /// The Machine-backed App whose route has `host`, if any.
     pub(super) fn app_with_host(&self, host: &str) -> Option<String> {
-        app_with_host(&self.entries.lock().unwrap(), host)
+        self.entries.lock().unwrap().values().find_map(|m| {
+            m.apps
+                .iter()
+                .find(|(_, app)| app.route.host == host)
+                .map(|(name, _)| name.clone())
+        })
     }
 
     /// Where the edge sends a request for `host`, when a Machine-backed App
@@ -161,24 +184,11 @@ impl Machines {
     }
 
     /// Makes a Machine-backed App and reconnects its Machine to forward to
-    /// it. The caller has checked the name and hostname aren't a VM's or
-    /// a VM-backed App's, and holds the VM table so neither can be taken
+    /// it. The caller has checked the name and hostname are free, and holds
+    /// the VM table, which every add takes, so neither can be taken
     /// meanwhile.
-    pub(super) fn add_app(
-        &self,
-        request: MachineAppRequest,
-        store: &Mutex<Store>,
-    ) -> Result<MachineAppInfo, ApiError> {
+    pub(super) fn add_app(&self, request: MachineAppRequest) -> Result<MachineAppInfo, ApiError> {
         let mut entries = self.entries.lock().unwrap();
-        if has_app(&entries, &request.name) {
-            return Err(ApiError(
-                StatusCode::CONFLICT,
-                format!("an App named {:?} already exists", request.name),
-            ));
-        }
-        if let Some(owner) = app_with_host(&entries, &request.route.host) {
-            return Err(super::hostname_taken(&request.route.host, &owner, false));
-        }
         let machine = entries.get_mut(&request.machine).ok_or_else(|| {
             ApiError(
                 StatusCode::NOT_FOUND,
@@ -199,12 +209,16 @@ impl Machines {
                 request.machine
             )));
         }
-        let recorded = store.lock().unwrap().insert_machine_app(&MachineAppRecord {
-            name: request.name.clone(),
-            machine: request.machine.clone(),
-            host: request.route.host.clone(),
-            port: request.route.port,
-        });
+        let recorded = self
+            .store
+            .lock()
+            .unwrap()
+            .insert_machine_app(&MachineAppRecord {
+                name: request.name.clone(),
+                machine: request.machine.clone(),
+                host: request.route.host.clone(),
+                port: request.route.port,
+            });
         if let Err(e) = recorded {
             machine.apps.remove(&request.name);
             let _ = self.start_tunnel(machine);
@@ -220,12 +234,12 @@ impl Machines {
 
     /// Removes the Machine-backed App `name` and stops forwarding to it;
     /// `false` when there's none.
-    pub(super) fn remove_app(&self, name: &str, store: &Mutex<Store>) -> Result<bool, ApiError> {
+    pub(super) fn remove_app(&self, name: &str) -> Result<bool, ApiError> {
         let mut entries = self.entries.lock().unwrap();
         let Some(machine) = entries.values_mut().find(|m| m.apps.contains_key(name)) else {
             return Ok(false);
         };
-        store
+        self.store
             .lock()
             .unwrap()
             .delete_machine_app(name)
@@ -243,18 +257,13 @@ impl Machines {
     pub(super) fn public_key(&self) -> Result<String, ApiError> {
         let _making = self.keygen.lock().unwrap();
         if !self.key.exists() {
-            let made = std::process::Command::new("ssh-keygen")
-                .args(["-q", "-t", "ed25519", "-N", "", "-C", "cirro-node", "-f"])
-                .arg(&self.key)
-                .stdin(Stdio::null())
-                .output()
-                .map_err(|e| internal(format!("run ssh-keygen: {e}")))?;
-            if !made.status.success() {
-                return Err(internal(format!(
-                    "make the Node agent's SSH key: {}",
-                    String::from_utf8_lossy(&made.stderr).trim()
-                )));
-            }
+            crate::cmd::run(
+                std::process::Command::new("ssh-keygen")
+                    .args(["-q", "-t", "ed25519", "-N", "", "-C", "cirro-node", "-f"])
+                    .arg(&self.key),
+                None,
+            )
+            .map_err(|e| internal(format!("make the Node agent's SSH key: {e}")))?;
         }
         std::fs::read_to_string(self.key.with_extension("pub"))
             .map_err(|e| internal(format!("read the Node agent's SSH public key: {e}")))
@@ -272,19 +281,15 @@ impl Machines {
     /// The fingerprint of the host key the Machine at `ssh` presents, for
     /// `cirro machine add` to show before pinning it.
     pub(super) async fn scan(&self, ssh: &str) -> Result<String, ApiError> {
-        let target = Target::parse(ssh)?;
+        let target = Target::parse(ssh).map_err(|e| bad_request(&e))?;
         fingerprint(&host_keys(&target).await?[0]).await
     }
 
     /// Pins the host key `add.host_key` names, checks the agent can log in
     /// with it, then records the Machine and connects to it.
-    pub(super) async fn add(
-        &self,
-        add: AddMachine,
-        store: &Mutex<Store>,
-    ) -> Result<MachineInfo, ApiError> {
+    pub(super) async fn add(&self, add: AddMachine) -> Result<MachineInfo, ApiError> {
         super::validate_name("Machine", &add.name)?;
-        let target = Target::parse(&add.ssh)?;
+        let target = Target::parse(&add.ssh).map_err(|e| bad_request(&e))?;
         let _adding = self.adding.lock().await;
         if self.entries.lock().unwrap().contains_key(&add.name) {
             return Err(ApiError(
@@ -350,7 +355,7 @@ impl Machines {
                 ),
             ));
         }
-        store
+        self.store
             .lock()
             .unwrap()
             .insert_machine(&record)
@@ -361,7 +366,7 @@ impl Machines {
         Ok(self.entries.lock().unwrap()[&name].info())
     }
 
-    pub(super) async fn remove(&self, name: &str, store: &Mutex<Store>) -> Result<(), ApiError> {
+    pub(super) async fn remove(&self, name: &str) -> Result<(), ApiError> {
         // Not mid-add: rewriting known_hosts would unpin the key being added.
         let _adding = self.adding.lock().await;
         let mut entries = self.entries.lock().unwrap();
@@ -381,7 +386,7 @@ impl Machines {
                 ),
             ));
         }
-        store
+        self.store
             .lock()
             .unwrap()
             .delete_machine(name)
@@ -416,11 +421,7 @@ impl Machines {
                     )
                 })
                 .collect(),
-            link: Arc::new(Mutex::new(Link {
-                status: MachineStatus::Unreachable,
-                last_error: None,
-                host_key_changed: false,
-            })),
+            link: Arc::new(Mutex::new(Link::down())),
             tunnel: tokio::spawn(async {}),
         };
         self.start_tunnel(&mut machine)?;
@@ -431,7 +432,7 @@ impl Machines {
     /// Replaces the Machine's `ssh` with one that forwards to each of its
     /// Apps, and tracks what it says.
     fn start_tunnel(&self, machine: &mut Machine) -> io::Result<()> {
-        let target = Target::parse(&machine.record.ssh).map_err(|e| io::Error::other(e.1))?;
+        let target = Target::parse(&machine.record.ssh).map_err(io::Error::other)?;
         // Every port is chosen before anything changes, so a failure leaves
         // the running `ssh` and the ports the edge uses as they were.
         let ports = free_local_ports(machine.apps.len())?;
@@ -452,11 +453,7 @@ impl Machines {
             return Ok(());
         }
         machine.tunnel.abort();
-        machine.link = Arc::new(Mutex::new(Link {
-            status: MachineStatus::Unreachable,
-            last_error: None,
-            host_key_changed: false,
-        }));
+        machine.link = Arc::new(Mutex::new(Link::down()));
         let (key, known_hosts) = (self.key.clone(), self.known_hosts.clone());
         let name = machine.record.name.clone();
         machine.tunnel = tokio::spawn(run_tunnel(
@@ -648,12 +645,9 @@ struct Target {
 impl Target {
     /// Each part becomes an `ssh` argument, so none may start with `-` or
     /// hold anything but the characters user and host names use.
-    fn parse(ssh: &str) -> Result<Target, ApiError> {
-        let invalid = || {
-            bad_request(&format!(
-                "invalid SSH target {ssh:?}: expected user@host or user@host:port"
-            ))
-        };
+    fn parse(ssh: &str) -> Result<Target, String> {
+        let invalid =
+            || format!("invalid SSH target {ssh:?}: expected user@host or user@host:port");
         let word = |s: &str, extra: &[u8]| {
             !s.is_empty()
                 && !s.starts_with('-')
@@ -746,19 +740,6 @@ async fn fingerprint(key: &str) -> Result<String, ApiError> {
         .nth(1)
         .map(str::to_string)
         .ok_or_else(|| internal(format!("ssh-keygen couldn't read the host key {key:?}")))
-}
-
-fn has_app(entries: &BTreeMap<String, Machine>, name: &str) -> bool {
-    entries.values().any(|m| m.apps.contains_key(name))
-}
-
-fn app_with_host(entries: &BTreeMap<String, Machine>, host: &str) -> Option<String> {
-    entries.values().find_map(|m| {
-        m.apps
-            .iter()
-            .find(|(_, app)| app.route.host == host)
-            .map(|(name, _)| name.clone())
-    })
 }
 
 /// `n` different ports free on the Node's 127.0.0.1 a moment ago: all

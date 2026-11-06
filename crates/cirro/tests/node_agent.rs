@@ -21,6 +21,8 @@
 //! `scripts/step0/.build` (`scripts/step0/fetch_kernel.sh`).
 
 use assert_cmd::Command;
+use cirro_guest_init::FORWARDING_MARKER;
+use cirro_proto::LOG_CHUNK;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::{Pid, getgid};
 use std::io::{Read, Write};
@@ -34,24 +36,15 @@ use std::time::{Duration, Instant};
 const HTTP_PORT: u16 = 8080;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The port the agent on Node subnet `10.77.<octet>.0/24` serves its HTTP
-/// edge on, on 127.0.0.1: one per agent, so tests running at once don't
-/// share an edge.
-fn edge_port(octet: u8) -> u16 {
-    18000 + u16::from(octet)
-}
-
-/// Like [`edge_port`], for the HTTPS edge.
-fn tls_edge_port(octet: u8) -> u16 {
-    19000 + u16::from(octet)
-}
-
 /// The Node subnet octets of the agents currently running in this process.
 static LIVE_OCTETS: std::sync::Mutex<std::collections::BTreeSet<u8>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 mod common;
-use common::{home, latest_kernel, repo_root, rootfs, test_agent, test_agent_path};
+use common::{
+    AGENT_OCTETS_FROM, edge_port, home, latest_kernel, repo_root, rootfs, test_agent,
+    test_agent_path, tls_edge_port,
+};
 
 /// A throwaway Node agent on Node subnet `10.77.<octet>.0/24`. It can be
 /// stopped and restarted on the same state dir, like the real one. Dropping
@@ -72,49 +65,26 @@ impl Agent {
     /// Starts an agent whose socket belongs to the test user's group, or
     /// returns `None` (after saying why) when the test has to skip.
     fn start(octet: u8) -> Option<Agent> {
-        Agent::start_with_socket_group(octet, &getgid().as_raw().to_string())
-    }
-
-    /// Like [`Agent::start`], with more `cirro node agent` arguments.
-    fn start_with_args(octet: u8, args: &[&str]) -> Option<Agent> {
-        Agent::start_with(
-            octet,
-            &getgid().as_raw().to_string(),
-            args.iter().map(|a| a.to_string()).collect(),
-        )
-    }
-
-    fn start_with_socket_group(octet: u8, socket_group: &str) -> Option<Agent> {
-        Agent::start_with(octet, socket_group, Vec::new())
+        Agent::start_with(octet, None, &[], true)
     }
 
     /// Like [`Agent::start`], for tests that boot no VM and so don't need
     /// KVM: Machine tests.
     fn start_without_kvm(octet: u8) -> Option<Agent> {
-        Agent::start_without_kvm_with_args(octet, &[])
+        Agent::start_with(octet, None, &[], false)
     }
 
-    /// Like [`Agent::start_without_kvm`], with more `cirro node agent`
-    /// arguments.
-    fn start_without_kvm_with_args(octet: u8, args: &[&str]) -> Option<Agent> {
-        Agent::start_checked(
-            octet,
-            &getgid().as_raw().to_string(),
-            args.iter().map(|a| a.to_string()).collect(),
-            false,
-        )
-    }
-
-    fn start_with(octet: u8, socket_group: &str, extra_args: Vec<String>) -> Option<Agent> {
-        Agent::start_checked(octet, socket_group, extra_args, true)
-    }
-
-    fn start_checked(
+    /// Like [`Agent::start`], with the socket's group (the test user's when
+    /// `None`), more `cirro node agent` arguments, and whether it needs KVM.
+    fn start_with(
         octet: u8,
-        socket_group: &str,
-        extra_args: Vec<String>,
+        socket_group: Option<&str>,
+        extra_args: &[&str],
         needs_kvm: bool,
     ) -> Option<Agent> {
+        let socket_group =
+            socket_group.map_or_else(|| getgid().as_raw().to_string(), str::to_owned);
+        let extra_args: Vec<String> = extra_args.iter().map(|a| a.to_string()).collect();
         if needs_kvm && !Path::new("/dev/kvm").exists() {
             eprintln!("skipping: /dev/kvm not present");
             return None;
@@ -128,6 +98,10 @@ impl Agent {
             return None;
         }
 
+        assert!(
+            octet >= AGENT_OCTETS_FROM,
+            "octet {octet} is an install test's"
+        );
         // Two live agents on one subnet sweep each other's VMs, which shows
         // up as unrelated failures elsewhere in the suite.
         let free = LIVE_OCTETS.lock().unwrap().insert(octet);
@@ -145,7 +119,7 @@ impl Agent {
         let mut agent = Agent {
             sudo: None,
             octet,
-            socket_group: socket_group.to_string(),
+            socket_group,
             state_dir,
             socket,
             extra_args,
@@ -192,8 +166,11 @@ impl Agent {
             .arg(&self.socket)
             .args(["--socket-group", &self.socket_group])
             .args(["--subnet", &format!("10.77.{octet}.0/24")])
-            .args(["--http", &format!("127.0.0.1:{}", edge_port(octet))])
-            .args(["--https", &format!("127.0.0.1:{}", tls_edge_port(octet))])
+            .args(["--http", &format!("127.0.0.1:{}", edge_port(octet.into()))])
+            .args([
+                "--https",
+                &format!("127.0.0.1:{}", tls_edge_port(octet.into())),
+            ])
             .arg("--firecracker")
             .arg(repo.join("firecracker"))
             .arg("--jailer")
@@ -972,7 +949,7 @@ fn logs_reads_a_long_console_log_whole_and_returns_while_it_still_grows() {
     // runs.
     let log = agent.state_dir.join("logs/chatty.0.log");
     let deadline = Instant::now() + 3 * TIMEOUT;
-    while std::fs::metadata(&log).map_or(0, |m| m.len()) < 5 << 18 {
+    while std::fs::metadata(&log).map_or(0, |m| m.len()) < LOG_CHUNK * 5 / 4 {
         assert!(
             Instant::now() < deadline,
             "chatter wrote only {:?} bytes",
@@ -996,7 +973,7 @@ fn logs_reads_a_long_console_log_whole_and_returns_while_it_still_grows() {
         .filter(|l| l.starts_with("CHATTER "))
         .collect();
     assert!(
-        logs.len() > 1 << 20,
+        logs.len() as u64 > LOG_CHUNK,
         "logs stopped inside the first 1 MiB answer: {} bytes",
         logs.len()
     );
@@ -1040,7 +1017,7 @@ fn graceful_stop_forces_a_vm_that_ignores_sigterm_after_its_timeout() {
     let ended = row(&ps, "stubborn").unwrap_or_else(|| panic!("ps -a lacks stubborn:\n{ps}"));
     assert!(ended.contains("forced"), "end reason missing: {ended}");
     // guest-init did pass the stop on, and the command ignored it.
-    wait_for_log(&agent, "stubborn", "GUEST_INIT_FORWARDING_SIGTERM");
+    wait_for_log(&agent, "stubborn", FORWARDING_MARKER);
     agent.assert_no_cirro_state();
 }
 
@@ -1263,7 +1240,7 @@ fn console_logs_are_not_world_readable() {
 #[test]
 fn a_user_outside_the_socket_group_gets_a_clear_permission_error() {
     // The test user isn't in group 0 (root), so the socket is closed to it.
-    let Some(agent) = Agent::start_with_socket_group(230, "0") else {
+    let Some(agent) = Agent::start_with(230, Some("0"), &[], true) else {
         return;
     };
     let err = stderr(agent.cirro().arg("ps").assert().failure());
@@ -1312,7 +1289,7 @@ fn logs_follow_streams_a_running_vm_until_it_ends() {
         .read_to_string(&mut output)
         .unwrap();
     // Output from before and after the stop: it followed, not just dumped.
-    for marker in ["HTTP_FIXTURE_LISTENING", "GUEST_INIT_FORWARDING_SIGTERM"] {
+    for marker in ["HTTP_FIXTURE_LISTENING", FORWARDING_MARKER] {
         assert!(
             output.contains(marker),
             "logs -f missed {marker}:\n{output}"
@@ -2104,7 +2081,7 @@ fn edge_get(agent: &Agent, host: &str) -> std::io::Result<String> {
 /// `GET <path>` through the agent's HTTP edge, asking for `host`.
 fn edge_get_path(agent: &Agent, host: &str, path: &str) -> std::io::Result<String> {
     let mut stream = TcpStream::connect_timeout(
-        &SocketAddr::from(([127, 0, 0, 1], edge_port(agent.octet))),
+        &SocketAddr::from(([127, 0, 0, 1], edge_port(agent.octet.into()))),
         Duration::from_secs(1),
     )?;
     stream.set_read_timeout(Some(TIMEOUT))?;
@@ -2374,7 +2351,7 @@ fn tls_get(agent: &Agent, host: &str, ca: &Path) -> Result<String, String> {
 
 /// [`tls_get`] with more `curl` arguments.
 fn tls_get_with(agent: &Agent, host: &str, ca: &Path, extra: &[&str]) -> Result<String, String> {
-    let port = tls_edge_port(agent.octet);
+    let port = tls_edge_port(agent.octet.into());
     let output = std::process::Command::new("curl")
         .args(["--silent", "--show-error", "--max-time", "10", "--cacert"])
         .arg(ca)
@@ -2505,8 +2482,8 @@ impl Pebble {
             "managementListenAddress": management,
             "certificate": certs.join("localhost/cert.pem"),
             "privateKey": certs.join("localhost/key.pem"),
-            "httpPort": edge_port(octet),
-            "tlsPort": tls_edge_port(octet),
+            "httpPort": edge_port(octet.into()),
+            "tlsPort": tls_edge_port(octet.into()),
             "ocspResponderURL": "",
             "externalAccountBindingRequired": false,
         }});
@@ -2573,8 +2550,9 @@ fn an_app_with_a_public_hostname_is_served_with_an_acme_certificate() {
         return;
     };
     let minica = pebble.minica.to_string_lossy().into_owned();
-    let Some(agent) = Agent::start_with_args(
+    let Some(agent) = Agent::start_with(
         211,
+        None,
         &[
             "--acme-email",
             "ops@cirro-test.dev",
@@ -2583,6 +2561,7 @@ fn an_app_with_a_public_hostname_is_served_with_an_acme_certificate() {
             "--acme-root",
             &minica,
         ],
+        true,
     ) else {
         return;
     };
@@ -3204,8 +3183,9 @@ fn a_machine_backed_app_with_a_public_hostname_gets_an_acme_certificate() {
         return;
     };
     let minica = pebble.minica.to_string_lossy().into_owned();
-    let Some(agent) = Agent::start_without_kvm_with_args(
+    let Some(agent) = Agent::start_with(
         187,
+        None,
         &[
             "--acme-email",
             "ops@cirro-test.dev",
@@ -3214,6 +3194,7 @@ fn a_machine_backed_app_with_a_public_hostname_gets_an_acme_certificate() {
             "--acme-root",
             &minica,
         ],
+        false,
     ) else {
         return;
     };

@@ -20,9 +20,11 @@
 //! Letting VM traffic past such a firewall is therefore the firewall's own
 //! configuration, which `cirro node install` sets up (#11).
 
-use std::io::{self, Write};
+use crate::cmd;
+use crate::vm::HOST_ID_PREFIX;
+use std::io;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 /// The table's name, in the `ip` family.
 const TABLE: &str = "cirro";
@@ -38,7 +40,7 @@ const LAN_RANGES: &str = "10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/
 /// declares the table (a no-op if it exists), rewrites its rules from
 /// scratch and adds to its sets, so it never duplicates a rule and never
 /// drops another agent's subnet.
-pub fn ensure_node_policy(subnet: &str, egress_iface: Option<&str>) -> io::Result<()> {
+pub(crate) fn ensure_node_policy(subnet: &str, egress_iface: Option<&str>) -> io::Result<()> {
     let mut script = format!(
         "table ip {TABLE} {{\n\
          \tset node_subnets {{ type ipv4_addr; flags interval; }}\n\
@@ -52,12 +54,12 @@ pub fn ensure_node_policy(subnet: &str, egress_iface: Option<&str>) -> io::Resul
          flush chain ip {TABLE} forward\n\
          flush chain ip {TABLE} input\n\
          add rule ip {TABLE} postrouting ip saddr @node_subnets oifname @egress_ifaces masquerade\n\
-         add rule ip {TABLE} forward iifname \"cirro-*\" ip saddr != @node_subnets drop\n\
-         add rule ip {TABLE} forward iifname \"cirro-*\" ip saddr @node_subnets tcp dport 25 drop\n\
-         add rule ip {TABLE} forward iifname \"cirro-*\" ip saddr @node_subnets ip daddr @node_subnets drop\n\
-         add rule ip {TABLE} forward iifname \"cirro-*\" ip saddr @node_subnets ip daddr @lan drop\n\
-         add rule ip {TABLE} input iifname \"cirro-*\" ip saddr != @node_subnets drop\n\
-         add rule ip {TABLE} input iifname \"cirro-*\" ip saddr @node_subnets ct state new drop\n\
+         add rule ip {TABLE} forward iifname \"{HOST_ID_PREFIX}*\" ip saddr != @node_subnets drop\n\
+         add rule ip {TABLE} forward iifname \"{HOST_ID_PREFIX}*\" ip saddr @node_subnets tcp dport 25 drop\n\
+         add rule ip {TABLE} forward iifname \"{HOST_ID_PREFIX}*\" ip saddr @node_subnets ip daddr @node_subnets drop\n\
+         add rule ip {TABLE} forward iifname \"{HOST_ID_PREFIX}*\" ip saddr @node_subnets ip daddr @lan drop\n\
+         add rule ip {TABLE} input iifname \"{HOST_ID_PREFIX}*\" ip saddr != @node_subnets drop\n\
+         add rule ip {TABLE} input iifname \"{HOST_ID_PREFIX}*\" ip saddr @node_subnets ct state new drop\n\
          add element ip {TABLE} node_subnets {{ {subnet} }}\n"
     );
     if let Some(iface) = egress_iface {
@@ -70,18 +72,19 @@ pub fn ensure_node_policy(subnet: &str, egress_iface: Option<&str>) -> io::Resul
 
 /// Removes the whole egress policy. For `cirro node uninstall`; the agent
 /// itself never calls this. Removing a policy that isn't there is fine.
-pub fn remove_node_policy() -> io::Result<()> {
+pub(crate) fn remove_node_policy() -> io::Result<()> {
     match nft(&["delete", "table", "ip", TABLE], None) {
         Err(e) if e.to_string().contains("No such file or directory") => Ok(()),
         other => other,
     }
 }
 
+const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
+
 /// Turns on IPv4 forwarding, first recording its value at `record` if
 /// nothing has been recorded there yet, so `cirro node uninstall` can put
 /// back what the Node had before Cirrocumulus.
-pub fn enable_ip_forward(record: &Path) -> io::Result<()> {
-    const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
+pub(crate) fn enable_ip_forward(record: &Path) -> io::Result<()> {
     if !record.exists() {
         let before = std::fs::read_to_string(IP_FORWARD)?;
         std::fs::write(record, before.trim())?;
@@ -94,8 +97,7 @@ pub fn enable_ip_forward(record: &Path) -> io::Result<()> {
 /// node uninstall`. A missing record means no agent ever ran here (or a
 /// previous uninstall already restored it) -- a no-op, not an error, the
 /// same tolerance [`remove_node_policy`] gives a missing table.
-pub fn restore_ip_forward(record: &Path) -> io::Result<()> {
-    const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
+pub(crate) fn restore_ip_forward(record: &Path) -> io::Result<()> {
     let before = match std::fs::read_to_string(record) {
         Ok(value) => value,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -106,7 +108,7 @@ pub fn restore_ip_forward(record: &Path) -> io::Result<()> {
 }
 
 /// The interface the Node's IPv4 default route goes out of, if it has one.
-pub fn default_route_iface() -> Option<String> {
+pub(crate) fn default_route_iface() -> Option<String> {
     let output = Command::new("ip")
         .args(["-o", "-4", "route", "show", "default"])
         .output()
@@ -118,34 +120,6 @@ pub fn default_route_iface() -> Option<String> {
         .map(str::to_string)
 }
 
-/// Runs `nft`, feeding it `stdin` when given, and folds its stderr into the
-/// error on failure.
 fn nft(args: &[&str], stdin: Option<&str>) -> io::Result<()> {
-    let mut child = Command::new("nft")
-        .args(args)
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let Some(input) = stdin {
-        child
-            .stdin
-            .take()
-            .expect("stdin was piped")
-            .write_all(input.as_bytes())?;
-    }
-    let output = child.wait_with_output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "nft {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )))
-    }
+    cmd::run(Command::new("nft").args(args), stdin).map(drop)
 }

@@ -15,15 +15,19 @@
 //! that file's module doc for the sudoers rule this needs.
 
 use assert_cmd::Command;
+use predicates::prelude::*;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 
 mod common;
-use common::{home, latest_kernel, repo_root, rootfs, test_agent, test_agent_path};
+use common::{
+    AGENT_OCTETS_FROM, edge_port, home, latest_kernel, repo_root, rootfs, test_agent,
+    test_agent_path, tls_edge_port,
+};
 
 /// One test's throwaway install target: a unique group, unit name, subnet
 /// and state dir, all named from this test's pid so parallel test runs
-/// (and parallel `cargo test` invocations across this file and
-/// `node_agent.rs`) never collide. `Drop` force-uninstalls, so a failed
+/// never collide, on a subnet octet below `node_agent.rs`'s. `Drop` force-uninstalls, so a failed
 /// assertion never strands a real group/systemd unit/state dir on the
 /// host.
 struct Install {
@@ -31,10 +35,15 @@ struct Install {
     group: String,
     unit_name: String,
     subnet: String,
-    /// The edge's ports are `18000 + edge` and `19000 + edge`.
+    /// Its edge's ports are [`edge_port`] and [`tls_edge_port`] of this.
     edge: u16,
     installed: bool,
+    /// Held for the install's life: ufw rewrites its rules file whole, so
+    /// two installs adding rules at once can lose one.
+    _one_at_a_time: MutexGuard<'static, ()>,
 }
+
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 impl Install {
     fn new(label: &str, edge: u16) -> Option<Install> {
@@ -50,9 +59,14 @@ impl Install {
             state_dir: home().join(format!(".cache/cirro-install-test-{label}-{pid}")),
             group: format!("cirro-test-{label}-{pid}"),
             unit_name: format!("cirro-test-{label}-{pid}"),
-            subnet: format!("10.78.{}.0/24", pid % 200 + 20),
+            // The edge offset tells this binary's tests apart, which share a pid.
+            subnet: format!(
+                "10.78.{}.0/24",
+                (pid + u32::from(edge)) % (u32::from(AGENT_OCTETS_FROM) - 20) + 20
+            ),
             edge,
             installed: false,
+            _one_at_a_time: ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner()),
         })
     }
 
@@ -75,8 +89,11 @@ impl Install {
             .arg(repo.join("jailer"))
             .arg("--kernel")
             .arg(latest_kernel())
-            .args(["--http", &format!("127.0.0.1:{}", 18000 + self.edge)])
-            .args(["--https", &format!("127.0.0.1:{}", 19000 + self.edge)]);
+            .args(["--http", &format!("127.0.0.1:{}", edge_port(self.edge))])
+            .args([
+                "--https",
+                &format!("127.0.0.1:{}", tls_edge_port(self.edge)),
+            ]);
         cmd
     }
 
@@ -177,16 +194,32 @@ fn install_creates_a_group_state_dir_and_enabled_unit_and_is_idempotent() {
     );
     assert!(install.is_enabled(), "unit not enabled");
     let unit_contents = std::fs::read_to_string(install.unit_file()).expect("read unit file");
+    let exec_start = unit_contents
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStart="))
+        .unwrap_or_else(|| panic!("unit missing ExecStart: {unit_contents}"));
+    // The agent's flags parse: `--help` only answers once everything before
+    // it has.
+    let parsed = std::process::Command::new(env!("CARGO_BIN_EXE_cirro"))
+        .args(exec_start.split_whitespace().skip(1))
+        .arg("--help")
+        .output()
+        .expect("run cirro");
     assert!(
-        unit_contents.contains("ExecStart="),
-        "unit missing ExecStart: {unit_contents}"
+        parsed.status.success(),
+        "the unit's agent arguments don't parse: {}",
+        String::from_utf8_lossy(&parsed.stderr)
     );
     assert!(
         unit_contents.contains(&install.state_dir.display().to_string()),
         "unit doesn't reference the state dir: {unit_contents}"
     );
     assert!(
-        unit_contents.contains("--http 127.0.0.1:18299 --https 127.0.0.1:19299"),
+        unit_contents.contains(&format!(
+            "--http 127.0.0.1:{} --https 127.0.0.1:{}",
+            edge_port(install.edge),
+            tls_edge_port(install.edge)
+        )),
         "unit doesn't start the agent's edge where install was told: {unit_contents}"
     );
     assert_ne!(
@@ -249,7 +282,9 @@ fn uninstall_of_a_state_dir_that_was_never_installed_fails_clearly() {
 fn install_requires_firecracker_jailer_and_kernel_together() {
     let mut cmd = Command::cargo_bin("cirro").unwrap();
     cmd.args(["node", "install", "--firecracker", "/tmp/nonexistent"]);
-    cmd.assert().failure();
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("--jailer").and(predicate::str::contains("--kernel")));
 }
 
 #[test]
