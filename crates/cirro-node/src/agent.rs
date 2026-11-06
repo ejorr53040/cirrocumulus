@@ -24,8 +24,8 @@ use crate::state::{Record, Store};
 use crate::subnet::Subnet;
 use crate::vm::{self, Stop, Vm, VmSpec, WakeSpec};
 use bytes::Bytes;
+use cirro_edge::acme::Acme;
 pub use cirro_edge::acme::AcmeConfig;
-use cirro_edge::acme::{Acme, is_public};
 use cirro_edge::tls::NodeCa;
 use cirro_edge::{Lease, Resolution, Router};
 use cirro_guest_init::config::{self as guest, Config as GuestConfig};
@@ -339,6 +339,7 @@ pub async fn run(config: Config) -> io::Result<()> {
             Some(tokio::spawn(cirro_edge::serve(
                 listener,
                 Arc::new(Edge(agent.clone())),
+                agent.acme.clone(),
             )))
         }
         None => None,
@@ -349,18 +350,14 @@ pub async fn run(config: Config) -> io::Result<()> {
             let listener = TcpListener::bind(address)
                 .await
                 .map_err(|e| io::Error::other(format!("listen for HTTPS on {address}: {e}")))?;
-            let routes = agent.clone();
-            let tls =
-                cirro_edge::tls::server_config(ca.clone(), agent.acme.clone(), move |host| {
-                    app_with_host(&routes.vms.lock().unwrap(), host).is_some()
-                        || routes.machines.app_with_host(host).is_some()
-                })?;
-            info!(%address, "HTTPS edge listening");
-            Some(tokio::spawn(cirro_edge::serve_tls(
+            let serving = cirro_edge::serve_tls(
                 listener,
                 Arc::new(Edge(agent.clone())),
-                tls,
-            )))
+                ca.clone(),
+                agent.acme.clone(),
+            )?;
+            info!(%address, "HTTPS edge listening");
+            Some(tokio::spawn(serving))
         }
         _ => None,
     };
@@ -695,11 +692,6 @@ impl Agent {
                     format!("a Machine-backed App named {:?} already exists", run.name),
                 ));
             }
-            if let Some(route) = &run.route
-                && let Some(owner) = self.machines.app_with_host(&route.host)
-            {
-                return Err(hostname_taken(&route.host, &owner, false));
-            }
             match vms.get(&run.name) {
                 Some(Entry::Starting { .. } | Entry::Running { .. }) => {
                     return Err(ApiError(
@@ -719,10 +711,10 @@ impl Agent {
                 _ => {}
             }
             if let Some(route) = &run.route
-                && let Some((owner, _)) = app_with_host(&vms, &route.host)
-                && *owner != run.name
+                && let Some(owner) = self.host_owner(&vms, &route.host)
+                && owner.name() != run.name
             {
-                return Err(hostname_taken(&route.host, owner, true));
+                return Err(owner.taken(&route.host));
             }
             let vm_address = self.free_vm_address(&vms)?;
             // Reusing an Ended VM's name replaces its record once the new VM
@@ -1296,14 +1288,11 @@ impl Agent {
     }
 
     /// Starts getting `host` a certificate from the ACME CA, in the
-    /// background, if ACME is on and `host` is public.
+    /// background, if ACME is on.
     fn get_certificate(&self, host: &str) {
         let Some(acme) = self.acme.clone() else {
             return;
         };
-        if !is_public(host) {
-            return;
-        }
         let host = host.to_string();
         tokio::spawn(async move {
             if let Err(e) = acme.ensure(&host).await {
@@ -1397,8 +1386,14 @@ impl Agent {
                 ),
             ));
         }
-        if let Some((owner, _)) = app_with_host(&vms, &request.route.host) {
-            return Err(hostname_taken(&request.route.host, owner, true));
+        if self.machines.has_app(&request.name) {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                format!("an App named {:?} already exists", request.name),
+            ));
+        }
+        if let Some(owner) = self.host_owner(&vms, &request.route.host) {
+            return Err(owner.taken(&request.route.host));
         }
         let info = self.machines.add_app(request, &self.store)?;
         self.get_certificate(&info.route.host);
@@ -1484,8 +1479,10 @@ enum Holding {
 struct Edge(Arc<Agent>);
 
 impl Router for Edge {
-    fn acme_challenge(&self, token: &str) -> Option<String> {
-        self.0.acme.as_ref()?.challenge(token)
+    fn routes(&self, host: &str) -> bool {
+        self.0
+            .host_owner(&self.0.vms.lock().unwrap(), host)
+            .is_some()
     }
 
     async fn resolve(&self, host: &str) -> Resolution {
@@ -1594,14 +1591,45 @@ fn app_with_host<'a>(
         .find(|(_, entry)| entry.route().is_some_and(|r| r.host == host))
 }
 
-/// `host` is already the Route of App `owner`, which has to stop before
-/// `rm` when it's VM-backed.
-fn hostname_taken(host: &str, owner: &str, vm_backed: bool) -> ApiError {
-    let stop = if vm_backed { "stop and " } else { "" };
-    ApiError(
-        StatusCode::CONFLICT,
-        format!("the hostname {host:?} belongs to App {owner:?}; {stop}rm it to free the hostname"),
-    )
+/// The App a hostname belongs to. VMs and Machine-backed Apps share one
+/// namespace of names and hostnames.
+enum Owner {
+    Vm(String),
+    Machine(String),
+}
+
+impl Owner {
+    fn name(&self) -> &str {
+        match self {
+            Owner::Vm(name) | Owner::Machine(name) => name,
+        }
+    }
+
+    /// `host` is already this App's, which has to stop before `rm` when
+    /// it's VM-backed.
+    fn taken(&self, host: &str) -> ApiError {
+        let (owner, stop) = match self {
+            Owner::Vm(name) => (name, "stop and "),
+            Owner::Machine(name) => (name, ""),
+        };
+        ApiError(
+            StatusCode::CONFLICT,
+            format!(
+                "the hostname {host:?} belongs to App {owner:?}; {stop}rm it to free the hostname"
+            ),
+        )
+    }
+}
+
+impl Agent {
+    /// The App whose Route has `host`, of either kind. `vms` is the VM
+    /// table, held by the caller so no VM takes the hostname meanwhile.
+    fn host_owner(&self, vms: &BTreeMap<String, Entry>, host: &str) -> Option<Owner> {
+        if let Some((name, _)) = app_with_host(vms, host) {
+            return Some(Owner::Vm(name.clone()));
+        }
+        self.machines.app_with_host(host).map(Owner::Machine)
+    }
 }
 
 /// A route's hostname is a DNS name as the edge compares it: lowercase

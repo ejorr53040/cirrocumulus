@@ -162,8 +162,8 @@ impl Machines {
     }
 
     /// Makes a Machine-backed App and reconnects its Machine to forward to
-    /// it. The caller has checked the name and hostname aren't a VM's or
-    /// a VM-backed App's, and holds the VM table so neither can be taken
+    /// it. The caller has checked the name and hostname are free, and holds
+    /// the VM table, which every add takes, so neither can be taken
     /// meanwhile.
     pub(super) fn add_app(
         &self,
@@ -171,15 +171,6 @@ impl Machines {
         store: &Mutex<Store>,
     ) -> Result<MachineAppInfo, ApiError> {
         let mut entries = self.entries.lock().unwrap();
-        if has_app(&entries, &request.name) {
-            return Err(ApiError(
-                StatusCode::CONFLICT,
-                format!("an App named {:?} already exists", request.name),
-            ));
-        }
-        if let Some(owner) = app_with_host(&entries, &request.route.host) {
-            return Err(super::hostname_taken(&request.route.host, &owner, false));
-        }
         let machine = entries.get_mut(&request.machine).ok_or_else(|| {
             ApiError(
                 StatusCode::NOT_FOUND,

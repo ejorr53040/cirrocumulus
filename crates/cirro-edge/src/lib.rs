@@ -6,6 +6,7 @@ pub mod acme;
 mod fs;
 pub mod tls;
 
+use acme::Acme;
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
@@ -19,10 +20,10 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tls::NodeCa;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
-use tokio_rustls::rustls::ServerConfig;
 use tracing::{debug, warn};
 
 /// How long a client has to finish its TLS handshake.
@@ -72,34 +73,52 @@ pub trait Router: Send + Sync + 'static {
     /// `host` is in lowercase, without a port or a trailing dot.
     fn resolve(&self, host: &str) -> impl Future<Output = Resolution> + Send;
 
-    /// The answer to an ACME HTTP-01 challenge for `token`, while one is
-    /// under way: the HTTP edge serves it at
-    /// `/.well-known/acme-challenge/<token>` for any hostname.
-    fn acme_challenge(&self, token: &str) -> Option<String> {
-        let _ = token;
-        None
-    }
+    /// Whether an App has `host`, without starting or waking anything: the
+    /// HTTPS edge makes certificates only for hostnames that route.
+    fn routes(&self, host: &str) -> bool;
 }
 
 type Body = BoxBody<Bytes, hyper::Error>;
 
 /// Serves HTTP on `listener` until the task is dropped, sending each
-/// request where `router` says.
-pub async fn serve<R: Router>(listener: TcpListener, router: Arc<R>) {
-    accept(listener, router, None).await
+/// request where `router` says. With `acme`, it also answers the ACME CA's
+/// HTTP-01 challenges, at `/.well-known/acme-challenge/<token>` for any
+/// hostname.
+pub async fn serve<R: Router>(listener: TcpListener, router: Arc<R>, acme: Option<Arc<Acme>>) {
+    accept(listener, router, None, acme).await
 }
 
-/// Serves HTTPS on `listener` with `config` until the task is dropped,
-/// sending each request where `router` says.
-pub async fn serve_tls<R: Router>(
+/// Serves HTTPS on `listener` until the task is dropped, sending each
+/// request where `router` says, with a certificate for each hostname it
+/// routes: from `acme` for a public hostname when there is one, else signed
+/// by `ca`.
+pub fn serve_tls<R: Router>(
     listener: TcpListener,
     router: Arc<R>,
-    config: Arc<ServerConfig>,
-) {
-    accept(listener, router, Some(TlsAcceptor::from(config))).await
+    ca: Arc<NodeCa>,
+    acme: Option<Arc<Acme>>,
+) -> std::io::Result<impl Future<Output = ()> + Send> {
+    let routes = router.clone();
+    let config = tls::server_config(ca, acme, move |host| routes.routes(host))?;
+    Ok(accept(
+        listener,
+        router,
+        Some(TlsAcceptor::from(config)),
+        None,
+    ))
 }
 
-async fn accept<R: Router>(listener: TcpListener, router: Arc<R>, tls: Option<TlsAcceptor>) {
+/// `host` as the edge compares hostnames: lowercase, without a trailing dot.
+fn normalize(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+async fn accept<R: Router>(
+    listener: TcpListener,
+    router: Arc<R>,
+    tls: Option<TlsAcceptor>,
+    acme: Option<Arc<Acme>>,
+) {
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(conn) => conn,
@@ -112,16 +131,17 @@ async fn accept<R: Router>(listener: TcpListener, router: Arc<R>, tls: Option<Tl
         };
         let router = router.clone();
         let tls = tls.clone();
+        let acme = acme.clone();
         tokio::spawn(async move {
             let Some(tls) = tls else {
-                return serve_connection(stream, router, peer, Scheme::Http).await;
+                return serve_connection(stream, router, peer, Scheme::Http { acme }).await;
             };
             match tokio::time::timeout(HANDSHAKE_TIMEOUT, tls.accept(stream)).await {
                 Ok(Ok(stream)) => {
                     // The resolver only answers a client with an SNI name.
                     let sni = stream.get_ref().1.server_name().unwrap_or_default();
                     let scheme = Scheme::Https {
-                        sni: sni.trim_end_matches('.').to_ascii_lowercase(),
+                        sni: normalize(sni),
                     };
                     serve_connection(stream, router, peer, scheme).await
                 }
@@ -135,19 +155,18 @@ async fn accept<R: Router>(listener: TcpListener, router: Arc<R>, tls: Option<Tl
 /// What a client connection arrived over.
 #[derive(Clone)]
 enum Scheme {
-    Http,
+    /// With the ACME CA whose challenges it answers, when there is one.
+    Http { acme: Option<Arc<Acme>> },
     /// With the hostname the client named in its TLS handshake, which its
     /// certificate was chosen for.
-    Https {
-        sni: String,
-    },
+    Https { sni: String },
 }
 
 impl Scheme {
     /// Its `X-Forwarded-Proto` value.
     fn proto(&self) -> &'static str {
         match self {
-            Scheme::Http => "http",
+            Scheme::Http { .. } => "http",
             Scheme::Https { .. } => "https",
         }
     }
@@ -187,12 +206,12 @@ async fn handle<R: Router>(
             "the request names no host\n".into(),
         );
     };
-    if let Scheme::Http = scheme
+    if let Scheme::Http { acme: Some(acme) } = scheme
         && let Some(token) = req
             .uri()
             .path()
             .strip_prefix("/.well-known/acme-challenge/")
-        && let Some(answer) = router.acme_challenge(token)
+        && let Some(answer) = acme.challenge(token)
     {
         return text(StatusCode::OK, answer);
     }
@@ -238,7 +257,7 @@ fn host_of(req: &Request<Incoming>) -> Option<String> {
             authority.host().to_string()
         }
     };
-    let host = raw.trim_end_matches('.').to_ascii_lowercase();
+    let host = normalize(&raw);
     (!host.is_empty()).then_some(host)
 }
 

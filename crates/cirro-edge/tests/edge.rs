@@ -16,13 +16,17 @@ impl Router for To {
     async fn resolve(&self, _host: &str) -> Resolution {
         Resolution::Upstream(self.0, Lease::new(()))
     }
+
+    fn routes(&self, _host: &str) -> bool {
+        true
+    }
 }
 
 /// An edge in front of `upstream`, and the address it listens on.
 async fn edge(upstream: SocketAddr) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    tokio::spawn(cirro_edge::serve(listener, Arc::new(To(upstream))));
+    tokio::spawn(cirro_edge::serve(listener, Arc::new(To(upstream)), None));
     address
 }
 

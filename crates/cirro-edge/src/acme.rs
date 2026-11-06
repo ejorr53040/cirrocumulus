@@ -144,10 +144,13 @@ impl Acme {
             .then(|| certificate.certified.clone())
     }
 
-    /// Orders a certificate for `host` unless it has one with more than
-    /// a month left, an order for it is under way, or its last
+    /// Orders a certificate for `host` unless it isn't public, has one with
+    /// more than a month left, an order for it is under way, or its last
     /// order failed too recently to try again.
     pub async fn ensure(&self, host: &str) -> Result<(), String> {
+        if !is_public(host) {
+            return Ok(());
+        }
         let fresh = self
             .certificates
             .lock()

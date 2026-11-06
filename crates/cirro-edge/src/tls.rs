@@ -165,7 +165,7 @@ fn ca_params() -> CertificateParams {
 /// CA, and until it has one the handshake fails; every other hostname's is
 /// signed by `ca` the first time a client asks for it. A hostname no App
 /// has gets no certificate, so the handshake fails.
-pub fn server_config(
+pub(crate) fn server_config(
     ca: Arc<NodeCa>,
     acme: Option<Arc<Acme>>,
     routed: impl Fn(&str) -> bool + Send + Sync + 'static,
@@ -210,7 +210,7 @@ impl ResolvesServerCert for HostCertificates {
             debug!("TLS client sent no SNI hostname");
             return None;
         };
-        let host = name.trim_end_matches('.').to_ascii_lowercase();
+        let host = crate::normalize(name);
         if !(self.routed)(&host) {
             return None;
         }
