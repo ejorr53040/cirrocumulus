@@ -40,6 +40,9 @@ pub struct Dashboard {
     confirming_stop: Option<String>,
     /// A one-off message in place of the key help.
     status: Option<String>,
+    /// Whether `status` says a refresh failed, which the next one that
+    /// works takes back.
+    refresh_failed: bool,
 }
 
 /// The column the VM table is sorted by.
@@ -65,9 +68,12 @@ impl Sort {
 }
 
 impl Dashboard {
-    /// Shows `stats`. The selected VM stays selected; if it has gone, the
-    /// first row is.
+    /// Shows `stats`, and takes back a failed refresh's message. The
+    /// selected VM stays selected; if it has gone, the first row is.
     pub fn set_stats(&mut self, stats: Stats) {
+        if std::mem::take(&mut self.refresh_failed) {
+            self.status = None;
+        }
         self.stats = stats;
         self.sort_vms();
         if self.selected_row().is_none() {
@@ -103,16 +109,20 @@ impl Dashboard {
     /// Shows `message` in place of the key help until the next key.
     pub fn set_status(&mut self, message: String) {
         self.status = Some(message);
+        self.refresh_failed = false;
     }
 
-    /// Brings the key help back, as when a refresh that failed recovers.
-    pub fn clear_status(&mut self) {
-        self.status = None;
+    /// Shows why a refresh failed until the next key, or until a refresh
+    /// works and [`Dashboard::set_stats`] brings the key help back.
+    pub fn set_refresh_error(&mut self, error: String) {
+        self.status = Some(error);
+        self.refresh_failed = true;
     }
 
     /// Handles a key press, and says what the CLI should do about it.
     pub fn key(&mut self, key: KeyCode) -> Action {
         self.status = None;
+        self.refresh_failed = false;
         if let Some(name) = self.confirming_stop.take() {
             return match key {
                 KeyCode::Char('y') => Action::Stop(name),
@@ -129,9 +139,6 @@ impl Dashboard {
                 (_, None) => {}
             },
             KeyCode::Char('k') => self.confirming_stop = selected,
-            KeyCode::Char('s' | 'p' | 'w') => {
-                self.status = Some("shell, park and wake are not yet implemented".into());
-            }
             KeyCode::Down => self.move_selection(1),
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Tab => {
@@ -159,7 +166,6 @@ impl Dashboard {
         self.stats.vms.iter().position(|vm| &vm.info.name == name)
     }
 
-    /// Draws everything into `frame`.
     pub fn draw(&self, frame: &mut Frame) {
         // Borders and a header row around the Machine-backed Apps; none at all
         // when there are none.
@@ -344,7 +350,7 @@ impl Dashboard {
     }
 }
 
-const HELP: &str = " q quit  ↑↓ select  tab sort  l log  k stop  s shell  p park  w wake";
+const HELP: &str = " q quit  ↑↓ select  tab sort  l log  k stop";
 
 /// A sparkline of the newest samples in `data` that fit `area` (it holds
 /// a minute, oldest first, which is more than most areas are wide), scaled

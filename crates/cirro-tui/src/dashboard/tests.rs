@@ -215,22 +215,28 @@ fn k_stops_the_selected_vm_only_once_confirmed() {
     );
 }
 
+fn footer(dashboard: &Dashboard) -> String {
+    screen(dashboard).last().unwrap().clone()
+}
+
 #[test]
-fn keys_for_what_isnt_built_yet_say_so() {
+fn a_status_lasts_until_the_next_key_and_a_failed_refresh_until_one_works() {
     let mut dashboard = Dashboard::default();
     dashboard.set_stats(stats());
 
-    for key in ['s', 'p', 'w'] {
-        assert_eq!(dashboard.key(KeyCode::Char(key)), Action::None);
-        let all = screen(&dashboard).join("\n");
-        assert!(all.contains("not yet implemented"), "{key}: {all}");
-    }
-    // The message lasts until the next key; then the help is back.
+    dashboard.set_status("stopped web".into());
+    dashboard.set_stats(stats());
+    assert!(footer(&dashboard).contains("stopped web"));
     dashboard.key(KeyCode::Down);
-    let help = screen(&dashboard).last().unwrap().clone();
+    let help = footer(&dashboard);
     for key in ["q quit", "tab sort", "l log", "k stop"] {
         assert!(help.contains(key), "help lacks {key}: {help}");
     }
+
+    dashboard.set_refresh_error("the agent is gone".into());
+    assert!(footer(&dashboard).contains("the agent is gone"));
+    dashboard.set_stats(stats());
+    assert!(footer(&dashboard).contains("q quit"));
 }
 
 /// A minute of history is wider than a sparkline: the newest samples are

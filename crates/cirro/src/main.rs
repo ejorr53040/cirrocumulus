@@ -766,7 +766,6 @@ async fn top_loop(socket: &Path, terminal: &mut ratatui::DefaultTerminal) -> Res
     use ratatui::crossterm::event::{self, Event, KeyEventKind};
     let mut dashboard = cirro_tui::Dashboard::default();
     let mut next_refresh = std::time::Instant::now();
-    let mut refresh_failed = false;
     // Stops run in the background (a graceful one can take its whole
     // timeout) and report back here.
     let (stopped, mut stop_results) = tokio::sync::mpsc::unbounded_channel();
@@ -781,14 +780,8 @@ async fn top_loop(socket: &Path, terminal: &mut ratatui::DefaultTerminal) -> Res
                 Ok((stats, machine_apps)) => {
                     dashboard.set_stats(stats.unwrap_or_default());
                     dashboard.set_machine_apps(machine_apps.unwrap_or_default());
-                    if std::mem::take(&mut refresh_failed) {
-                        dashboard.clear_status();
-                    }
                 }
-                Err(e) => {
-                    refresh_failed = true;
-                    dashboard.set_status(e);
-                }
+                Err(e) => dashboard.set_refresh_error(e),
             }
             next_refresh = std::time::Instant::now() + Duration::from_secs(1);
         }
