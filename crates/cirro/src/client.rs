@@ -12,21 +12,27 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::path::Path;
 
-/// Sends one request and decodes a JSON response body, `None` when the
-/// body is empty. Any failure comes back as the message the CLI prints.
+/// Sends one request and decodes its JSON response body. Any failure comes
+/// back as the message the CLI prints.
 pub(crate) async fn call<T: DeserializeOwned>(
     socket: &Path,
     method: Method,
     path: &str,
     body: Option<&impl Serialize>,
-) -> Result<Option<T>, String> {
+) -> Result<T, String> {
     let (_, body) = send(socket, method, path, body).await?;
-    if body.is_empty() {
-        return Ok(None);
-    }
     serde_json::from_slice(&body)
-        .map(Some)
         .map_err(|e| format!("unexpected response from the Node agent: {e}"))
+}
+
+/// Sends one request whose response has no body.
+pub(crate) async fn call_empty(
+    socket: &Path,
+    method: Method,
+    path: &str,
+    body: Option<&impl Serialize>,
+) -> Result<(), String> {
+    send(socket, method, path, body).await.map(drop)
 }
 
 /// Sends one request and returns a successful response's headers and raw

@@ -511,9 +511,7 @@ async fn run(socket: &Path, args: RunArgs) -> Result<(), String> {
         route,
     )
     .await?;
-    let vm: VmInfo = client::call(socket, Method::POST, "/vms", Some(&request))
-        .await?
-        .ok_or("the Node agent returned no VM")?;
+    let vm: VmInfo = client::call(socket, Method::POST, "/vms", Some(&request)).await?;
     let address = vm
         .vm_address
         .ok_or("the Node agent returned no VM address")?;
@@ -778,8 +776,8 @@ async fn top_loop(socket: &Path, terminal: &mut ratatui::DefaultTerminal) -> Res
             };
             match refreshed.await {
                 Ok((stats, machine_apps)) => {
-                    dashboard.set_stats(stats.unwrap_or_default());
-                    dashboard.set_machine_apps(machine_apps.unwrap_or_default());
+                    dashboard.set_stats(stats);
+                    dashboard.set_machine_apps(machine_apps);
                 }
                 Err(e) => dashboard.set_refresh_error(e),
             }
@@ -835,13 +833,9 @@ async fn top_loop(socket: &Path, terminal: &mut ratatui::DefaultTerminal) -> Res
 }
 
 async fn top_once(socket: &Path) -> Result<(), String> {
-    let stats: Stats = client::call(socket, Method::GET, "/stats", None::<&()>)
-        .await?
-        .unwrap_or_default();
+    let stats: Stats = client::call(socket, Method::GET, "/stats", None::<&()>).await?;
     let machine_apps: Vec<MachineAppInfo> =
-        client::call(socket, Method::GET, "/machine-apps", None::<&()>)
-            .await?
-            .unwrap_or_default();
+        client::call(socket, Method::GET, "/machine-apps", None::<&()>).await?;
     print!("{}", cirro_tui::snapshot(&stats, &machine_apps));
     Ok(())
 }
@@ -855,16 +849,12 @@ async fn node_ca(socket: &Path) -> Result<(), String> {
 
 async fn ps(socket: &Path, all: bool) -> Result<(), String> {
     let path = if all { "/vms?all=true" } else { "/vms" };
-    let vms: Vec<VmInfo> = client::call(socket, Method::GET, path, None::<&()>)
-        .await?
-        .unwrap_or_default();
+    let vms: Vec<VmInfo> = client::call(socket, Method::GET, path, None::<&()>).await?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let machine_apps: Vec<MachineAppInfo> =
-        client::call(socket, Method::GET, "/machine-apps", None::<&()>)
-            .await?
-            .unwrap_or_default();
+        client::call(socket, Method::GET, "/machine-apps", None::<&()>).await?;
     let mut header = ps_row([
         "NAME",
         "VM ADDRESS",
@@ -999,8 +989,7 @@ async fn wake(socket: &Path, name: &str) -> Result<(), String> {
         &format!("/vms/{name}/wake"),
         None::<&()>,
     )
-    .await?
-    .ok_or("the Node agent answered the wake with no VM")?;
+    .await?;
     match vm.vm_address {
         Some(address) => {
             println!("{address}");
@@ -1032,9 +1021,7 @@ async fn machine_command(socket: &Path, command: MachineCommand) -> Result<(), S
         }
         MachineCommand::Ls => {
             let machines: Vec<MachineInfo> =
-                client::call(socket, Method::GET, "/machines", None::<&()>)
-                    .await?
-                    .unwrap_or_default();
+                client::call(socket, Method::GET, "/machines", None::<&()>).await?;
             println!(
                 "{:<32} {:<32} {:<50} {:<11}  ERROR",
                 "NAME", "SSH", "HOST KEY", "STATUS"
@@ -1051,14 +1038,15 @@ async fn machine_command(socket: &Path, command: MachineCommand) -> Result<(), S
             }
             Ok(())
         }
-        MachineCommand::Rm { name } => client::call::<()>(
-            socket,
-            Method::DELETE,
-            &format!("/machines/{name}"),
-            None::<&()>,
-        )
-        .await
-        .map(drop),
+        MachineCommand::Rm { name } => {
+            client::call_empty(
+                socket,
+                Method::DELETE,
+                &format!("/machines/{name}"),
+                None::<&()>,
+            )
+            .await
+        }
         MachineCommand::Key => {
             let (_, key) = client::send(socket, Method::GET, "/ssh-key", None::<&()>).await?;
             std::io::stdout()
@@ -1072,9 +1060,8 @@ async fn machine_command(socket: &Path, command: MachineCommand) -> Result<(), S
 /// returns it once the user says it's the Machine's.
 async fn confirm_host_key(socket: &Path, ssh: &str) -> Result<String, String> {
     let scan = MachineScan { ssh: ssh.into() };
-    let found: MachineHostKey = client::call(socket, Method::POST, "/machines/scan", Some(&scan))
-        .await?
-        .ok_or("the Node agent returned no host key")?;
+    let found: MachineHostKey =
+        client::call(socket, Method::POST, "/machines/scan", Some(&scan)).await?;
     print!(
         "{ssh} presents the host key {}\nCheck it on the Machine with `ssh-keygen -lf \
          /etc/ssh/ssh_host_ed25519_key.pub`. Trust it? [y/N] ",
@@ -1094,9 +1081,7 @@ async fn confirm_host_key(socket: &Path, ssh: &str) -> Result<String, String> {
 }
 
 async fn rm(socket: &Path, name: &str) -> Result<(), String> {
-    client::call::<()>(socket, Method::DELETE, &format!("/vms/{name}"), None::<&()>)
-        .await
-        .map(drop)
+    client::call_empty(socket, Method::DELETE, &format!("/vms/{name}"), None::<&()>).await
 }
 
 /// Parses `--mem`: a count of MiB with an optional `M`/`G` suffix.
