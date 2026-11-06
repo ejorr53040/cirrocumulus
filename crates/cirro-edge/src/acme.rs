@@ -1,7 +1,7 @@
 //! Certificates from an ACME CA (Let's Encrypt by default) for Apps whose
 //! hostnames are public, proved over HTTP-01: the CA fetches a token from
 //! `http://<host>/.well-known/acme-challenge/<token>`, which the HTTP edge
-//! answers (see [`crate::Router::acme_challenge`]), so the edge must be
+//! answers (see [`Acme::challenge`]), so the edge must be
 //! reachable on port 80 under that hostname (ADR 0008).
 //!
 //! Kept in the agent's state dir, root-only: the account, one per ACME
@@ -61,7 +61,7 @@ const NOT_PUBLIC: [&str; 12] = [
 ];
 
 /// Whether `host` can have a certificate from a public ACME CA.
-pub fn is_public(host: &str) -> bool {
+pub(crate) fn is_public(host: &str) -> bool {
     host.contains('.')
         && host.rsplit('.').next().is_some_and(|tld| {
             !NOT_PUBLIC.contains(&tld) && !tld.bytes().all(|b| b.is_ascii_digit())
@@ -146,6 +146,9 @@ impl Acme {
     /// more than a month left, an order for it is under way, or its last
     /// order failed too recently to try again.
     pub async fn ensure(&self, host: &str) -> Result<(), String> {
+        if !crate::is_hostname(host) {
+            return Err(format!("{host:?} isn't a hostname"));
+        }
         if !is_public(host) {
             return Ok(());
         }

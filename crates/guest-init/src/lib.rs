@@ -5,3 +5,7 @@
 //! build script can find and build the binary.
 
 pub mod config;
+
+/// Printed on the console as a host shutdown request is forwarded to the
+/// app as `SIGTERM`.
+pub const FORWARDING_MARKER: &str = "GUEST_INIT_FORWARDING_SIGTERM";

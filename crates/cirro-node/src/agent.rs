@@ -1393,19 +1393,11 @@ impl Agent {
     }
 }
 
-/// A route's hostname is a DNS name as the edge compares it: lowercase
-/// labels of letters, digits and inner hyphens, without a trailing dot.
+/// A route's hostname is one the edge accepts ([`cirro_edge::is_hostname`]),
+/// and its port isn't 0.
 fn validate_route(route: &Route) -> Result<(), ApiError> {
     let host = &route.host;
-    let label_ok = |label: &str| {
-        (1..=63).contains(&label.len())
-            && label
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-            && !label.starts_with('-')
-            && !label.ends_with('-')
-    };
-    if host.len() > 253 || !host.split('.').all(label_ok) {
+    if !cirro_edge::is_hostname(host) {
         return Err(bad_request(&format!(
             "{host:?} isn't a hostname: use lowercase letters, digits, hyphens and dots, \
              like web.example.com"

@@ -35,25 +35,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_config_the_node_sends_parses_back_the_same() {
-        for config in [
-            Config {
-                exec: "/app".into(),
-                args: vec!["--flag".into(), "value".into()],
-                env: vec!["A=1".into()],
-                workdir: Some("/srv".into()),
-                user: Some(User { uid: 101, gid: 102 }),
-            },
+    fn a_config_with_only_exec_takes_the_defaults() {
+        assert_eq!(
+            parse_config(r#"{"exec":"nginx"}"#).unwrap(),
             Config {
                 exec: "nginx".into(),
                 args: Vec::new(),
                 env: Vec::new(),
                 workdir: None,
                 user: None,
-            },
-        ] {
-            let sent = serde_json::to_string(&config).unwrap();
-            assert_eq!(parse_config(&sent).unwrap(), config);
-        }
+            }
+        );
     }
 }

@@ -232,7 +232,13 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           "$HOME/.cargo/bin/rustup" toolchain install
       - name: cirro-image tests
-        run: cargo test --locked -p cirro-image
+        # This job exists to run the ext4 tests, so one that skips fails it.
+        run: |
+          cargo test --locked -p cirro-image 2>&1 | tee image-tests.log
+          if grep -q "^skipping:" image-tests.log; then
+            echo "::error::ext4 tests skipped instead of running; see the log for why"
+            exit 1
+          fi
 
   every-commit-builds:
     # Keeps history bisectable: each commit in a PR must pass clippy on its

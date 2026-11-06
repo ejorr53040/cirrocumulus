@@ -108,6 +108,21 @@ pub fn serve_tls<R: Router>(
     ))
 }
 
+/// Whether `host` is a hostname in the form the edge compares them: dot-
+/// separated labels of lowercase letters, digits and inner hyphens, with no
+/// trailing dot, so it is also safe in a file name.
+pub fn is_hostname(host: &str) -> bool {
+    let label_ok = |label: &str| {
+        (1..=63).contains(&label.len())
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    };
+    host.len() <= 253 && host.split('.').all(label_ok)
+}
+
 /// `host` as the edge compares hostnames: lowercase, without a trailing dot.
 fn normalize(host: &str) -> String {
     host.trim_end_matches('.').to_ascii_lowercase()

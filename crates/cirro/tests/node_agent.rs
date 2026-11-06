@@ -21,6 +21,7 @@
 //! `scripts/step0/.build` (`scripts/step0/fetch_kernel.sh`).
 
 use assert_cmd::Command;
+use cirro_guest_init::FORWARDING_MARKER;
 use cirro_proto::LOG_CHUNK;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::{Pid, getgid};
@@ -1039,7 +1040,7 @@ fn graceful_stop_forces_a_vm_that_ignores_sigterm_after_its_timeout() {
     let ended = row(&ps, "stubborn").unwrap_or_else(|| panic!("ps -a lacks stubborn:\n{ps}"));
     assert!(ended.contains("forced"), "end reason missing: {ended}");
     // guest-init did pass the stop on, and the command ignored it.
-    wait_for_log(&agent, "stubborn", "GUEST_INIT_FORWARDING_SIGTERM");
+    wait_for_log(&agent, "stubborn", FORWARDING_MARKER);
     agent.assert_no_cirro_state();
 }
 
@@ -1311,7 +1312,7 @@ fn logs_follow_streams_a_running_vm_until_it_ends() {
         .read_to_string(&mut output)
         .unwrap();
     // Output from before and after the stop: it followed, not just dumped.
-    for marker in ["HTTP_FIXTURE_LISTENING", "GUEST_INIT_FORWARDING_SIGTERM"] {
+    for marker in ["HTTP_FIXTURE_LISTENING", FORWARDING_MARKER] {
         assert!(
             output.contains(marker),
             "logs -f missed {marker}:\n{output}"
