@@ -1196,11 +1196,10 @@ impl Agent {
             .values()
             .filter_map(Entry::vm_address)
             .collect();
-        for owner in vm::host_state_owners(&self.node) {
-            if let Some(vm_address) = self.subnet.vm_address_with_low16(owner)
-                && !held.contains(&vm_address)
-            {
-                vm::clean_up(&self.node, vm_address).await;
+        let jails = self.node.jails();
+        for vm_address in vm::host_state_in(&jails, &self.subnet) {
+            if !held.contains(&vm_address) {
+                vm::clean_up(&jails, vm_address).await;
             }
         }
     }
@@ -1456,7 +1455,7 @@ impl Agent {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         // Only succeed once empty, so a jail still in use is never removed.
-        let _ = std::fs::remove_dir(self.node.jail_base.join("firecracker"));
+        let _ = std::fs::remove_dir(self.node.jails());
         let _ = std::fs::remove_dir(&self.node.jail_base);
         let _ = std::fs::remove_dir(&self.parked_dir);
         let _ = std::fs::remove_dir(vm::parent_cgroup());

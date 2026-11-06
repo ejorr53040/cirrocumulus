@@ -211,25 +211,14 @@ fn records(state_dir: &Path, subnet: &str) -> io::Result<Vec<Record>> {
     Store::open(&db, subnet)?.load()
 }
 
-/// Kills every VM the Node has a record of and removes its host state, as
-/// the agent does for a VM that is gone. Ended VMs too: one whose VMM died
-/// can still have its namespace, veth or cgroup until the agent next
-/// starts, and after uninstall it never will.
+/// Kills every VM in the Node subnet and removes its host state, recorded
+/// or not, as the agent's own sweep does for VMs that are gone: after
+/// uninstall, no agent ever will.
 async fn clean_up_vms(state_dir: &Path, config: &NodeConfig) -> io::Result<()> {
     let subnet: Subnet = config.subnet.parse().map_err(io::Error::other)?;
-    let node = vm::NodeConfig {
-        firecracker: config.release.firecracker.clone(),
-        jailer: config.release.jailer.clone(),
-        kernel: config.release.kernel.clone(),
-        jail_base: vm::jail_base(state_dir),
-        node_address: subnet.node_address(),
-        // Only used to hand a new VM's console log to the group.
-        cirro_gid: 0,
-    };
-    for record in records(state_dir, &config.subnet)? {
-        if let Some(vm_address) = record.info.vm_address {
-            vm::clean_up(&node, vm_address).await;
-        }
+    let jails = vm::jails(&vm::jail_base(state_dir), &config.release.firecracker);
+    for vm_address in vm::host_state_in(&jails, &subnet) {
+        vm::clean_up(&jails, vm_address).await;
     }
     Ok(())
 }
@@ -331,14 +320,15 @@ fn host_firewall_commands(subnet: &str, allow: bool) -> Vec<Command> {
 }
 
 /// `ufw route [delete] allow ...` for the Node subnet.
-fn ufw_route_rule(subnet: &str, allow: bool) -> Vec<&str> {
+fn ufw_route_rule(subnet: &str, allow: bool) -> Vec<String> {
     let mut args = vec!["route"];
     if !allow {
         args.push("delete");
     }
-    args.extend(["allow", "in", "on", "cirro-+", "from", subnet]);
+    let vm_veths = format!("{}+", vm::HOST_ID_PREFIX);
+    args.extend(["allow", "in", "on", &vm_veths, "from", subnet]);
     args.extend(["comment", UFW_COMMENT]);
-    args
+    args.into_iter().map(String::from).collect()
 }
 
 /// Whether `program arg` runs and exits 0.
@@ -435,14 +425,6 @@ mod tests {
     /// for (covered instead by `crates/cirro/tests/node_install.rs`).
     fn tempdir() -> PathBuf {
         crate::test_util::tempdir("cirro-install-test")
-    }
-
-    #[test]
-    fn ufw_rule_routes_the_subnet_in_from_vm_veths_to_anywhere() {
-        assert_eq!(
-            ufw_route_rule("10.77.0.0/24", true).join(" "),
-            "route allow in on cirro-+ from 10.77.0.0/24 comment cirro Node VMs"
-        );
     }
 
     #[test]

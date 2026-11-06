@@ -6,7 +6,6 @@ pub mod agent;
 pub mod egress;
 pub mod firecracker;
 pub mod install;
-pub mod jailer;
 pub mod metrics;
 pub mod release;
 pub mod rootfs_open;

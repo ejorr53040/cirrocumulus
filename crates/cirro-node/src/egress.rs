@@ -20,6 +20,7 @@
 //! Letting VM traffic past such a firewall is therefore the firewall's own
 //! configuration, which `cirro node install` sets up (#11).
 
+use crate::vm::HOST_ID_PREFIX;
 use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -52,12 +53,12 @@ pub fn ensure_node_policy(subnet: &str, egress_iface: Option<&str>) -> io::Resul
          flush chain ip {TABLE} forward\n\
          flush chain ip {TABLE} input\n\
          add rule ip {TABLE} postrouting ip saddr @node_subnets oifname @egress_ifaces masquerade\n\
-         add rule ip {TABLE} forward iifname \"cirro-*\" ip saddr != @node_subnets drop\n\
-         add rule ip {TABLE} forward iifname \"cirro-*\" ip saddr @node_subnets tcp dport 25 drop\n\
-         add rule ip {TABLE} forward iifname \"cirro-*\" ip saddr @node_subnets ip daddr @node_subnets drop\n\
-         add rule ip {TABLE} forward iifname \"cirro-*\" ip saddr @node_subnets ip daddr @lan drop\n\
-         add rule ip {TABLE} input iifname \"cirro-*\" ip saddr != @node_subnets drop\n\
-         add rule ip {TABLE} input iifname \"cirro-*\" ip saddr @node_subnets ct state new drop\n\
+         add rule ip {TABLE} forward iifname \"{HOST_ID_PREFIX}*\" ip saddr != @node_subnets drop\n\
+         add rule ip {TABLE} forward iifname \"{HOST_ID_PREFIX}*\" ip saddr @node_subnets tcp dport 25 drop\n\
+         add rule ip {TABLE} forward iifname \"{HOST_ID_PREFIX}*\" ip saddr @node_subnets ip daddr @node_subnets drop\n\
+         add rule ip {TABLE} forward iifname \"{HOST_ID_PREFIX}*\" ip saddr @node_subnets ip daddr @lan drop\n\
+         add rule ip {TABLE} input iifname \"{HOST_ID_PREFIX}*\" ip saddr != @node_subnets drop\n\
+         add rule ip {TABLE} input iifname \"{HOST_ID_PREFIX}*\" ip saddr @node_subnets ct state new drop\n\
          add element ip {TABLE} node_subnets {{ {subnet} }}\n"
     );
     if let Some(iface) = egress_iface {

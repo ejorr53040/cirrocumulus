@@ -37,7 +37,7 @@ expect "other CI scripts" "$nothing" $'scripts/ci/check-commits.sh\n.githooks/pr
 expect "one crate" $'rust=true\nsupply_chain=true\ncrates=cirro-node' \
     'crates/cirro-node/src/egress.rs'
 expect "two crates, sorted and deduplicated" $'rust=true\nsupply_chain=true\ncrates=cirro-node guest-init' \
-    $'crates/guest-init/src/main.rs\ncrates/cirro-node/src/egress.rs\ncrates/cirro-node/tests/jailer.rs'
+    $'crates/guest-init/src/main.rs\ncrates/cirro-node/src/egress.rs\ncrates/cirro-node/tests/boot.rs'
 expect "crate plus docs" $'rust=true\nsupply_chain=true\ncrates=cirro' \
     $'crates/cirro/src/main.rs\nCONTEXT.md'
 
