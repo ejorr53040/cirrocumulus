@@ -31,8 +31,8 @@ use cirro_edge::{Lease, Resolution, Router};
 use cirro_guest_init::config::{self as guest, Config as GuestConfig};
 use cirro_proto::{
     AddMachine, DEFAULT_STOP_TIMEOUT_SECS, EndReason, Ended, ErrorBody, LOG_CHUNK, MAX_MEM_MIB,
-    MAX_VCPUS, MIN_MEM_MIB, MIN_VCPUS, MachineAppRequest, MachineHostKey, MachineScan, Route,
-    RunRequest, Stats, StopRequest, VM_STATE_HEADER, VmInfo, VmStats,
+    MAX_VCPUS, MIN_MEM_MIB, MIN_VCPUS, MachineAppInfo, MachineAppRequest, MachineHostKey,
+    MachineScan, Route, RunRequest, Stats, StopRequest, VM_STATE_HEADER, VmInfo, VmStats,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -56,7 +56,12 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 use tracing::{Instrument, error, info, info_span, warn};
 
+mod api;
+mod edge;
 mod machine;
+
+use api::{ApiError, ApiResponse, bad_request, internal};
+use edge::Edge;
 
 /// How long the edge holds a request for an App that is starting or waking
 /// before answering 503.
@@ -473,130 +478,7 @@ fn refuse_if_already_running(socket: &Path) -> io::Result<()> {
     }
 }
 
-type ApiResponse = Response<Full<Bytes>>;
-
 impl Agent {
-    async fn handle(self: Arc<Self>, req: Request<Incoming>, cred: UCred) -> ApiResponse {
-        let method = req.method().clone();
-        let path = req.uri().path().to_string();
-        let query = req.uri().query().unwrap_or("").to_string();
-        let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
-        // Path names are validated here, once, so no handler echoes an
-        // unvalidated string back. `run_vm` validates the name in its body.
-        if let ["vms", name, ..] = segments.as_slice()
-            && let Err(e) = validate_name("VM", name)
-        {
-            return json(e.0, &ErrorBody { error: e.1 });
-        }
-        if let ["machines", name, ..] = segments.as_slice()
-            && let Err(e) = validate_name("Machine", name)
-        {
-            return json(e.0, &ErrorBody { error: e.1 });
-        }
-        if let ["vms", name, action] = segments.as_slice()
-            && self.machines.has_app(name)
-        {
-            let cant = match *action {
-                "logs" => "it has no log of it".to_string(),
-                action => format!("it can't {action} it"),
-            };
-            let error = format!(
-                "{name:?} is a Machine-backed App: Cirrocumulus doesn't run what serves it, so \
-                 {cant}; `cirro rm {name}` takes it off the edge"
-            );
-            return json(StatusCode::CONFLICT, &ErrorBody { error });
-        }
-        let result = match (&method, segments.as_slice()) {
-            (&Method::GET, ["machine-apps"]) => Ok(json(StatusCode::OK, &self.machines.apps())),
-            (&Method::POST, ["machine-apps"]) => match read_json::<MachineAppRequest>(req).await {
-                Ok(request) => self.run_on_machine(request),
-                Err(e) => Err(e),
-            },
-            (&Method::GET, ["stats"]) => Ok(json(StatusCode::OK, &self.stats())),
-            (&Method::GET, ["ca"]) => self.ca_pem(),
-            (&Method::GET, ["vms"]) => {
-                let all = query_param(&query, "all") == Some("true");
-                Ok(json(StatusCode::OK, &self.list(all)))
-            }
-            (&Method::POST, ["vms"]) => match read_json::<RunRequest>(req).await {
-                Ok(run) => self.run_vm(run, cred).await,
-                Err(e) => Err(e),
-            },
-            (&Method::POST, ["vms", name, "stop"]) => {
-                let name = name.to_string();
-                match read_json::<StopRequest>(req).await {
-                    Ok(stop) => self.stop_vm(&name, stop).await,
-                    Err(e) => Err(e),
-                }
-            }
-            (&Method::POST, ["vms", name, "park"]) => {
-                let name = name.to_string();
-                self.park_vm(name).await
-            }
-            (&Method::POST, ["vms", name, "wake"]) => {
-                let name = name.to_string();
-                self.wake_vm(name).await
-            }
-            (&Method::GET, ["vms", name, "logs"]) => {
-                let offset = query_param(&query, "offset")
-                    .map(|o| o.parse::<u64>())
-                    .transpose()
-                    .map_err(|_| bad_request("offset must be a byte count"));
-                offset.and_then(|offset| self.logs(name, offset.unwrap_or(0)))
-            }
-            (&Method::DELETE, ["vms", name]) => self.remove(name),
-            (&Method::GET, ["ssh-key"]) => self.machines.public_key().map(|key| {
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "text/plain")
-                    .body(Full::new(Bytes::from(key)))
-                    .expect("build key response")
-            }),
-            (&Method::GET, ["machines"]) => Ok(json(StatusCode::OK, &self.machines.list())),
-            (&Method::POST, ["machines", "scan"]) => match read_json::<MachineScan>(req).await {
-                Ok(scan) => self
-                    .machines
-                    .scan(&scan.ssh)
-                    .await
-                    .map(|host_key| json(StatusCode::OK, &MachineHostKey { host_key })),
-                Err(e) => Err(e),
-            },
-            (&Method::POST, ["machines"]) => match read_json::<AddMachine>(req).await {
-                Ok(add) => self
-                    .machines
-                    .add(add, &self.store)
-                    .await
-                    .map(|info| json(StatusCode::CREATED, &info)),
-                Err(e) => Err(e),
-            },
-            (&Method::DELETE, ["machines", name]) => self
-                .machines
-                .remove(name, &self.store)
-                .await
-                .map(|()| no_content()),
-            _ => Err(ApiError(
-                StatusCode::NOT_FOUND,
-                format!("no such endpoint: {method} {path}"),
-            )),
-        };
-        result.unwrap_or_else(|ApiError(status, error)| json(status, &ErrorBody { error }))
-    }
-
-    /// The CA certificate the HTTPS edge's certificates come from.
-    fn ca_pem(&self) -> Result<ApiResponse, ApiError> {
-        let ca = self.ca.as_ref().ok_or_else(|| {
-            ApiError(
-                StatusCode::NOT_FOUND,
-                "this Node agent serves no HTTPS edge, so has no CA; start it with --https".into(),
-            )
-        })?;
-        Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "application/x-pem-file")
-            .body(Full::new(Bytes::from(ca.cert_pem().to_string())))
-            .expect("build CA response"))
-    }
-
     /// Samples the Node and every running VM, for [`Agent::stats`].
     fn sample(&self, sampler: &Sampler) {
         let running: Vec<RunningVm> = self
@@ -649,11 +531,7 @@ impl Agent {
         self.logs_dir.join(format!("{name}.{n}.log"))
     }
 
-    async fn run_vm(
-        self: Arc<Self>,
-        run: RunRequest,
-        cred: UCred,
-    ) -> Result<ApiResponse, ApiError> {
+    async fn run_vm(self: Arc<Self>, run: RunRequest, cred: UCred) -> Result<VmInfo, ApiError> {
         validate_name("VM", &run.name)?;
         let guest = guest_config(&run)?;
         if !run.rootfs.is_absolute() {
@@ -680,12 +558,7 @@ impl Agent {
         let log = self.new_log_path(&run.name);
         let (vm_address, replaced) = {
             let mut vms = self.vms.lock().unwrap();
-            if self.shutting_down.load(Ordering::SeqCst) {
-                return Err(ApiError(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "the Node agent is shutting down".into(),
-                ));
-            }
+            self.refuse_if_shutting_down()?;
             if self.machines.has_app(&run.name) {
                 return Err(ApiError(
                     StatusCode::CONFLICT,
@@ -716,17 +589,11 @@ impl Agent {
             {
                 return Err(owner.taken(&route.host));
             }
-            let vm_address = self.free_vm_address(&vms)?;
             // Reusing an Ended VM's name replaces its record once the new VM
             // has started.
-            let replaced = match vms.insert(
-                run.name.clone(),
-                Entry::Starting {
-                    vm_address,
-                    log: log.clone(),
-                    route: run.route.clone(),
-                },
-            ) {
+            let (vm_address, replaced) =
+                self.reserve(&mut vms, &run.name, log.clone(), run.route.clone())?;
+            let replaced = match replaced {
                 Some(Entry::Ended { info, log }) => Some(Replaced { info, log }),
                 _ => None,
             };
@@ -757,10 +624,29 @@ impl Agent {
         .unwrap_or_else(|e| Err(internal(format!("starting the VM panicked: {e}"))))
     }
 
-    /// The lowest VM address no entry in `vms` holds.
-    fn free_vm_address(&self, vms: &BTreeMap<String, Entry>) -> Result<Ipv4Addr, ApiError> {
+    fn refuse_if_shutting_down(&self) -> Result<(), ApiError> {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the Node agent is shutting down".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reserves `name` and the lowest VM address no entry in `vms` holds as
+    /// [`Entry::Starting`], for a start or a wake, and gives back the entry
+    /// it replaced.
+    fn reserve(
+        &self,
+        vms: &mut BTreeMap<String, Entry>,
+        name: &str,
+        log: PathBuf,
+        route: Option<Route>,
+    ) -> Result<(Ipv4Addr, Option<Entry>), ApiError> {
         let held: Vec<Ipv4Addr> = vms.values().filter_map(Entry::vm_address).collect();
-        self.subnet
+        let vm_address = self
+            .subnet
             .vm_addresses()
             .find(|a| !held.contains(a))
             .ok_or_else(|| {
@@ -768,12 +654,18 @@ impl Agent {
                     StatusCode::SERVICE_UNAVAILABLE,
                     "the Node subnet has no free VM addresses".into(),
                 )
-            })
+            })?;
+        let starting = Entry::Starting {
+            vm_address,
+            log,
+            route,
+        };
+        Ok((vm_address, vms.insert(name.to_string(), starting)))
     }
 
     /// Snapshots a running VM and ends it as parked. A VM that can't be
     /// parked keeps running, and the error says why.
-    async fn park_vm(self: Arc<Self>, name: String) -> Result<ApiResponse, ApiError> {
+    async fn park_vm(self: Arc<Self>, name: String) -> Result<VmInfo, ApiError> {
         let claim = self.claim_park(&name)?;
         self.park_claimed(name, claim).await
     }
@@ -803,7 +695,7 @@ impl Agent {
         self: Arc<Self>,
         name: String,
         claim: ParkClaim,
-    ) -> Result<ApiResponse, ApiError> {
+    ) -> Result<VmInfo, ApiError> {
         tokio::spawn(
             async move {
                 // Dropped in reverse: the claim is released before held
@@ -818,7 +710,7 @@ impl Agent {
         .unwrap_or_else(|e| Err(internal(format!("parking the VM panicked: {e}"))))
     }
 
-    async fn park(&self, name: &str) -> Result<ApiResponse, ApiError> {
+    async fn park(&self, name: &str) -> Result<VmInfo, ApiError> {
         let (stops, mut ended) = self.running(name)?;
         let (done_tx, done) = oneshot::channel();
         let park = Stop::Park {
@@ -852,15 +744,10 @@ impl Agent {
 
     /// Starts a new VM from a parked VM's snapshot, under its name. A wake
     /// that fails leaves the VM parked.
-    async fn wake_vm(self: Arc<Self>, name: String) -> Result<ApiResponse, ApiError> {
+    async fn wake_vm(self: Arc<Self>, name: String) -> Result<VmInfo, ApiError> {
         let (spec, parked) = {
             let mut vms = self.vms.lock().unwrap();
-            if self.shutting_down.load(Ordering::SeqCst) {
-                return Err(ApiError(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "the Node agent is shutting down".into(),
-                ));
-            }
+            self.refuse_if_shutting_down()?;
             let parked = match vms.get(&name) {
                 None => return Err(no_such_vm(&name)),
                 Some(Entry::Ended { info, .. })
@@ -888,15 +775,12 @@ impl Agent {
                     ));
                 }
             };
-            let vm_address = self.free_vm_address(&vms)?;
-            vms.insert(
-                name.clone(),
-                Entry::Starting {
-                    vm_address,
-                    log: parked.log.clone(),
-                    route: parked.info.route.clone(),
-                },
-            );
+            let (vm_address, _) = self.reserve(
+                &mut vms,
+                &name,
+                parked.log.clone(),
+                parked.info.route.clone(),
+            )?;
             let spec = WakeSpec {
                 vm_address,
                 mem_mib: parked.info.mem_mib,
@@ -930,7 +814,7 @@ impl Agent {
         name: String,
         spec: WakeSpec,
         parked: Replaced,
-    ) -> Result<ApiResponse, ApiError> {
+    ) -> Result<VmInfo, ApiError> {
         let put_back = |agent: &Agent, parked: Replaced| {
             agent.vms.lock().unwrap().insert(
                 name.clone(),
@@ -954,7 +838,7 @@ impl Agent {
                 ));
             }
         };
-        let info = VmInfo {
+        let started = VmInfo {
             name: name.clone(),
             vm_address: Some(spec.vm_address),
             mem_mib: spec.mem_mib,
@@ -963,39 +847,37 @@ impl Agent {
             ended: None,
             route: parked.info.route.clone(),
         };
-        let recorded =
-            self.store
-                .lock()
-                .unwrap()
-                .insert_running(&info, &spec.console_log, vm.process());
-        if let Err(e) = recorded {
-            // The guest has run, so its rootfs may no longer match the
-            // snapshot, which goes with the VM. It ends as forced, not
-            // parked: there is nothing left to wake.
-            vm.destroy().await;
-            let ended = Ended {
-                at: now(),
-                reason: EndReason::Forced,
-            };
-            if let Err(e) = self.store.lock().unwrap().mark_ended(&name, &ended) {
-                error!(vm = name, "record the end: {e}");
-            }
-            self.vms.lock().unwrap().insert(
-                name.clone(),
-                Entry::Ended {
-                    info: ended_info(parked.info, ended),
-                    log: parked.log,
-                },
-            );
-            return Err(internal(format!(
-                "VM {name:?} woke, but recording it failed, so it was stopped and its \
-                 snapshot is lost: {e}"
-            )));
-        }
+        // Emptied by the wake, and gone before a park of the new VM can make
+        // it again.
         let _ = std::fs::remove_dir(&spec.snapshot);
+        let info = match self.keep(started, &spec.console_log, vm).await {
+            Ok(info) => info,
+            Err(e) => {
+                // The guest has run, so its rootfs may no longer match the
+                // snapshot, which goes with the VM. It ends as forced, not
+                // parked: there is nothing left to wake.
+                let ended = Ended {
+                    at: now(),
+                    reason: EndReason::Forced,
+                };
+                if let Err(e) = self.store.lock().unwrap().mark_ended(&name, &ended) {
+                    error!(vm = name, "record the end: {e}");
+                }
+                self.vms.lock().unwrap().insert(
+                    name.clone(),
+                    Entry::Ended {
+                        info: ended_info(parked.info, ended),
+                        log: parked.log,
+                    },
+                );
+                return Err(internal(format!(
+                    "VM {name:?} woke, but recording it failed, so it was stopped and its \
+                     snapshot is lost: {e}"
+                )));
+            }
+        };
         info!(vm = name, address = %spec.vm_address, "VM woke");
-        self.start_supervising(info.clone(), spec.console_log, vm);
-        Ok(json(StatusCode::CREATED, &info))
+        Ok(info)
     }
 
     /// Runs `Vm::start` for a name and VM address already reserved as
@@ -1008,7 +890,7 @@ impl Agent {
         spec: VmSpec,
         route: Option<Route>,
         replaced: Option<Replaced>,
-    ) -> Result<ApiResponse, ApiError> {
+    ) -> Result<VmInfo, ApiError> {
         let vm = match Vm::start(&self.node, &spec)
             .instrument(info_span!("start", vm = name, address = %spec.vm_address))
             .await
@@ -1023,7 +905,7 @@ impl Agent {
                 ));
             }
         };
-        let info = VmInfo {
+        let started = VmInfo {
             name: name.clone(),
             vm_address: Some(spec.vm_address),
             mem_mib: spec.mem_mib,
@@ -1032,19 +914,15 @@ impl Agent {
             ended: None,
             route,
         };
-        // A VM that isn't on record would be nobody's to stop after a restart.
-        let recorded =
-            self.store
-                .lock()
-                .unwrap()
-                .insert_running(&info, &spec.console_log, vm.process());
-        if let Err(e) = recorded {
-            vm.destroy().await;
-            self.forget_start(&name, replaced, &spec.console_log);
-            return Err(internal(format!(
-                "VM {name:?} started, but recording it failed, so it was stopped: {e}"
-            )));
-        }
+        let info = match self.keep(started, &spec.console_log, vm).await {
+            Ok(info) => info,
+            Err(e) => {
+                self.forget_start(&name, replaced, &spec.console_log);
+                return Err(internal(format!(
+                    "VM {name:?} started, but recording it failed, so it was stopped: {e}"
+                )));
+            }
+        };
         if let Some(old) = replaced {
             let _ = std::fs::remove_file(old.log);
         }
@@ -1052,8 +930,25 @@ impl Agent {
         if let Some(route) = &info.route {
             self.get_certificate(&route.host);
         }
-        self.start_supervising(info.clone(), spec.console_log, vm);
-        Ok(json(StatusCode::CREATED, &info))
+        Ok(info)
+    }
+
+    /// Records a VM that just started or woke in the state database and
+    /// hands it to its supervisor. A VM that isn't on record would be
+    /// nobody's to stop after a restart, so one that can't be recorded is
+    /// destroyed.
+    async fn keep(self: &Arc<Self>, info: VmInfo, log: &Path, vm: Vm) -> Result<VmInfo, String> {
+        let recorded = self
+            .store
+            .lock()
+            .unwrap()
+            .insert_running(&info, log, vm.process());
+        if let Err(e) = recorded {
+            vm.destroy().await;
+            return Err(e.to_string());
+        }
+        self.start_supervising(info.clone(), log.to_path_buf(), vm);
+        Ok(info)
     }
 
     /// Records `vm` as running and spawns its supervisor task, which records
@@ -1323,16 +1218,16 @@ impl Agent {
     }
 
     /// The Ended VM record of `name`, once its supervisor has recorded it.
-    fn ended_info(&self, name: &str) -> Result<ApiResponse, ApiError> {
+    fn ended_info(&self, name: &str) -> Result<VmInfo, ApiError> {
         match self.vms.lock().unwrap().get(name) {
-            Some(Entry::Ended { info, .. }) => Ok(json(StatusCode::OK, info)),
+            Some(Entry::Ended { info, .. }) => Ok(info.clone()),
             _ => Err(internal(format!(
                 "VM {name:?} ended, but its record is gone"
             ))),
         }
     }
 
-    async fn stop_vm(&self, name: &str, stop: StopRequest) -> Result<ApiResponse, ApiError> {
+    async fn stop_vm(&self, name: &str, stop: StopRequest) -> Result<VmInfo, ApiError> {
         let (stops, mut ended) = self.running(name)?;
         let request = if stop.force {
             Stop::Force
@@ -1367,7 +1262,7 @@ impl Agent {
 
     /// Makes a Machine-backed App, whose name and hostname mustn't be a
     /// VM's or a VM-backed App's.
-    fn run_on_machine(&self, request: MachineAppRequest) -> Result<ApiResponse, ApiError> {
+    fn run_on_machine(&self, request: MachineAppRequest) -> Result<MachineAppInfo, ApiError> {
         validate_name("App", &request.name)?;
         validate_route(&request.route)?;
         if request.route.idle_park_secs.is_some() {
@@ -1397,12 +1292,12 @@ impl Agent {
         }
         let info = self.machines.add_app(request, &self.store)?;
         self.get_certificate(&info.route.host);
-        Ok(json(StatusCode::CREATED, &info))
+        Ok(info)
     }
 
-    fn remove(&self, name: &str) -> Result<ApiResponse, ApiError> {
+    fn remove(&self, name: &str) -> Result<(), ApiError> {
         if self.machines.remove_app(name, &self.store)? {
-            return Ok(no_content());
+            return Ok(());
         }
         let mut vms = self.vms.lock().unwrap();
         match vms.get(name) {
@@ -1424,7 +1319,7 @@ impl Agent {
                     .map_err(|e| internal(format!("remove the record of {name:?}: {e}")))?;
                 let _ = std::fs::remove_file(log);
                 vms.remove(name);
-                Ok(no_content())
+                Ok(())
             }
             Some(_) => Err(ApiError(
                 StatusCode::CONFLICT,
@@ -1452,133 +1347,6 @@ impl Agent {
         let _ = std::fs::remove_dir(&self.node.jail_base);
         let _ = std::fs::remove_dir(&self.parked_dir);
         let _ = std::fs::remove_dir(vm::parent_cgroup());
-    }
-}
-
-/// What the edge does next for a hostname, decided under the VM table's
-/// lock and acted on after it is released. Each carries the App's name.
-enum Step {
-    Answer(Resolution),
-    /// The App is starting, waking or parking: hold the request until that
-    /// settles.
-    Hold(String, Holding),
-    /// The App is parked: wake it.
-    Wake(String),
-}
-
-/// What a held request waits for.
-enum Holding {
-    /// A start or wake, after which the App runs or the start failed.
-    Start,
-    /// A park, after which the App is parked and the request wakes it.
-    Park,
-}
-
-/// The agent as the edge's [`Router`]: a request for a parked App wakes it
-/// and is held until it runs, so the client sees latency, not an error.
-struct Edge(Arc<Agent>);
-
-impl Router for Edge {
-    fn routes(&self, host: &str) -> bool {
-        self.0
-            .host_owner(&self.0.vms.lock().unwrap(), host)
-            .is_some()
-    }
-
-    async fn resolve(&self, host: &str) -> Resolution {
-        let agent = &self.0;
-        let deadline = tokio::time::Instant::now() + HOLD_FOR_START;
-        // Set once this request has held for a wake or tried one. Finding
-        // the App parked after that means the wake failed, and the request
-        // answers why instead of trying again.
-        let mut tried: Option<Option<String>> = None;
-        loop {
-            // Listening before looking, so a start that settles in between
-            // isn't missed.
-            let settled = agent.settled.notified();
-            tokio::pin!(settled);
-            settled.as_mut().enable();
-            match agent.step_for(host) {
-                Step::Answer(resolution) => return resolution,
-                Step::Hold(name, holding) => {
-                    if let Holding::Start = &holding {
-                        tried = Some(None);
-                    }
-                    if tokio::time::timeout_at(deadline, settled).await.is_err() {
-                        return Resolution::Unavailable(match holding {
-                            Holding::Start => still_starting(&name),
-                            Holding::Park => format!(
-                                "App {name:?} is still being parked after {HOLD_FOR_START:?}; \
-                                 try again shortly"
-                            ),
-                        });
-                    }
-                }
-                Step::Wake(name) if tried.is_some() => {
-                    let why = tried
-                        .flatten()
-                        .or_else(|| agent.wake_failures.lock().unwrap().get(&name).cloned());
-                    return Resolution::Unavailable(why.unwrap_or_else(|| {
-                        format!("App {name:?} failed to wake; `cirro logs {name}` may say why")
-                    }));
-                }
-                Step::Wake(name) => {
-                    let woken =
-                        tokio::time::timeout_at(deadline, agent.clone().wake_vm(name.clone()));
-                    match woken.await {
-                        Err(_) => return Resolution::Unavailable(still_starting(&name)),
-                        Ok(Ok(_)) => info!(vm = name, host, "woke an App for a request"),
-                        // Another request's wake may have got there first,
-                        // or the App can't be woken (its snapshot is gone).
-                        Ok(Err(ApiError(StatusCode::CONFLICT, why))) => tried = Some(Some(why)),
-                        Ok(Err(ApiError(_, why))) => return Resolution::Unavailable(why),
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn still_starting(name: &str) -> String {
-    format!(
-        "App {name:?} is still starting after {HOLD_FOR_START:?}; try again shortly, or see \
-         `cirro logs {name}`"
-    )
-}
-
-impl Agent {
-    /// What a request for `host` needs next.
-    fn step_for(&self, host: &str) -> Step {
-        if let Some(resolution) = self.machines.resolve(host) {
-            return Step::Answer(resolution);
-        }
-        let vms = self.vms.lock().unwrap();
-        let Some((name, entry)) = app_with_host(&vms, host) else {
-            return Step::Answer(Resolution::NotFound);
-        };
-        let name = name.clone();
-        match entry {
-            Entry::Running { traffic, .. } if traffic.parking.load(Ordering::SeqCst) => {
-                Step::Hold(name, Holding::Park)
-            }
-            Entry::Running { info, traffic, .. } => {
-                Step::Answer(match (info.vm_address, &info.route) {
-                    // Counted under the VM table's lock, so the idle parker
-                    // never picks a VM a request is about to reach.
-                    (Some(address), Some(route)) => Resolution::Upstream(
-                        SocketAddr::new(address.into(), route.port),
-                        Lease::new(InFlight::start(traffic)),
-                    ),
-                    _ => Resolution::Unavailable(format!("App {name:?} has no VM address")),
-                })
-            }
-            Entry::Starting { .. } => Step::Hold(name, Holding::Start),
-            Entry::Ended { info, .. } if is_parked(info) => Step::Wake(name),
-            Entry::Ended { info, .. } => Step::Answer(Resolution::Unavailable(format!(
-                "App {name:?} has ended ({})",
-                info.ended.as_ref().map_or("unknown", |e| e.reason.as_str())
-            ))),
-        }
     }
 }
 
@@ -1795,24 +1563,6 @@ fn now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
-    query
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .find(|(k, _)| *k == key)
-        .map(|(_, v)| v)
-}
-
-struct ApiError(StatusCode, String);
-
-fn bad_request(message: &str) -> ApiError {
-    ApiError(StatusCode::BAD_REQUEST, message.to_string())
-}
-
-fn internal(message: String) -> ApiError {
-    ApiError(StatusCode::INTERNAL_SERVER_ERROR, message)
-}
-
 fn snapshot_gone(name: &str) -> String {
     format!(
         "VM {name:?} is parked, but its snapshot is gone, so it can't be woken; \
@@ -1825,33 +1575,6 @@ fn no_such_vm(name: &str) -> ApiError {
         StatusCode::NOT_FOUND,
         format!("no VM named {name:?}; `cirro ps -a` lists them all"),
     )
-}
-
-async fn read_json<T: serde::de::DeserializeOwned>(req: Request<Incoming>) -> Result<T, ApiError> {
-    let body = req
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| bad_request(&format!("read request body: {e}")))?
-        .to_bytes();
-    serde_json::from_slice(&body).map_err(|e| bad_request(&format!("invalid request body: {e}")))
-}
-
-fn no_content() -> ApiResponse {
-    Response::builder()
-        .status(StatusCode::NO_CONTENT)
-        .body(Full::new(Bytes::new()))
-        .expect("build empty response")
-}
-
-fn json(status: StatusCode, body: &impl serde::Serialize) -> ApiResponse {
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(
-            serde_json::to_vec(body).expect("serialize response"),
-        )))
-        .expect("build response")
 }
 
 #[cfg(test)]
