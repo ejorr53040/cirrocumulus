@@ -57,16 +57,6 @@ fn pull(cache: &ImageCache, reference: &str) -> Result<crate::CachedImage, Error
         .block_on(cache.pull(reference, INIT))
 }
 
-fn have_mke2fs() -> bool {
-    match check_mke2fs() {
-        Ok(()) => true,
-        Err(e) => {
-            eprintln!("skipping: {e}");
-            false
-        }
-    }
-}
-
 #[test]
 fn pulling_a_tag_builds_the_rootfs_and_reads_the_run_config() {
     if !have_mke2fs() {
@@ -173,16 +163,12 @@ fn a_blob_that_doesnt_match_its_digest_is_refused_and_nothing_is_cached() {
     );
     registry.tag("app", "v1", &digest);
     registry.corrupt_blob(&super::registry::sha256(&layer));
-    let dir = tempdir().join("images");
-    let cache = ImageCache::new(dir.clone()).with_plain_http(vec![registry.host.clone()]);
+    let cache = cache(&registry);
 
     let e = pull(&cache, &format!("{}/app:v1", registry.host)).unwrap_err();
 
     assert!(e.0.to_lowercase().contains("digest"), "{e}");
-    let left: Vec<_> = std::fs::read_dir(&dir)
-        .map(|d| d.flatten().map(|e| e.file_name()).collect())
-        .unwrap_or_default();
-    assert!(left.is_empty(), "left in the cache: {left:?}");
+    assert!(cache.list().unwrap().is_empty());
 }
 
 #[test]

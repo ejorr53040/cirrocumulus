@@ -79,7 +79,7 @@ fn flatten(layers: &[Layer]) -> Result<Flattened, Error> {
 }
 
 fn paths(flat: &Flattened) -> Vec<&str> {
-    flat.tree.keys().map(String::as_str).collect()
+    flat.paths().collect()
 }
 
 #[test]
@@ -218,9 +218,18 @@ fn debugfs(image: &Path, request: &str) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+fn have_mke2fs() -> bool {
+    match check_mke2fs() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("skipping: {e}");
+            false
+        }
+    }
+}
+
 fn build(layers: &[Layer]) -> Option<PathBuf> {
-    if let Err(e) = check_mke2fs() {
-        eprintln!("skipping: {e}");
+    if !have_mke2fs() {
         return None;
     }
     let flat = flatten(layers).unwrap();
@@ -282,7 +291,7 @@ fn every_guest_gets_init_mountpoints_and_dns() {
 
 #[test]
 fn a_hardlink_to_a_whited_out_file_fails_the_build() {
-    if check_mke2fs().is_err() {
+    if !have_mke2fs() {
         return;
     }
     let flat = flatten(&[
