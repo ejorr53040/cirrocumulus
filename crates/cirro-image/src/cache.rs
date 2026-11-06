@@ -88,10 +88,10 @@ impl ImageCache {
             let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
                 continue;
             };
-            if let Some(image) = stem
-                .split_once('-')
-                .and_then(|(algorithm, hex)| self.cached(&format!("{algorithm}:{hex}")))
-            {
+            let Some((algorithm, hex)) = stem.split_once('-') else {
+                continue;
+            };
+            if let Some(image) = self.cached(&format!("{algorithm}:{hex}"))? {
                 images.push(image);
             }
         }
@@ -152,7 +152,7 @@ impl ImageCache {
                 self.write_record(&image)?;
             }
         }
-        self.cached(digest)
+        self.cached(digest)?
             .ok_or_else(|| Error(format!("{digest} vanished from {}", self.dir.display())))
     }
 
@@ -202,7 +202,7 @@ impl ImageCache {
                         found.join(", ")
                     )));
                 };
-                if self.cached(&digest).is_some() {
+                if self.cached(&digest)?.is_some() {
                     return Ok(digest);
                 }
                 let image = reference.clone_with_digest(digest.clone());
@@ -217,7 +217,7 @@ impl ImageCache {
                 }
             }
         };
-        if self.cached(&digest).is_some() {
+        if self.cached(&digest)?.is_some() {
             return Ok(digest);
         }
         if manifest
@@ -286,17 +286,31 @@ impl ImageCache {
 
     /// The image built from manifest `digest`, if it's in the cache. The
     /// rootfs is moved in last, so a record without one is a pull that
-    /// didn't finish and is pulled again.
-    fn cached(&self, digest: &str) -> Option<CachedImage> {
+    /// didn't finish and is pulled again. A record that can't be read is
+    /// an error, not a reason to pull again over it.
+    fn cached(&self, digest: &str) -> Result<Option<CachedImage>, Error> {
         let rootfs = self.path(digest, "ext4");
-        let record = std::fs::read(self.path(digest, "json")).ok()?;
-        let record: Record = serde_json::from_slice(&record).ok()?;
-        rootfs.is_file().then(|| CachedImage {
+        let path = self.path(digest, "json");
+        let record = match std::fs::read(&path) {
+            Ok(record) => record,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(err(&format!("read {}", path.display()), e)),
+        };
+        let record: Record = serde_json::from_slice(&record).map_err(|e| {
+            err(
+                &format!(
+                    "{} is corrupt (remove it to pull the image again)",
+                    path.display()
+                ),
+                e,
+            )
+        })?;
+        Ok(rootfs.is_file().then(|| CachedImage {
             digest: digest.to_string(),
             rootfs,
             config: record.config,
             references: record.references,
-        })
+        }))
     }
 
     fn client(&self) -> Client {
@@ -385,13 +399,15 @@ fn run_config(file: &ConfigFile, flat: &Flattened) -> Result<RunConfig, Error> {
         return Ok(RunConfig::default());
     };
     let text = |path| {
-        flat.read(path)
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
+        Ok::<_, Error>(
+            flat.read(path)?
+                .map(|b| String::from_utf8_lossy(&b).into_owned()),
+        )
     };
     let user = run_config::resolve_user(
         config.user.as_deref().unwrap_or(""),
-        text("/etc/passwd").as_deref(),
-        text("/etc/group").as_deref(),
+        text("/etc/passwd")?.as_deref(),
+        text("/etc/group")?.as_deref(),
     )?;
     Ok(RunConfig {
         entrypoint: config.entrypoint.clone().unwrap_or_default(),

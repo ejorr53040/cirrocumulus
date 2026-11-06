@@ -193,17 +193,21 @@ impl Flattened {
 
     /// The contents of the regular file at `path` in the final tree, if
     /// there is one. `path` may start with `/`.
-    pub fn read(&self, path: &str) -> Option<Vec<u8>> {
-        let source = self.tree.get(path.trim_start_matches('/'))?;
+    pub fn read(&self, path: &str) -> Result<Option<Vec<u8>>, Error> {
+        let Some(source) = self.tree.get(path.trim_start_matches('/')) else {
+            return Ok(None);
+        };
         if !matches!(
             source.header.entry_type(),
             EntryType::Regular | EntryType::Continuous
         ) {
-            return None;
+            return Ok(None);
         }
         let mut data = Vec::new();
-        self.data(source).ok()?.read_to_end(&mut data).ok()?;
-        Some(data)
+        self.data(source)
+            .and_then(|mut r| r.read_to_end(&mut data))
+            .map_err(|e| err(&format!("read {path} from the image"), e))?;
+        Ok(Some(data))
     }
 
     fn data(&self, source: &Source) -> io::Result<impl Read> {

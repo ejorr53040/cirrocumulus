@@ -90,7 +90,7 @@ fn a_later_layer_replaces_a_file() {
     ])
     .unwrap();
 
-    assert_eq!(flat.read("/etc/motd").unwrap(), b"new");
+    assert_eq!(flat.read("/etc/motd").unwrap().unwrap(), b"new");
 }
 
 #[test]
@@ -102,7 +102,7 @@ fn leading_dot_slash_and_slash_are_the_same_path() {
     .unwrap();
 
     assert_eq!(paths(&flat), ["a"]);
-    assert_eq!(flat.read("a").unwrap(), b"2");
+    assert_eq!(flat.read("a").unwrap().unwrap(), b"2");
 }
 
 #[test]
@@ -124,7 +124,7 @@ fn a_whiteout_removes_a_file_or_a_whole_directory() {
 fn a_whiteout_hides_only_lower_layers() {
     let flat = flatten(&[Layer::default().file("x", "same layer").file(".wh.x", "")]).unwrap();
 
-    assert_eq!(flat.read("x").unwrap(), b"same layer");
+    assert_eq!(flat.read("x").unwrap().unwrap(), b"same layer");
 }
 
 #[test]
@@ -153,7 +153,7 @@ fn a_file_over_a_directory_removes_what_was_in_it() {
     .unwrap();
 
     assert_eq!(paths(&flat), ["d"]);
-    assert_eq!(flat.read("d").unwrap(), b"now a file");
+    assert_eq!(flat.read("d").unwrap().unwrap(), b"now a file");
 }
 
 #[test]

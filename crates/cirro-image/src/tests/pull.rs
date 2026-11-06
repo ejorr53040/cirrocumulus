@@ -386,3 +386,22 @@ fn a_repository_the_registry_names_unknown_is_no_image() {
         "{e}"
     );
 }
+
+#[test]
+fn a_corrupt_record_is_an_error_not_a_reason_to_pull_again() {
+    if !have_mke2fs() {
+        return;
+    }
+    let (registry, digest) = registry_with_app();
+    let dir = tempdir().join("images");
+    let cache = ImageCache::new(dir.clone()).with_plain_http(vec![registry.host.clone()]);
+    let reference = format!("{}/app:v1", registry.host);
+    pull(&cache, &reference).unwrap();
+    let record = dir.join(format!("{}.json", digest.replace(':', "-")));
+    std::fs::write(&record, "{not json").unwrap();
+
+    let e = pull(&cache, &reference).unwrap_err();
+
+    assert!(e.0.contains("is corrupt"), "{e}");
+    assert!(cache.list().is_err());
+}
