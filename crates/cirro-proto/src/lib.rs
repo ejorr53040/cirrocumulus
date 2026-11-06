@@ -49,6 +49,10 @@ pub const VM_STATE_HEADER: &str = "cirro-vm-state";
 /// more was already there; ask again from where it ended.
 pub const LOG_CHUNK: u64 = 1 << 20;
 
+/// How long a graceful stop waits for the VM to end before killing it,
+/// when [`StopRequest::timeout_secs`] is unset.
+pub const DEFAULT_STOP_TIMEOUT_SECS: u64 = 10;
+
 /// Bounds on `RunRequest.mem_mib` and `RunRequest.vcpus`. The CLI and the
 /// agent both enforce them; the agent's check is the one that counts, since
 /// anything on its socket can send a request the CLI never validated.

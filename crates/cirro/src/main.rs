@@ -3,9 +3,9 @@ mod open_rootfs;
 
 use cirro_image::ImageCache;
 use cirro_image::run_config::merge_env;
-use cirro_node::agent;
 use cirro_node::release::ReleaseBinaries;
 use cirro_node::subnet::Subnet;
+use cirro_node::{agent, install};
 use cirro_proto::{
     AddMachine, LOG_CHUNK, MachineAppInfo, MachineAppRequest, MachineHostKey, MachineInfo,
     MachineScan, Route, RunRequest, Stats, StopRequest, User, VM_STATE_HEADER, VmInfo,
@@ -77,7 +77,7 @@ enum Command {
         #[arg(long)]
         force: bool,
         /// Seconds to wait for the VM to end before killing it
-        #[arg(long, default_value_t = 10, conflicts_with = "force")]
+        #[arg(long, default_value_t = cirro_proto::DEFAULT_STOP_TIMEOUT_SECS, conflicts_with = "force")]
         timeout: u64,
         name: String,
     },
@@ -182,13 +182,13 @@ enum NodeCommand {
     /// Fetch and verify firecracker and jailer, check KVM and cgroup v2
     Install {
         /// Where the agent keeps jails, console logs and its own config
-        #[arg(long, default_value = "/var/lib/cirro")]
+        #[arg(long, default_value = install::DEFAULT_STATE_DIR)]
         state_dir: PathBuf,
         /// The group created (if missing) and used for the agent socket
-        #[arg(long, default_value = "cirro")]
+        #[arg(long, default_value = install::DEFAULT_GROUP)]
         group: String,
         /// The Node subnet VM addresses come from
-        #[arg(long, default_value = "10.77.0.0/24")]
+        #[arg(long, default_value = install::DEFAULT_SUBNET)]
         subnet: Subnet,
         /// The systemd unit's name, without `.service`
         #[arg(long, default_value = "cirro")]
@@ -216,7 +216,7 @@ enum NodeCommand {
     /// Reverse `install`: refuses while a VM is running unless `--force`
     Uninstall {
         /// The state dir `install` was given
-        #[arg(long, default_value = "/var/lib/cirro")]
+        #[arg(long, default_value = install::DEFAULT_STATE_DIR)]
         state_dir: PathBuf,
         /// Uninstall even if VMs are still running, killing them
         #[arg(long)]
@@ -233,10 +233,10 @@ enum NodeCommand {
         #[arg(long)]
         state_dir: PathBuf,
         /// The group allowed to use the socket: a name or a numeric gid
-        #[arg(long, default_value = "cirro")]
+        #[arg(long, default_value = install::DEFAULT_GROUP)]
         socket_group: String,
         /// The Node subnet VM addresses come from
-        #[arg(long, default_value = "10.77.0.0/24")]
+        #[arg(long, default_value = install::DEFAULT_SUBNET)]
         subnet: Subnet,
         #[arg(long)]
         firecracker: PathBuf,
@@ -406,13 +406,13 @@ fn main() -> ExitCode {
             }) => cirro_image::check_mke2fs()
                 .map_err(|e| io::Error::other(e.0))
                 .and_then(|()| {
-                    cirro_node::install::install(&cirro_node::install::InstallConfig {
+                    install::install(&install::InstallConfig {
                         state_dir,
                         socket: cli.socket,
                         group,
                         subnet,
                         unit_name,
-                        edge: cirro_node::install::EdgeConfig {
+                        edge: install::EdgeConfig {
                             http,
                             https,
                             acme_email,
@@ -434,7 +434,7 @@ fn main() -> ExitCode {
                 .map_err(|e| format!("node install: {e}")),
             Command::Node(NodeCommand::Ca) => node_ca(&cli.socket).await,
             Command::Node(NodeCommand::Uninstall { state_dir, force }) => {
-                cirro_node::install::uninstall(&state_dir, force)
+                install::uninstall(&state_dir, force)
                     .await
                     .map_err(|e| format!("node uninstall: {e}"))
             }
@@ -827,7 +827,13 @@ async fn top_loop(socket: &Path, terminal: &mut ratatui::DefaultTerminal) -> Res
                 let socket = socket.to_path_buf();
                 let stopped = stopped.clone();
                 tokio::spawn(async move {
-                    let result = stop(&socket, &name, false, 10).await;
+                    let result = stop(
+                        &socket,
+                        &name,
+                        false,
+                        cirro_proto::DEFAULT_STOP_TIMEOUT_SECS,
+                    )
+                    .await;
                     let _ = stopped.send((name, result));
                 });
             }

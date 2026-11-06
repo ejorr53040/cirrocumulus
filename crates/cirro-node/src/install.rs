@@ -23,6 +23,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Where a Node keeps its state unless told otherwise.
+pub const DEFAULT_STATE_DIR: &str = "/var/lib/cirro";
+/// The group allowed to use the agent socket unless told otherwise.
+pub const DEFAULT_GROUP: &str = "cirro";
+/// The Node subnet unless told otherwise.
+pub const DEFAULT_SUBNET: &str = "10.77.0.0/24";
+
 /// What `cirro node install` was given.
 pub struct InstallConfig {
     pub state_dir: PathBuf,

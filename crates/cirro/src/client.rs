@@ -78,8 +78,9 @@ fn connect_error(socket: &Path, error: &(dyn std::error::Error + 'static)) -> St
         {
             return format!(
                 "permission denied on the Node agent's socket {}: ask the Node's operator \
-                 to add you to its group (cirro by default)",
-                socket.display()
+                 to add you to its group ({} by default)",
+                socket.display(),
+                cirro_node::install::DEFAULT_GROUP
             );
         }
         source = e.source();

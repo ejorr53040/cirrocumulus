@@ -30,9 +30,9 @@ use cirro_edge::tls::NodeCa;
 use cirro_edge::{Lease, Resolution, Router};
 use cirro_guest_init::config::{self as guest, Config as GuestConfig};
 use cirro_proto::{
-    AddMachine, EndReason, Ended, ErrorBody, LOG_CHUNK, MAX_MEM_MIB, MAX_VCPUS, MIN_MEM_MIB,
-    MIN_VCPUS, MachineAppRequest, MachineHostKey, MachineScan, Route, RunRequest, Stats,
-    StopRequest, VM_STATE_HEADER, VmInfo, VmStats,
+    AddMachine, DEFAULT_STOP_TIMEOUT_SECS, EndReason, Ended, ErrorBody, LOG_CHUNK, MAX_MEM_MIB,
+    MAX_VCPUS, MIN_MEM_MIB, MIN_VCPUS, MachineAppRequest, MachineHostKey, MachineScan, Route,
+    RunRequest, Stats, StopRequest, VM_STATE_HEADER, VmInfo, VmStats,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -57,10 +57,6 @@ use tokio::time::MissedTickBehavior;
 use tracing::{Instrument, error, info, info_span, warn};
 
 mod machine;
-
-/// How long a graceful stop waits for the VM to end before killing it,
-/// unless the request says otherwise.
-const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the edge holds a request for an App that is starting or waking
 /// before answering 503.
@@ -1353,9 +1349,9 @@ impl Agent {
             Stop::Force
         } else {
             Stop::Graceful {
-                timeout: stop
-                    .timeout_secs
-                    .map_or(DEFAULT_STOP_TIMEOUT, Duration::from_secs),
+                timeout: Duration::from_secs(
+                    stop.timeout_secs.unwrap_or(DEFAULT_STOP_TIMEOUT_SECS),
+                ),
             }
         };
         // If the supervisor is already gone, the VM is ending anyway.
