@@ -37,6 +37,7 @@ pub(super) struct Machines {
     /// other's host key.
     adding: tokio::sync::Mutex<()>,
     entries: Mutex<BTreeMap<String, Machine>>,
+    store: Arc<Mutex<Store>>,
 }
 
 struct Machine {
@@ -85,21 +86,22 @@ impl Link {
 }
 
 impl Machines {
-    pub(super) fn new(state_dir: &Path) -> Machines {
+    pub(super) fn new(state_dir: &Path, store: Arc<Mutex<Store>>) -> Machines {
         Machines {
             key: layout::ssh_key(state_dir),
             known_hosts: layout::known_hosts(state_dir),
             keygen: Mutex::new(()),
             adding: tokio::sync::Mutex::new(()),
             entries: Mutex::new(BTreeMap::new()),
+            store,
         }
     }
 
     /// Brings back the Machines a previous agent added, connecting to each
     /// in the background so an unreachable one holds nothing up.
-    pub(super) fn restore(&self, store: &Mutex<Store>) -> io::Result<()> {
+    pub(super) fn restore(&self) -> io::Result<()> {
         let (records, app_records) = {
-            let store = store.lock().unwrap();
+            let store = self.store.lock().unwrap();
             (store.load_machines()?, store.load_machine_apps()?)
         };
         for record in records {
@@ -185,11 +187,7 @@ impl Machines {
     /// it. The caller has checked the name and hostname are free, and holds
     /// the VM table, which every add takes, so neither can be taken
     /// meanwhile.
-    pub(super) fn add_app(
-        &self,
-        request: MachineAppRequest,
-        store: &Mutex<Store>,
-    ) -> Result<MachineAppInfo, ApiError> {
+    pub(super) fn add_app(&self, request: MachineAppRequest) -> Result<MachineAppInfo, ApiError> {
         let mut entries = self.entries.lock().unwrap();
         let machine = entries.get_mut(&request.machine).ok_or_else(|| {
             ApiError(
@@ -211,12 +209,16 @@ impl Machines {
                 request.machine
             )));
         }
-        let recorded = store.lock().unwrap().insert_machine_app(&MachineAppRecord {
-            name: request.name.clone(),
-            machine: request.machine.clone(),
-            host: request.route.host.clone(),
-            port: request.route.port,
-        });
+        let recorded = self
+            .store
+            .lock()
+            .unwrap()
+            .insert_machine_app(&MachineAppRecord {
+                name: request.name.clone(),
+                machine: request.machine.clone(),
+                host: request.route.host.clone(),
+                port: request.route.port,
+            });
         if let Err(e) = recorded {
             machine.apps.remove(&request.name);
             let _ = self.start_tunnel(machine);
@@ -232,12 +234,12 @@ impl Machines {
 
     /// Removes the Machine-backed App `name` and stops forwarding to it;
     /// `false` when there's none.
-    pub(super) fn remove_app(&self, name: &str, store: &Mutex<Store>) -> Result<bool, ApiError> {
+    pub(super) fn remove_app(&self, name: &str) -> Result<bool, ApiError> {
         let mut entries = self.entries.lock().unwrap();
         let Some(machine) = entries.values_mut().find(|m| m.apps.contains_key(name)) else {
             return Ok(false);
         };
-        store
+        self.store
             .lock()
             .unwrap()
             .delete_machine_app(name)
@@ -285,11 +287,7 @@ impl Machines {
 
     /// Pins the host key `add.host_key` names, checks the agent can log in
     /// with it, then records the Machine and connects to it.
-    pub(super) async fn add(
-        &self,
-        add: AddMachine,
-        store: &Mutex<Store>,
-    ) -> Result<MachineInfo, ApiError> {
+    pub(super) async fn add(&self, add: AddMachine) -> Result<MachineInfo, ApiError> {
         super::validate_name("Machine", &add.name)?;
         let target = Target::parse(&add.ssh).map_err(|e| bad_request(&e))?;
         let _adding = self.adding.lock().await;
@@ -357,7 +355,7 @@ impl Machines {
                 ),
             ));
         }
-        store
+        self.store
             .lock()
             .unwrap()
             .insert_machine(&record)
@@ -368,7 +366,7 @@ impl Machines {
         Ok(self.entries.lock().unwrap()[&name].info())
     }
 
-    pub(super) async fn remove(&self, name: &str, store: &Mutex<Store>) -> Result<(), ApiError> {
+    pub(super) async fn remove(&self, name: &str) -> Result<(), ApiError> {
         // Not mid-add: rewriting known_hosts would unpin the key being added.
         let _adding = self.adding.lock().await;
         let mut entries = self.entries.lock().unwrap();
@@ -388,7 +386,7 @@ impl Machines {
                 ),
             ));
         }
-        store
+        self.store
             .lock()
             .unwrap()
             .delete_machine(name)

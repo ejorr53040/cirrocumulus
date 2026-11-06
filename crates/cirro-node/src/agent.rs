@@ -225,7 +225,7 @@ struct Agent {
     logs_dir: PathBuf,
     parked_dir: PathBuf,
     vms: Mutex<BTreeMap<String, Entry>>,
-    store: Mutex<Store>,
+    store: Arc<Mutex<Store>>,
     /// Numbers each VM start's console log file.
     next_log: AtomicU64,
     /// Set once shutdown begins, so no new VM starts while the agent waits for
@@ -274,10 +274,10 @@ pub async fn run(config: Config) -> io::Result<()> {
     }
     // Also when an earlier agent made it: it holds guests' memory.
     std::fs::set_permissions(&parked_dir, std::fs::Permissions::from_mode(0o700))?;
-    let store = Store::open(
+    let store = Arc::new(Mutex::new(Store::open(
         &layout::state_db(&config.state_dir),
         &config.subnet.to_string(),
-    )?;
+    )?));
 
     // Fail closed: no VM starts without the egress policy in place.
     let egress_iface = egress::default_route_iface();
@@ -314,7 +314,7 @@ pub async fn run(config: Config) -> io::Result<()> {
         logs_dir: logs_dir.clone(),
         parked_dir,
         vms: Mutex::new(BTreeMap::new()),
-        store: Mutex::new(store),
+        store: store.clone(),
         next_log: AtomicU64::new(next_log_number(&logs_dir)),
         shutting_down: AtomicBool::new(false),
         metrics: Mutex::new(Recorder::default()),
@@ -322,10 +322,10 @@ pub async fn run(config: Config) -> io::Result<()> {
         wake_failures: Mutex::new(BTreeMap::new()),
         ca,
         acme,
-        machines: machine::Machines::new(&config.state_dir),
+        machines: machine::Machines::new(&config.state_dir, store),
     });
     agent.reconcile().await?;
-    agent.machines.restore(&agent.store)?;
+    agent.machines.restore()?;
     let idle_parker = tokio::spawn(agent.clone().park_idle_apps());
     let renewer = agent
         .acme
@@ -1277,13 +1277,13 @@ impl Agent {
         if let Some(owner) = self.host_owner(&vms, &request.route.host) {
             return Err(owner.taken(&request.route.host));
         }
-        let info = self.machines.add_app(request, &self.store)?;
+        let info = self.machines.add_app(request)?;
         self.get_certificate(&info.route.host);
         Ok(info)
     }
 
     fn remove(&self, name: &str) -> Result<(), ApiError> {
-        if self.machines.remove_app(name, &self.store)? {
+        if self.machines.remove_app(name)? {
             return Ok(());
         }
         let mut vms = self.vms.lock().unwrap();

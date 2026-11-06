@@ -108,16 +108,14 @@ impl Agent {
             (&Method::POST, ["machines"]) => match read_json::<AddMachine>(req).await {
                 Ok(add) => self
                     .machines
-                    .add(add, &self.store)
+                    .add(add)
                     .await
                     .map(|info| json(StatusCode::CREATED, &info)),
                 Err(e) => Err(e),
             },
-            (&Method::DELETE, ["machines", name]) => self
-                .machines
-                .remove(name, &self.store)
-                .await
-                .map(|()| no_content()),
+            (&Method::DELETE, ["machines", name]) => {
+                self.machines.remove(name).await.map(|()| no_content())
+            }
             _ => Err(ApiError(
                 StatusCode::NOT_FOUND,
                 format!("no such endpoint: {method} {path}"),
