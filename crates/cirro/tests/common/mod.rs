@@ -122,9 +122,8 @@ pub(crate) fn rootfs() -> &'static Rootfs {
         std::fs::copy(tree.join("app/ignore_term"), tree.join("init"))
             .expect("copy ignore_term in as /init");
         let wrong_init = make_image(&tree, &dir.join("wrong-init.ext4"));
-        let guest_init_bin = repo_root()
-            .join("target/guest-init-embed/x86_64-unknown-linux-musl/release/guest-init");
-        std::fs::copy(&guest_init_bin, tree.join("init")).expect("copy guest-init into tree");
+        let guest_init_bin = Path::new(env!("CIRRO_GUEST_INIT"));
+        std::fs::copy(guest_init_bin, tree.join("init")).expect("copy guest-init into tree");
         let guest_init = make_image(&tree, &dir.join("guest-init.ext4"));
         Rootfs {
             guest_init,

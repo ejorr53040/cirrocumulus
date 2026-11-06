@@ -15,7 +15,9 @@
 //! that file's module doc for the sudoers rule this needs.
 
 use assert_cmd::Command;
+use predicates::prelude::*;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 
 mod common;
 use common::{home, latest_kernel, repo_root, rootfs, test_agent, test_agent_path};
@@ -34,7 +36,12 @@ struct Install {
     /// The edge's ports are `18000 + edge` and `19000 + edge`.
     edge: u16,
     installed: bool,
+    /// Held for the install's life: ufw rewrites its rules file whole, so
+    /// two installs adding rules at once can lose one.
+    _one_at_a_time: MutexGuard<'static, ()>,
 }
+
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 impl Install {
     fn new(label: &str, edge: u16) -> Option<Install> {
@@ -50,9 +57,11 @@ impl Install {
             state_dir: home().join(format!(".cache/cirro-install-test-{label}-{pid}")),
             group: format!("cirro-test-{label}-{pid}"),
             unit_name: format!("cirro-test-{label}-{pid}"),
-            subnet: format!("10.78.{}.0/24", pid % 200 + 20),
+            // The edge offset tells this binary's tests apart, which share a pid.
+            subnet: format!("10.78.{}.0/24", (pid + u32::from(edge)) % 200 + 20),
             edge,
             installed: false,
+            _one_at_a_time: ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner()),
         })
     }
 
@@ -249,7 +258,9 @@ fn uninstall_of_a_state_dir_that_was_never_installed_fails_clearly() {
 fn install_requires_firecracker_jailer_and_kernel_together() {
     let mut cmd = Command::cargo_bin("cirro").unwrap();
     cmd.args(["node", "install", "--firecracker", "/tmp/nonexistent"]);
-    cmd.assert().failure();
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("--jailer").and(predicate::str::contains("--kernel")));
 }
 
 #[test]

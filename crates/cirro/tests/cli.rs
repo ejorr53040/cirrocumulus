@@ -48,8 +48,9 @@ fn run_says_a_missing_or_directory_rootfs_is_not_a_rootfs() {
     }
 }
 
-fn empty_cache() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("cirro-cli-cache-{}", std::process::id()));
+/// A cache dir of its own for each test, which run in parallel.
+fn empty_cache(test: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("cirro-cli-cache-{test}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     dir
 }
@@ -57,7 +58,7 @@ fn empty_cache() -> std::path::PathBuf {
 #[test]
 fn image_ls_on_an_empty_cache_prints_just_the_header() {
     let output = cirro()
-        .env("XDG_CACHE_HOME", empty_cache())
+        .env("XDG_CACHE_HOME", empty_cache("image_ls_on_"))
         .args(["image", "ls"])
         .output()
         .unwrap();
@@ -73,7 +74,7 @@ fn image_ls_on_an_empty_cache_prints_just_the_header() {
 #[test]
 fn image_rm_of_an_image_thats_not_cached_fails() {
     cirro()
-        .env("XDG_CACHE_HOME", empty_cache())
+        .env("XDG_CACHE_HOME", empty_cache("image_rm_of_"))
         .args(["image", "rm", "nginx:alpine"])
         .assert()
         .failure()
