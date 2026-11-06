@@ -194,9 +194,21 @@ fn install_creates_a_group_state_dir_and_enabled_unit_and_is_idempotent() {
     );
     assert!(install.is_enabled(), "unit not enabled");
     let unit_contents = std::fs::read_to_string(install.unit_file()).expect("read unit file");
+    let exec_start = unit_contents
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStart="))
+        .unwrap_or_else(|| panic!("unit missing ExecStart: {unit_contents}"));
+    // The agent's flags parse: `--help` only answers once everything before
+    // it has.
+    let parsed = std::process::Command::new(env!("CARGO_BIN_EXE_cirro"))
+        .args(exec_start.split_whitespace().skip(1))
+        .arg("--help")
+        .output()
+        .expect("run cirro");
     assert!(
-        unit_contents.contains("ExecStart="),
-        "unit missing ExecStart: {unit_contents}"
+        parsed.status.success(),
+        "the unit's agent arguments don't parse: {}",
+        String::from_utf8_lossy(&parsed.stderr)
     );
     assert!(
         unit_contents.contains(&install.state_dir.display().to_string()),

@@ -65,49 +65,26 @@ impl Agent {
     /// Starts an agent whose socket belongs to the test user's group, or
     /// returns `None` (after saying why) when the test has to skip.
     fn start(octet: u8) -> Option<Agent> {
-        Agent::start_with_socket_group(octet, &getgid().as_raw().to_string())
-    }
-
-    /// Like [`Agent::start`], with more `cirro node agent` arguments.
-    fn start_with_args(octet: u8, args: &[&str]) -> Option<Agent> {
-        Agent::start_with(
-            octet,
-            &getgid().as_raw().to_string(),
-            args.iter().map(|a| a.to_string()).collect(),
-        )
-    }
-
-    fn start_with_socket_group(octet: u8, socket_group: &str) -> Option<Agent> {
-        Agent::start_with(octet, socket_group, Vec::new())
+        Agent::start_with(octet, None, &[], true)
     }
 
     /// Like [`Agent::start`], for tests that boot no VM and so don't need
     /// KVM: Machine tests.
     fn start_without_kvm(octet: u8) -> Option<Agent> {
-        Agent::start_without_kvm_with_args(octet, &[])
+        Agent::start_with(octet, None, &[], false)
     }
 
-    /// Like [`Agent::start_without_kvm`], with more `cirro node agent`
-    /// arguments.
-    fn start_without_kvm_with_args(octet: u8, args: &[&str]) -> Option<Agent> {
-        Agent::start_checked(
-            octet,
-            &getgid().as_raw().to_string(),
-            args.iter().map(|a| a.to_string()).collect(),
-            false,
-        )
-    }
-
-    fn start_with(octet: u8, socket_group: &str, extra_args: Vec<String>) -> Option<Agent> {
-        Agent::start_checked(octet, socket_group, extra_args, true)
-    }
-
-    fn start_checked(
+    /// Like [`Agent::start`], with the socket's group (the test user's when
+    /// `None`), more `cirro node agent` arguments, and whether it needs KVM.
+    fn start_with(
         octet: u8,
-        socket_group: &str,
-        extra_args: Vec<String>,
+        socket_group: Option<&str>,
+        extra_args: &[&str],
         needs_kvm: bool,
     ) -> Option<Agent> {
+        let socket_group =
+            socket_group.map_or_else(|| getgid().as_raw().to_string(), str::to_owned);
+        let extra_args: Vec<String> = extra_args.iter().map(|a| a.to_string()).collect();
         if needs_kvm && !Path::new("/dev/kvm").exists() {
             eprintln!("skipping: /dev/kvm not present");
             return None;
@@ -142,7 +119,7 @@ impl Agent {
         let mut agent = Agent {
             sudo: None,
             octet,
-            socket_group: socket_group.to_string(),
+            socket_group,
             state_dir,
             socket,
             extra_args,
@@ -1263,7 +1240,7 @@ fn console_logs_are_not_world_readable() {
 #[test]
 fn a_user_outside_the_socket_group_gets_a_clear_permission_error() {
     // The test user isn't in group 0 (root), so the socket is closed to it.
-    let Some(agent) = Agent::start_with_socket_group(230, "0") else {
+    let Some(agent) = Agent::start_with(230, Some("0"), &[], true) else {
         return;
     };
     let err = stderr(agent.cirro().arg("ps").assert().failure());
@@ -2573,8 +2550,9 @@ fn an_app_with_a_public_hostname_is_served_with_an_acme_certificate() {
         return;
     };
     let minica = pebble.minica.to_string_lossy().into_owned();
-    let Some(agent) = Agent::start_with_args(
+    let Some(agent) = Agent::start_with(
         211,
+        None,
         &[
             "--acme-email",
             "ops@cirro-test.dev",
@@ -2583,6 +2561,7 @@ fn an_app_with_a_public_hostname_is_served_with_an_acme_certificate() {
             "--acme-root",
             &minica,
         ],
+        true,
     ) else {
         return;
     };
@@ -3204,8 +3183,9 @@ fn a_machine_backed_app_with_a_public_hostname_gets_an_acme_certificate() {
         return;
     };
     let minica = pebble.minica.to_string_lossy().into_owned();
-    let Some(agent) = Agent::start_without_kvm_with_args(
+    let Some(agent) = Agent::start_with(
         187,
+        None,
         &[
             "--acme-email",
             "ops@cirro-test.dev",
@@ -3214,6 +3194,7 @@ fn a_machine_backed_app_with_a_public_hostname_gets_an_acme_certificate() {
             "--acme-root",
             &minica,
         ],
+        false,
     ) else {
         return;
     };
