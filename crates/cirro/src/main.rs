@@ -712,7 +712,7 @@ async fn image_command(command: ImageCommand) -> Result<(), String> {
             println!("{:<40} {:<19} {:>5}", "REFERENCE", "DIGEST", "SIZE");
             for image in cache.list().map_err(|e| e.to_string())? {
                 let size = std::fs::metadata(&image.rootfs).map_or(0, |m| m.len());
-                let size = cirro_tui::mem(size >> 20);
+                let size = cirro_tui::bytes(size);
                 let digest: String = image.digest.chars().take("sha256:".len() + 12).collect();
                 let references: Vec<&str> = match image.references.as_slice() {
                     [] => vec!["-"],
@@ -806,13 +806,10 @@ async fn top_loop(socket: &Path, terminal: &mut ratatui::DefaultTerminal) -> Res
         match dashboard.key(key.code) {
             cirro_tui::Action::None => {}
             cirro_tui::Action::Quit => return Ok(()),
-            cirro_tui::Action::ShowLog(name) => {
-                let path = format!("/vms/{name}/logs?offset=0");
-                match client::send(socket, Method::GET, &path, None::<&()>).await {
-                    Ok((_, log)) => dashboard.set_log(&name, &String::from_utf8_lossy(&log)),
-                    Err(e) => dashboard.set_status(e),
-                }
-            }
+            cirro_tui::Action::ShowLog(name) => match log_tail(socket, &name).await {
+                Ok(log) => dashboard.set_log(&name, &String::from_utf8_lossy(&log)),
+                Err(e) => dashboard.set_status(e),
+            },
             cirro_tui::Action::Stop(name) => {
                 dashboard.set_status(format!("stopping {name}…"));
                 let socket = socket.to_path_buf();
@@ -953,6 +950,29 @@ async fn logs(socket: &Path, name: &str, follow: bool) -> Result<(), String> {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// The last [`LOG_CHUNK`] bytes of `name`'s console log, read through to
+/// its end: the agent hands out at most one chunk per request.
+// ponytail: reads the whole log to find its end; an offset-from-end query
+// on the agent would avoid that if `top` on huge logs gets slow.
+async fn log_tail(socket: &Path, name: &str) -> Result<Vec<u8>, String> {
+    let mut tail = Vec::new();
+    let mut offset = 0u64;
+    loop {
+        let path = format!("/vms/{name}/logs?offset={offset}");
+        let (_, bytes) = client::send(socket, Method::GET, &path, None::<&()>).await?;
+        let full = bytes.len() as u64 == LOG_CHUNK;
+        offset += bytes.len() as u64;
+        tail.extend_from_slice(&bytes);
+        let keep = LOG_CHUNK as usize;
+        if tail.len() > keep {
+            tail.drain(..tail.len() - keep);
+        }
+        if !full {
+            return Ok(tail);
+        }
     }
 }
 

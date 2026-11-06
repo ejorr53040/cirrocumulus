@@ -21,6 +21,7 @@
 //! `scripts/step0/.build` (`scripts/step0/fetch_kernel.sh`).
 
 use assert_cmd::Command;
+use cirro_proto::LOG_CHUNK;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::{Pid, getgid};
 use std::io::{Read, Write};
@@ -34,24 +35,15 @@ use std::time::{Duration, Instant};
 const HTTP_PORT: u16 = 8080;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The port the agent on Node subnet `10.77.<octet>.0/24` serves its HTTP
-/// edge on, on 127.0.0.1: one per agent, so tests running at once don't
-/// share an edge.
-fn edge_port(octet: u8) -> u16 {
-    18000 + u16::from(octet)
-}
-
-/// Like [`edge_port`], for the HTTPS edge.
-fn tls_edge_port(octet: u8) -> u16 {
-    19000 + u16::from(octet)
-}
-
 /// The Node subnet octets of the agents currently running in this process.
 static LIVE_OCTETS: std::sync::Mutex<std::collections::BTreeSet<u8>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 mod common;
-use common::{home, latest_kernel, repo_root, rootfs, test_agent, test_agent_path};
+use common::{
+    AGENT_OCTETS_FROM, edge_port, home, latest_kernel, repo_root, rootfs, test_agent,
+    test_agent_path, tls_edge_port,
+};
 
 /// A throwaway Node agent on Node subnet `10.77.<octet>.0/24`. It can be
 /// stopped and restarted on the same state dir, like the real one. Dropping
@@ -128,6 +120,10 @@ impl Agent {
             return None;
         }
 
+        assert!(
+            octet >= AGENT_OCTETS_FROM,
+            "octet {octet} is an install test's"
+        );
         // Two live agents on one subnet sweep each other's VMs, which shows
         // up as unrelated failures elsewhere in the suite.
         let free = LIVE_OCTETS.lock().unwrap().insert(octet);
@@ -192,8 +188,11 @@ impl Agent {
             .arg(&self.socket)
             .args(["--socket-group", &self.socket_group])
             .args(["--subnet", &format!("10.77.{octet}.0/24")])
-            .args(["--http", &format!("127.0.0.1:{}", edge_port(octet))])
-            .args(["--https", &format!("127.0.0.1:{}", tls_edge_port(octet))])
+            .args(["--http", &format!("127.0.0.1:{}", edge_port(octet.into()))])
+            .args([
+                "--https",
+                &format!("127.0.0.1:{}", tls_edge_port(octet.into())),
+            ])
             .arg("--firecracker")
             .arg(repo.join("firecracker"))
             .arg("--jailer")
@@ -972,7 +971,7 @@ fn logs_reads_a_long_console_log_whole_and_returns_while_it_still_grows() {
     // runs.
     let log = agent.state_dir.join("logs/chatty.0.log");
     let deadline = Instant::now() + 3 * TIMEOUT;
-    while std::fs::metadata(&log).map_or(0, |m| m.len()) < 5 << 18 {
+    while std::fs::metadata(&log).map_or(0, |m| m.len()) < LOG_CHUNK * 5 / 4 {
         assert!(
             Instant::now() < deadline,
             "chatter wrote only {:?} bytes",
@@ -996,7 +995,7 @@ fn logs_reads_a_long_console_log_whole_and_returns_while_it_still_grows() {
         .filter(|l| l.starts_with("CHATTER "))
         .collect();
     assert!(
-        logs.len() > 1 << 20,
+        logs.len() as u64 > LOG_CHUNK,
         "logs stopped inside the first 1 MiB answer: {} bytes",
         logs.len()
     );
@@ -2104,7 +2103,7 @@ fn edge_get(agent: &Agent, host: &str) -> std::io::Result<String> {
 /// `GET <path>` through the agent's HTTP edge, asking for `host`.
 fn edge_get_path(agent: &Agent, host: &str, path: &str) -> std::io::Result<String> {
     let mut stream = TcpStream::connect_timeout(
-        &SocketAddr::from(([127, 0, 0, 1], edge_port(agent.octet))),
+        &SocketAddr::from(([127, 0, 0, 1], edge_port(agent.octet.into()))),
         Duration::from_secs(1),
     )?;
     stream.set_read_timeout(Some(TIMEOUT))?;
@@ -2374,7 +2373,7 @@ fn tls_get(agent: &Agent, host: &str, ca: &Path) -> Result<String, String> {
 
 /// [`tls_get`] with more `curl` arguments.
 fn tls_get_with(agent: &Agent, host: &str, ca: &Path, extra: &[&str]) -> Result<String, String> {
-    let port = tls_edge_port(agent.octet);
+    let port = tls_edge_port(agent.octet.into());
     let output = std::process::Command::new("curl")
         .args(["--silent", "--show-error", "--max-time", "10", "--cacert"])
         .arg(ca)
@@ -2505,8 +2504,8 @@ impl Pebble {
             "managementListenAddress": management,
             "certificate": certs.join("localhost/cert.pem"),
             "privateKey": certs.join("localhost/key.pem"),
-            "httpPort": edge_port(octet),
-            "tlsPort": tls_edge_port(octet),
+            "httpPort": edge_port(octet.into()),
+            "tlsPort": tls_edge_port(octet.into()),
             "ocspResponderURL": "",
             "externalAccountBindingRequired": false,
         }});

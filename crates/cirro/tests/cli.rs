@@ -9,8 +9,8 @@ fn cirro() -> Command {
 fn help_lists_every_subcommand() {
     let mut assert = cirro().arg("--help").assert().success();
     for cmd in [
-        "node", "server", "run", "image", "ps", "logs", "ssh", "stop", "park", "wake", "top",
-        "bench", "db",
+        "node", "server", "run", "image", "ps", "logs", "ssh", "stop", "park", "wake", "rm",
+        "machine", "top", "bench", "db",
     ] {
         assert = assert.stdout(predicate::str::is_match(format!(r"(?m)^\s+{cmd}\s")).unwrap());
     }

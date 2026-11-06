@@ -6,8 +6,7 @@
 //!
 //! The `cirro-guest-init` package says where its source is through `links`
 //! metadata. In this repository that is `crates/guest-init`, built with the
-//! workspace's lockfile into `target/guest-init-embed`, where the VM tests
-//! also find it. Anywhere else (a crates.io download, a vendored copy) the
+//! workspace's lockfile into `target/guest-init-embed`. Anywhere else (a crates.io download, a vendored copy) the
 //! source is copied under `OUT_DIR` and built there, so nothing is written
 //! next to the downloaded source. Either way the nested `cargo build` gets a
 //! target dir of its own: sharing the outer build's is a known way to

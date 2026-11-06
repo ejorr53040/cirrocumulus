@@ -109,7 +109,7 @@ fn row(out: &mut String, [name, cells @ ..]: [String; 7]) {
 
 /// `n` bytes in the largest unit that keeps it at least 1: `512B`, `140M`,
 /// `1.5G`.
-fn bytes(n: u64) -> String {
+pub fn bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
     let mut value = n as f64;
     let mut unit = 0;

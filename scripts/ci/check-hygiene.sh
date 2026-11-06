@@ -26,7 +26,7 @@ report() {
     fail=1
 }
 
-# Binary-ish files that are allowed to skip the text checks.
+# True for text files; others skip the text checks.
 is_text() {
     # `grep -I` treats a file with NUL bytes as binary and prints nothing.
     [ ! -s "$1" ] || grep -Iq . "$1"

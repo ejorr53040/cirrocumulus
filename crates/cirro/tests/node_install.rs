@@ -20,12 +20,14 @@ use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
 mod common;
-use common::{home, latest_kernel, repo_root, rootfs, test_agent, test_agent_path};
+use common::{
+    AGENT_OCTETS_FROM, edge_port, home, latest_kernel, repo_root, rootfs, test_agent,
+    test_agent_path, tls_edge_port,
+};
 
 /// One test's throwaway install target: a unique group, unit name, subnet
 /// and state dir, all named from this test's pid so parallel test runs
-/// (and parallel `cargo test` invocations across this file and
-/// `node_agent.rs`) never collide. `Drop` force-uninstalls, so a failed
+/// never collide, on a subnet octet below `node_agent.rs`'s. `Drop` force-uninstalls, so a failed
 /// assertion never strands a real group/systemd unit/state dir on the
 /// host.
 struct Install {
@@ -33,7 +35,7 @@ struct Install {
     group: String,
     unit_name: String,
     subnet: String,
-    /// The edge's ports are `18000 + edge` and `19000 + edge`.
+    /// Its edge's ports are [`edge_port`] and [`tls_edge_port`] of this.
     edge: u16,
     installed: bool,
     /// Held for the install's life: ufw rewrites its rules file whole, so
@@ -58,7 +60,10 @@ impl Install {
             group: format!("cirro-test-{label}-{pid}"),
             unit_name: format!("cirro-test-{label}-{pid}"),
             // The edge offset tells this binary's tests apart, which share a pid.
-            subnet: format!("10.78.{}.0/24", (pid + u32::from(edge)) % 200 + 20),
+            subnet: format!(
+                "10.78.{}.0/24",
+                (pid + u32::from(edge)) % (u32::from(AGENT_OCTETS_FROM) - 20) + 20
+            ),
             edge,
             installed: false,
             _one_at_a_time: ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner()),
@@ -84,8 +89,11 @@ impl Install {
             .arg(repo.join("jailer"))
             .arg("--kernel")
             .arg(latest_kernel())
-            .args(["--http", &format!("127.0.0.1:{}", 18000 + self.edge)])
-            .args(["--https", &format!("127.0.0.1:{}", 19000 + self.edge)]);
+            .args(["--http", &format!("127.0.0.1:{}", edge_port(self.edge))])
+            .args([
+                "--https",
+                &format!("127.0.0.1:{}", tls_edge_port(self.edge)),
+            ]);
         cmd
     }
 
@@ -195,7 +203,11 @@ fn install_creates_a_group_state_dir_and_enabled_unit_and_is_idempotent() {
         "unit doesn't reference the state dir: {unit_contents}"
     );
     assert!(
-        unit_contents.contains("--http 127.0.0.1:18299 --https 127.0.0.1:19299"),
+        unit_contents.contains(&format!(
+            "--http 127.0.0.1:{} --https 127.0.0.1:{}",
+            edge_port(install.edge),
+            tls_edge_port(install.edge)
+        )),
         "unit doesn't start the agent's edge where install was told: {unit_contents}"
     );
     assert_ne!(
