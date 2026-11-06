@@ -132,7 +132,7 @@ pub(crate) fn open_as(uid: u32, gid: u32, path: &Path) -> Result<std::fs::File, 
 }
 
 /// The helper itself, run as `cirro __open-rootfs <uid> <gid> <path>` once
-/// [`open_as`]'s `pre_exec` has dropped it to `uid`/`gid`: opens `path`,
+/// `open_as`'s `pre_exec` has dropped it to `uid`/`gid`: opens `path`,
 /// refuses anything but a regular file, and sends the fd back over stdin.
 pub fn helper(uid: u32, gid: u32, path: &Path) -> ExitCode {
     // Belt and suspenders: the Node agent's `pre_exec` should already have
