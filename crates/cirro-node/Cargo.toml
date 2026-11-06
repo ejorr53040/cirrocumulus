@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 cirro-proto.workspace = true
 cirro-edge.workspace = true
+cirro-guest-init.workspace = true
 serde = { workspace = true, features = ["derive"] }
 bytes.workspace = true
 http-body-util.workspace = true

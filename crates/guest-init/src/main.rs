@@ -71,12 +71,6 @@ fn forward_shutdown(pid: nix::libc::pid_t) {
     }
 }
 
-/// Guest-side vsock port guest-init listens on for its config, per
-/// RESEARCH.md M2 slice 6. Arbitrary but fixed, matching the host side
-/// (`scripts/step0/push_vsock_config.sh`); same JSON shape slices 2-5's
-/// fixed-path file used, so `config::parse_config` doesn't change.
-const VSOCK_CONFIG_PORT: u32 = 52;
-
 /// Printed to the console (ttyS0) once the pseudo-filesystems are mounted,
 /// so the boot harness can confirm guest-init reached this point as PID 1.
 const BOOT_MARKER: &str = "GUEST_INIT_MOUNTS_OK";
@@ -135,7 +129,7 @@ fn read_config_from_vsock() -> Config {
     )
     .expect("create vsock socket");
 
-    let addr = VsockAddr::new(nix::libc::VMADDR_CID_ANY, VSOCK_CONFIG_PORT);
+    let addr = VsockAddr::new(nix::libc::VMADDR_CID_ANY, config::CONFIG_PORT);
     bind(listen_fd.as_raw_fd(), &addr).expect("bind vsock config port");
     listen(&listen_fd, Backlog::MAXCONN).expect("listen on vsock config port");
 

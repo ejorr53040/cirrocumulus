@@ -21,12 +21,13 @@ use crate::metrics::{Recorder, RunningVm, Sampler};
 use crate::rootfs_open;
 use crate::state::{Record, Store};
 use crate::subnet::Subnet;
-use crate::vm::{self, GuestConfig, Stop, Vm, VmSpec, WakeSpec};
+use crate::vm::{self, Stop, Vm, VmSpec, WakeSpec};
 use bytes::Bytes;
 pub use cirro_edge::acme::AcmeConfig;
 use cirro_edge::acme::{Acme, is_public};
 use cirro_edge::tls::NodeCa;
 use cirro_edge::{Lease, Resolution, Router};
+use cirro_guest_init::config::{self as guest, Config as GuestConfig};
 use cirro_proto::{
     AddMachine, EndReason, Ended, ErrorBody, LOG_CHUNK, MAX_MEM_MIB, MAX_VCPUS, MIN_MEM_MIB,
     MIN_VCPUS, MachineAppRequest, MachineHostKey, MachineScan, Route, RunRequest, Stats,
@@ -1724,7 +1725,10 @@ fn guest_config(run: &RunRequest) -> Result<GuestConfig, ApiError> {
         args: args.to_vec(),
         env: run.env.clone(),
         workdir: run.workdir.clone(),
-        user: run.user,
+        user: run.user.map(|u| guest::User {
+            uid: u.uid,
+            gid: u.gid,
+        }),
     })
 }
 

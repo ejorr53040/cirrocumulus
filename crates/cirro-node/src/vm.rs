@@ -31,6 +31,7 @@
 
 use crate::firecracker::{BootConfig, Client};
 use crate::subnet::Subnet;
+use cirro_guest_init::config::{CONFIG_PORT, Config as GuestConfig};
 use cirro_proto::EndReason;
 use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom};
@@ -62,8 +63,6 @@ const SNAPSHOT_FILES: [&str; 3] = ["vmstate", "mem", "rootfs.ext4"];
 const PARK_FILES: [&str; 3] = ["park.vmstate", "park.mem", "rootfs.ext4"];
 const WAKE_FILES: [&str; 3] = ["wake.vmstate", "wake.mem", "rootfs.ext4"];
 
-/// The fixed vsock port guest-init reads its config on (M2 protocol).
-const VSOCK_CONFIG_PORT: u32 = 52;
 /// The guest's vsock context id. Any id from 3 up works; each VM has its own
 /// vsock device, so every guest can use the same one.
 const VSOCK_GUEST_CID: u32 = 3;
@@ -133,16 +132,6 @@ pub fn jails(jail_base: &Path, firecracker: &Path) -> PathBuf {
         .file_name()
         .expect("the firecracker path names a file");
     jail_base.join(vmm)
-}
-
-/// What guest-init runs: its config, sent as JSON over vsock (M2 protocol).
-#[derive(Debug, serde::Serialize)]
-pub struct GuestConfig {
-    pub exec: String,
-    pub args: Vec<String>,
-    pub env: Vec<String>,
-    pub workdir: Option<String>,
-    pub user: Option<cirro_proto::User>,
 }
 
 /// What to start: the VM address is allocated by the caller.
@@ -1119,7 +1108,7 @@ async fn try_deliver_config(vsock: &Path, config: &str) -> Result<(), String> {
     let mut stream = BufReader::new(stream);
     stream
         .get_mut()
-        .write_all(format!("CONNECT {VSOCK_CONFIG_PORT}\n").as_bytes())
+        .write_all(format!("CONNECT {CONFIG_PORT}\n").as_bytes())
         .await
         .map_err(|e| e.to_string())?;
     let mut ack = String::new();
