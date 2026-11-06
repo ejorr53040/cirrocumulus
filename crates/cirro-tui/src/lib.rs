@@ -131,7 +131,7 @@ pub(crate) fn per_sec(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cirro_proto::{NodeRates, VmInfo, VmRates, VmStats};
+    use cirro_proto::{MachineStatus, Route, VmInfo, VmStats};
 
     fn vm(name: &str, history: Vec<VmRates>) -> VmStats {
         VmStats {
@@ -183,7 +183,18 @@ mod tests {
             ],
         };
 
-        let text = snapshot(&stats, &[]);
+        let blog = MachineAppInfo {
+            name: "blog".into(),
+            machine: "pi".into(),
+            route: Route {
+                host: "blog.test".into(),
+                port: 8080,
+                idle_park_secs: None,
+            },
+            status: MachineStatus::Up,
+        };
+
+        let text = snapshot(&stats, &[blog]);
         let lines: Vec<Vec<&str>> = text
             .lines()
             .map(|l| l.split_whitespace().collect())
@@ -201,6 +212,8 @@ mod tests {
                 ],
                 vec!["web", "99.8%", "140M", "10M/s", "512B/s", "0B/s", "4.0K/s"],
                 vec!["new", "-", "-", "-", "-", "-", "-"],
+                vec!["MACHINE-BACKED", "APP", "MACHINE", "STATUS"],
+                vec!["blog", "pi:8080", "up"],
             ]
         );
     }

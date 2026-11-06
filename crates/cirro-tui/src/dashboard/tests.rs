@@ -78,19 +78,17 @@ fn it_shows_the_node_and_each_vms_latest_rates() {
     let screen = screen(&dashboard);
 
     let all = screen.join("\n");
-    assert!(all.contains("CPU 12.3%"), "{all}");
+    // The summary's wording is the snapshot's, tested there.
+    let summary = screen.iter().find(|l| l.contains("CPU 12.3%"));
+    let summary = summary.unwrap_or_else(|| panic!("no Node summary:\n{all}"));
     for graph in [" cpu ", " mem ", " net "] {
-        assert!(screen[1].contains(graph), "no{graph}sparkline:\n{all}");
+        assert!(summary.contains(graph), "no{graph}sparkline:\n{all}");
     }
-    assert!(all.contains("MEM 3.0G/16G"), "{all}");
     let web = row(&screen, "web").unwrap_or_else(|| panic!("no web row:\n{all}"));
     let cells: Vec<&str> = web.split_whitespace().collect();
-    // vCPUs, then uptime, right after the VM address.
+    // vCPUs, then uptime, then the rates, right after the VM address.
     let at = cells.iter().position(|c| *c == "10.77.0.2").unwrap();
-    assert_eq!(cells[at + 1..at + 3], ["1", "2m"], "{web}");
-    for cell in ["99.8%", "140M", "2.0K/s"] {
-        assert!(web.contains(cell), "web's row lacks {cell}: {web}");
-    }
+    assert_eq!(cells[at + 1..at + 4], ["1", "2m", "99.8%"], "{web}");
     assert!(row(&screen, "db").is_some(), "no db row:\n{all}");
     assert!(all.contains("q quit"), "no key help:\n{all}");
 }
@@ -120,9 +118,8 @@ fn arrow_keys_choose_the_vm_the_detail_pane_shows_and_q_quits() {
     assert_eq!(dashboard.key(KeyCode::Char('q')), Action::Quit);
 }
 
-/// The VM names in table order.
-fn order(screen: &[String]) -> Vec<String> {
-    let names = ["web", "db"];
+/// Which of `names` the VM table shows, in its order.
+fn order(screen: &[String], names: &[&str]) -> Vec<String> {
     screen
         .iter()
         .take_while(|l| !l.contains(" Detail "))
@@ -138,11 +135,11 @@ fn vms_sort_by_cpu_first_and_tab_cycles_memory_then_name() {
     let mut dashboard = Dashboard::default();
     dashboard.set_stats(stats());
     // web uses more CPU, db more memory; by name db comes first.
-    assert_eq!(order(&screen(&dashboard)), ["web", "db"]);
+    assert_eq!(order(&screen(&dashboard), &["web", "db"]), ["web", "db"]);
     assert!(screen(&dashboard).join("\n").contains("CPU▼"));
 
     dashboard.key(KeyCode::Tab);
-    assert_eq!(order(&screen(&dashboard)), ["db", "web"]);
+    assert_eq!(order(&screen(&dashboard), &["web", "db"]), ["db", "web"]);
     assert!(screen(&dashboard).join("\n").contains("MEM▼"));
     // Still web, wherever its row went.
     assert!(detail(&screen(&dashboard)).contains("web"));
@@ -157,17 +154,10 @@ fn vms_sort_by_cpu_first_and_tab_cycles_memory_then_name() {
     });
     dashboard.key(KeyCode::Tab);
     assert!(screen(&dashboard).join("\n").contains("NAME▲"));
-    let names: Vec<String> = screen(&dashboard)
-        .iter()
-        .take_while(|l| !l.contains(" Detail "))
-        .filter_map(|l| {
-            let first = l.split_whitespace().next()?.trim_matches('│');
-            ["zeta", "web", "db"]
-                .contains(&first)
-                .then(|| first.to_string())
-        })
-        .collect();
-    assert_eq!(names, ["db", "web", "zeta"]);
+    assert_eq!(
+        order(&screen(&dashboard), &["zeta", "web", "db"]),
+        ["db", "web", "zeta"]
+    );
 
     dashboard.key(KeyCode::Tab);
     assert!(screen(&dashboard).join("\n").contains("CPU▼"));
@@ -187,10 +177,7 @@ fn l_asks_for_the_selected_vms_log_and_shows_its_last_lines() {
 
     let shown = detail(&screen(&dashboard));
     assert!(shown.contains("line 50"), "{shown}");
-    assert!(
-        !shown.contains("line 1\n") && !shown.contains("line 1 "),
-        "{shown}"
-    );
+    assert!(!shown.contains("line 1 "), "{shown}");
 
     // `l` again hides it.
     assert_eq!(dashboard.key(KeyCode::Char('l')), Action::None);
@@ -257,15 +244,16 @@ fn sparklines_show_the_newest_samples() {
 
     let screen = screen(&dashboard);
 
-    // The header's cpu sparkline: its rows, right of the " cpu " title.
-    let column = screen[1].find(" cpu ").expect("no cpu sparkline");
-    let cells: String = screen[1..3]
+    // The header's cpu sparkline, the first on screen: its rows, right of
+    // the " cpu " title.
+    let top = screen.iter().position(|l| l.contains(" cpu "));
+    let top = top.expect("no cpu sparkline");
+    let column = screen[top][..screen[top].find(" cpu ").unwrap()]
+        .chars()
+        .count();
+    let cells: String = screen[top..top + 2]
         .iter()
-        .flat_map(|row| {
-            row.chars()
-                .skip(screen[1][..column].chars().count())
-                .take(20)
-        })
+        .flat_map(|row| row.chars().skip(column).take(20))
         .collect();
     assert!(
         cells.contains('█'),

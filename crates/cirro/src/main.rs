@@ -1139,7 +1139,6 @@ fn parse_user(s: &str) -> Result<User, String> {
     Ok(User { uid, gid })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{GUEST_INIT_BINARY, nearest_rank};
