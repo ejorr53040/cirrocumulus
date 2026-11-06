@@ -7,7 +7,7 @@
 //! identity of its VMM process to find and remove that state again.
 //! Console logs stay as files next to their record; the record names its file.
 
-use crate::vm::ProcessId;
+use crate::process::ProcessId;
 use cirro_proto::{EndReason, Ended, Route, VmInfo};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::io;

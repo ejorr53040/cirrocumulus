@@ -11,6 +11,7 @@
 //! same arguments, every step below finds its target already in the state
 //! it would have created and does nothing.
 
+use crate::cmd;
 use crate::egress;
 use crate::layout;
 use crate::release::{self, ReleaseBinaries};
@@ -252,7 +253,7 @@ fn set_group_existence(name: &str, want_exists: bool, verb: &str) -> io::Result<
     if nix::unistd::Group::from_name(name)?.is_some() == want_exists {
         return Ok(());
     }
-    run(Command::new(verb).arg(name))
+    cmd::run(Command::new(verb).arg(name), None).map(drop)
 }
 
 fn ensure_group(name: &str) -> io::Result<()> {
@@ -277,7 +278,7 @@ const UFW_COMMENT: &str = "cirro Node VMs";
 /// firewall that is there refuses the rule.
 fn allow_through_host_firewall(subnet: &str) -> io::Result<()> {
     for mut command in host_firewall_commands(subnet, true) {
-        run(&mut command)?;
+        cmd::run(&mut command, None)?;
     }
     Ok(())
 }
@@ -286,7 +287,7 @@ fn allow_through_host_firewall(subnet: &str) -> io::Result<()> {
 /// of uninstall: a rule that's already gone isn't a failure.
 fn remove_from_host_firewall(subnet: &str) {
     for mut command in host_firewall_commands(subnet, false) {
-        let _ = run(&mut command);
+        let _ = cmd::run(&mut command, None);
     }
 }
 
@@ -386,10 +387,14 @@ fn install_unit(config: &NodeConfig, state_dir: &Path) -> io::Result<()> {
     );
     let unit_path = unit_path(&config.unit_name);
     fs::write(&unit_path, unit)?;
-    run(Command::new("systemctl").arg("daemon-reload"))?;
-    run(Command::new("systemctl")
-        .args(["enable", "--now"])
-        .arg(format!("{}.service", config.unit_name)))
+    cmd::run(Command::new("systemctl").arg("daemon-reload"), None)?;
+    cmd::run(
+        Command::new("systemctl")
+            .args(["enable", "--now"])
+            .arg(format!("{}.service", config.unit_name)),
+        None,
+    )
+    .map(drop)
 }
 
 /// Stops, disables and removes the unit. Missing/not-enabled is fine --
@@ -404,21 +409,17 @@ fn remove_unit(unit_name: &str) -> io::Result<()> {
     if path.exists() {
         fs::remove_file(&path)?;
     }
-    run(Command::new("systemctl").arg("daemon-reload"))
+    cmd::run(Command::new("systemctl").arg("daemon-reload"), None).map(drop)
 }
 
 fn unit_path(unit_name: &str) -> PathBuf {
     PathBuf::from("/etc/systemd/system").join(format!("{unit_name}.service"))
 }
 
-fn run(command: &mut Command) -> io::Result<()> {
-    release::run_capturing(command).map(drop)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::ProcessId;
+    use crate::process::ProcessId;
     use cirro_proto::{EndReason, Ended, VmInfo};
 
     /// Needs no root at all: a real SQLite state dir and the test's own

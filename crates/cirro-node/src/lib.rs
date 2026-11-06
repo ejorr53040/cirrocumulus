@@ -3,11 +3,13 @@
 //! `cirro node install`/`uninstall`.
 
 pub mod agent;
+mod cmd;
 pub mod egress;
 pub mod firecracker;
 pub mod install;
 mod layout;
 pub mod metrics;
+mod process;
 pub mod release;
 pub mod rootfs_open;
 mod state;

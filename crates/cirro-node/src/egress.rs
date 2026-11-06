@@ -20,10 +20,11 @@
 //! Letting VM traffic past such a firewall is therefore the firewall's own
 //! configuration, which `cirro node install` sets up (#11).
 
+use crate::cmd;
 use crate::vm::HOST_ID_PREFIX;
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 /// The table's name, in the `ip` family.
 const TABLE: &str = "cirro";
@@ -119,34 +120,6 @@ pub fn default_route_iface() -> Option<String> {
         .map(str::to_string)
 }
 
-/// Runs `nft`, feeding it `stdin` when given, and folds its stderr into the
-/// error on failure.
 fn nft(args: &[&str], stdin: Option<&str>) -> io::Result<()> {
-    let mut child = Command::new("nft")
-        .args(args)
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let Some(input) = stdin {
-        child
-            .stdin
-            .take()
-            .expect("stdin was piped")
-            .write_all(input.as_bytes())?;
-    }
-    let output = child.wait_with_output()?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "nft {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )))
-    }
+    cmd::run(Command::new("nft").args(args), stdin).map(drop)
 }

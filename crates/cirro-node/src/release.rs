@@ -13,16 +13,30 @@
 //! `--kernel` overrides (the same convention `node agent` already uses) to
 //! skip this module entirely, so `cargo test` never needs network access.
 
+use crate::cmd;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub const FIRECRACKER_VERSION: &str = "1.17.0";
+/// The pinned Firecracker release, as a macro so the names built from it
+/// can be `concat!`ed at compile time.
+macro_rules! firecracker_version {
+    () => {
+        "1.17.0"
+    };
+}
+const FIRECRACKER_VERSION: &str = firecracker_version!();
 
-const RELEASE_DIR: &str = "release-v1.17.0-x86_64";
-const FIRECRACKER_URL: &str = "https://github.com/firecracker-microvm/firecracker/releases/download/v1.17.0/firecracker-v1.17.0-x86_64.tgz";
+const RELEASE_DIR: &str = concat!("release-v", firecracker_version!(), "-x86_64");
+const FIRECRACKER_URL: &str = concat!(
+    "https://github.com/firecracker-microvm/firecracker/releases/download/v",
+    firecracker_version!(),
+    "/firecracker-v",
+    firecracker_version!(),
+    "-x86_64.tgz"
+);
 /// The whole release tarball's own hash (from its published
 /// `firecracker-v1.17.0-x86_64.tgz.sha256.txt`), checked before it's
 /// trusted enough to extract anything from.
@@ -40,9 +54,17 @@ const JAILER_BIN_SHA256: &str = "65ef226e96f0ceda55ba643f445801ef2cc0ea667ef67ca
 // pin is the best available source, not an ideal one: it may 404 upstream
 // eventually and need re-pinning with a fresh `scripts/step0/fetch_kernel.sh`
 // run followed by `sha256sum`. Recorded here 2026-09-29.
-const KERNEL_URL: &str = "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260929-a738f18a8db0-0/x86_64/vmlinux-6.18.48";
+macro_rules! kernel_filename {
+    () => {
+        "vmlinux-6.18.48"
+    };
+}
+const KERNEL_URL: &str = concat!(
+    "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20260929-a738f18a8db0-0/x86_64/",
+    kernel_filename!()
+);
 const KERNEL_SHA256: &str = "b0ff002711a6be32f2f5cbc21fbb7b2987b7807e0d37540034d49db22ce3d06b";
-const KERNEL_FILENAME: &str = "vmlinux-6.18.48";
+const KERNEL_FILENAME: &str = kernel_filename!();
 
 /// The three binaries a Node needs to run VMs: wherever they came from
 /// (this module's own pinned fetch, or an override an operator/test
@@ -92,30 +114,13 @@ pub fn fetch(dest_dir: &Path) -> io::Result<ReleaseBinaries> {
     })
 }
 
-/// Runs `command`, returning its stdout on success. On failure, folds the
-/// command's own debug form and stderr into one `io::Error` -- every
-/// caller in this module wants exactly this shape, whether it needs the
-/// output (`sha256sum`, `tar -O`) or just success/failure (`curl`), and so
-/// does [`crate::install`]'s own `run` (`groupadd`/`systemctl`).
-pub(crate) fn run_capturing(command: &mut Command) -> io::Result<Vec<u8>> {
-    let output = command.output()?;
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        Err(io::Error::other(format!(
-            "{command:?}: {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )))
-    }
-}
-
 fn download(url: &str, dest: &Path) -> io::Result<()> {
-    run_capturing(
+    cmd::run(
         Command::new("curl")
             .args(["-fsSL", "-o"])
             .arg(dest)
             .arg(url),
+        None,
     )
     .map(drop)
 }
@@ -125,7 +130,7 @@ fn download(url: &str, dest: &Path) -> io::Result<()> {
 /// caller here treats "not verified" and "not present" identically: fetch
 /// it (again).
 fn verify(path: &Path, want_sha256: &str) -> io::Result<()> {
-    let output = run_capturing(Command::new("sha256sum").arg(path))?;
+    let output = cmd::run(Command::new("sha256sum").arg(path), None)?;
     let got = String::from_utf8_lossy(&output);
     let got_hash = got.split_whitespace().next().unwrap_or_default();
     if got_hash != want_sha256 {
@@ -143,7 +148,7 @@ fn verify(path: &Path, want_sha256: &str) -> io::Result<()> {
 /// crate's own unversioned name does.
 fn extract_release_binary(tgz: &Path, name: &str, dest: &Path) -> io::Result<()> {
     let member = format!("{RELEASE_DIR}/{name}-v{FIRECRACKER_VERSION}-x86_64");
-    let bytes = run_capturing(Command::new("tar").arg("-xzOf").arg(tgz).arg(&member))?;
+    let bytes = cmd::run(Command::new("tar").arg("-xzOf").arg(tgz).arg(&member), None)?;
     fs::write(dest, &bytes)?;
     let mut perms = fs::metadata(dest)?.permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
