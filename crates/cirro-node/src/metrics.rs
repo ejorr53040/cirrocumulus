@@ -5,7 +5,7 @@
 //! host side of its veth, both named by [`vm::host_id`].
 
 use crate::vm;
-pub use cirro_proto::{NodeRates, VmRates};
+pub(crate) use cirro_proto::{NodeRates, VmRates};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -13,43 +13,43 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 
 /// How many rates a [`Series`] keeps: a minute, sampled every second.
-pub const HISTORY: usize = 60;
+pub(crate) const HISTORY: usize = 60;
 
 /// A running VM to sample: its name, and the host id its cgroup and veth
 /// are named by.
-pub struct RunningVm {
-    pub name: String,
-    pub id: String,
+pub(crate) struct RunningVm {
+    pub(crate) name: String,
+    pub(crate) id: String,
 }
 
 /// A VM's counters at one moment. Each only grows, except `memory_bytes`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct VmSample {
+pub(crate) struct VmSample {
     /// CPU time the VMM has used, in microseconds.
-    pub cpu_usec: u64,
-    pub memory_bytes: u64,
-    pub io_read_bytes: u64,
-    pub io_write_bytes: u64,
+    pub(crate) cpu_usec: u64,
+    pub(crate) memory_bytes: u64,
+    pub(crate) io_read_bytes: u64,
+    pub(crate) io_write_bytes: u64,
     /// Bytes the VM has received and sent.
-    pub rx_bytes: u64,
-    pub tx_bytes: u64,
+    pub(crate) rx_bytes: u64,
+    pub(crate) tx_bytes: u64,
 }
 
 /// The Node's counters at one moment.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct NodeSample {
+pub(crate) struct NodeSample {
     /// Clock ticks every CPU spent busy, and in all, since boot.
-    pub cpu_busy_ticks: u64,
-    pub cpu_total_ticks: u64,
-    pub memory_total_bytes: u64,
-    pub memory_available_bytes: u64,
+    pub(crate) cpu_busy_ticks: u64,
+    pub(crate) cpu_total_ticks: u64,
+    pub(crate) memory_total_bytes: u64,
+    pub(crate) memory_available_bytes: u64,
     /// Bytes through the Node's own interfaces, not its loopback or VMs'.
-    pub rx_bytes: u64,
-    pub tx_bytes: u64,
+    pub(crate) rx_bytes: u64,
+    pub(crate) tx_bytes: u64,
 }
 
 /// Counters that turn into rates between two samples.
-pub trait Sample {
+pub(crate) trait Sample {
     type Rates;
     /// What was used per second since `earlier`, `elapsed` ago. A counter
     /// that went backwards reads as no activity.
@@ -99,7 +99,7 @@ impl Sample for NodeSample {
 }
 
 /// The last [`HISTORY`] rates of one Node or VM, oldest first.
-pub struct Series<S: Sample> {
+pub(crate) struct Series<S: Sample> {
     last: Option<(Instant, S)>,
     rates: VecDeque<S::Rates>,
 }
@@ -116,7 +116,7 @@ impl<S: Sample> Default for Series<S> {
 impl<S: Sample> Series<S> {
     /// Adds the rates since the previous sample, dropping the oldest once
     /// there are [`HISTORY`]. The first sample only sets a baseline.
-    pub fn record(&mut self, at: Instant, sample: S) {
+    pub(crate) fn record(&mut self, at: Instant, sample: S) {
         if let Some((then, earlier)) = &self.last {
             if self.rates.len() == HISTORY {
                 self.rates.pop_front();
@@ -127,37 +127,33 @@ impl<S: Sample> Series<S> {
         self.last = Some((at, sample));
     }
 
-    pub fn rates(&self) -> impl Iterator<Item = &S::Rates> {
+    pub(crate) fn rates(&self) -> impl Iterator<Item = &S::Rates> {
         self.rates.iter()
-    }
-
-    pub fn latest(&self) -> Option<&S::Rates> {
-        self.rates.back()
     }
 }
 
 /// Reads samples from a filesystem root: `/` on a Node, a fake tree in
 /// tests.
-pub struct Sampler {
+pub(crate) struct Sampler {
     root: PathBuf,
 }
 
 /// One round of samples, read before [`Recorder::record`] takes them, so
 /// no lock is held while the kernel's files are read.
-pub struct Readings {
+pub(crate) struct Readings {
     node: Option<NodeSample>,
     /// Every running VM by name, with its sample if it could be read.
     vms: Vec<(String, Option<VmSample>)>,
 }
 
 impl Sampler {
-    pub fn new(root: PathBuf) -> Sampler {
+    pub(crate) fn new(root: PathBuf) -> Sampler {
         Sampler { root }
     }
 
     /// Samples the Node and `vms`. A VM that can't be read yet (its cgroup
     /// appears a moment after it starts) has no sample this round.
-    pub fn read(&self, vms: &[RunningVm]) -> Readings {
+    pub(crate) fn read(&self, vms: &[RunningVm]) -> Readings {
         let node = self.node().map_err(|e| debug!("sample the Node: {e}")).ok();
         let vms = vms
             .iter()
@@ -173,7 +169,7 @@ impl Sampler {
     }
 
     /// The Node's counters.
-    pub fn node(&self) -> io::Result<NodeSample> {
+    pub(crate) fn node(&self) -> io::Result<NodeSample> {
         let stat = read(&self.root.join("proc/stat"))?;
         // cpu user nice system idle iowait irq softirq steal guest guest_nice;
         // guest time is already counted in user, so it stops at steal.
@@ -227,7 +223,7 @@ impl Sampler {
     }
 
     /// The counters of the VM with host id `id`.
-    pub fn vm(&self, id: &str) -> io::Result<VmSample> {
+    pub(crate) fn vm(&self, id: &str) -> io::Result<VmSample> {
         let cgroup = vm::parent_cgroup_under(&self.root).join(id);
         let cpu_usec = field(&read(&cgroup.join("cpu.stat"))?, "usage_usec")?;
         let memory_bytes = number(&read(&cgroup.join("memory.current"))?)?;
@@ -252,7 +248,7 @@ impl Sampler {
 
 /// The Node's series and each running VM's, as the agent keeps them.
 #[derive(Default)]
-pub struct Recorder {
+pub(crate) struct Recorder {
     node: Series<NodeSample>,
     vms: HashMap<String, Series<VmSample>>,
 }
@@ -260,7 +256,7 @@ pub struct Recorder {
 impl Recorder {
     /// Records `readings`, taken at `at`, and forgets every VM they don't
     /// list as running.
-    pub fn record(&mut self, at: Instant, readings: Readings) {
+    pub(crate) fn record(&mut self, at: Instant, readings: Readings) {
         if let Some(sample) = readings.node {
             self.node.record(at, sample);
         }
@@ -274,12 +270,12 @@ impl Recorder {
     }
 
     /// The Node's rates, oldest first.
-    pub fn node(&self) -> Vec<NodeRates> {
+    pub(crate) fn node(&self) -> Vec<NodeRates> {
         self.node.rates().copied().collect()
     }
 
     /// VM `name`'s rates, oldest first.
-    pub fn vm(&self, name: &str) -> Vec<VmRates> {
+    pub(crate) fn vm(&self, name: &str) -> Vec<VmRates> {
         self.vms
             .get(name)
             .map(|series| series.rates().copied().collect())
@@ -555,6 +551,6 @@ mod tests {
         assert_eq!(rates.len(), HISTORY);
         assert_eq!(rates[..HISTORY - 1], [100.0; HISTORY - 1]);
         assert_eq!(rates[HISTORY - 1], 0.0);
-        assert_eq!(series.latest().map(|r| r.cpu_percent), Some(0.0));
+        assert_eq!(series.rates().last().map(|r| r.cpu_percent), Some(0.0));
     }
 }

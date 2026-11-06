@@ -4,17 +4,17 @@
 
 pub mod agent;
 mod cmd;
-pub mod egress;
+mod egress;
 pub mod firecracker;
 pub mod install;
 mod layout;
-pub mod metrics;
+mod metrics;
 mod process;
 pub mod release;
 pub mod rootfs_open;
 mod state;
 pub mod subnet;
-pub mod vm;
+mod vm;
 
 /// A fresh, empty temp dir per test, named `<prefix>-<pid>-<n>` so parallel
 /// threads and parallel test binaries never collide.

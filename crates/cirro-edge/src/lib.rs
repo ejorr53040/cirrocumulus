@@ -138,8 +138,11 @@ async fn accept<R: Router>(
             };
             match tokio::time::timeout(HANDSHAKE_TIMEOUT, tls.accept(stream)).await {
                 Ok(Ok(stream)) => {
-                    // The resolver only answers a client with an SNI name.
-                    let sni = stream.get_ref().1.server_name().unwrap_or_default();
+                    let sni = stream
+                        .get_ref()
+                        .1
+                        .server_name()
+                        .expect("the resolver only answers a client with an SNI name");
                     let scheme = Scheme::Https {
                         sni: normalize(sni),
                     };
@@ -291,19 +294,18 @@ async fn proxy(
         .uri
         .path_and_query()
         .map_or_else(|| Uri::from_static("/"), |pq| Uri::from(pq.clone()));
-    if let Ok(value) = HeaderValue::from_str(host) {
-        parts.headers.insert(header::HOST, value.clone());
-        parts
-            .headers
-            .insert(HeaderName::from_static("x-forwarded-host"), value);
-    }
+    let value = HeaderValue::from_str(host).expect("a hostname the edge parsed is a header value");
+    parts.headers.insert(header::HOST, value.clone());
+    parts
+        .headers
+        .insert(HeaderName::from_static("x-forwarded-host"), value);
     // The edge is the first proxy a request meets, so whatever a client
     // put in X-Forwarded-For is its own claim: replaced, not appended to.
-    if let Ok(value) = HeaderValue::from_str(&peer.ip().to_string()) {
-        parts
-            .headers
-            .insert(HeaderName::from_static("x-forwarded-for"), value);
-    }
+    let peer =
+        HeaderValue::from_str(&peer.ip().to_string()).expect("an IP address is a header value");
+    parts
+        .headers
+        .insert(HeaderName::from_static("x-forwarded-for"), peer);
     parts.headers.insert(
         HeaderName::from_static("x-forwarded-proto"),
         HeaderValue::from_static(proto),

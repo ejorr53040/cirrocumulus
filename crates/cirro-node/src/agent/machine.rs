@@ -73,6 +73,17 @@ struct Link {
     host_key_changed: bool,
 }
 
+impl Link {
+    /// Before its `ssh` has logged in.
+    fn down() -> Link {
+        Link {
+            status: MachineStatus::Unreachable,
+            last_error: None,
+            host_key_changed: false,
+        }
+    }
+}
+
 impl Machines {
     pub(super) fn new(state_dir: &Path) -> Machines {
         Machines {
@@ -264,7 +275,7 @@ impl Machines {
     /// The fingerprint of the host key the Machine at `ssh` presents, for
     /// `cirro machine add` to show before pinning it.
     pub(super) async fn scan(&self, ssh: &str) -> Result<String, ApiError> {
-        let target = Target::parse(ssh)?;
+        let target = Target::parse(ssh).map_err(|e| bad_request(&e))?;
         fingerprint(&host_keys(&target).await?[0]).await
     }
 
@@ -276,7 +287,7 @@ impl Machines {
         store: &Mutex<Store>,
     ) -> Result<MachineInfo, ApiError> {
         super::validate_name("Machine", &add.name)?;
-        let target = Target::parse(&add.ssh)?;
+        let target = Target::parse(&add.ssh).map_err(|e| bad_request(&e))?;
         let _adding = self.adding.lock().await;
         if self.entries.lock().unwrap().contains_key(&add.name) {
             return Err(ApiError(
@@ -408,11 +419,7 @@ impl Machines {
                     )
                 })
                 .collect(),
-            link: Arc::new(Mutex::new(Link {
-                status: MachineStatus::Unreachable,
-                last_error: None,
-                host_key_changed: false,
-            })),
+            link: Arc::new(Mutex::new(Link::down())),
             tunnel: tokio::spawn(async {}),
         };
         self.start_tunnel(&mut machine)?;
@@ -423,7 +430,7 @@ impl Machines {
     /// Replaces the Machine's `ssh` with one that forwards to each of its
     /// Apps, and tracks what it says.
     fn start_tunnel(&self, machine: &mut Machine) -> io::Result<()> {
-        let target = Target::parse(&machine.record.ssh).map_err(|e| io::Error::other(e.1))?;
+        let target = Target::parse(&machine.record.ssh).map_err(io::Error::other)?;
         // Every port is chosen before anything changes, so a failure leaves
         // the running `ssh` and the ports the edge uses as they were.
         let ports = free_local_ports(machine.apps.len())?;
@@ -444,11 +451,7 @@ impl Machines {
             return Ok(());
         }
         machine.tunnel.abort();
-        machine.link = Arc::new(Mutex::new(Link {
-            status: MachineStatus::Unreachable,
-            last_error: None,
-            host_key_changed: false,
-        }));
+        machine.link = Arc::new(Mutex::new(Link::down()));
         let (key, known_hosts) = (self.key.clone(), self.known_hosts.clone());
         let name = machine.record.name.clone();
         machine.tunnel = tokio::spawn(run_tunnel(
@@ -640,12 +643,9 @@ struct Target {
 impl Target {
     /// Each part becomes an `ssh` argument, so none may start with `-` or
     /// hold anything but the characters user and host names use.
-    fn parse(ssh: &str) -> Result<Target, ApiError> {
-        let invalid = || {
-            bad_request(&format!(
-                "invalid SSH target {ssh:?}: expected user@host or user@host:port"
-            ))
-        };
+    fn parse(ssh: &str) -> Result<Target, String> {
+        let invalid =
+            || format!("invalid SSH target {ssh:?}: expected user@host or user@host:port");
         let word = |s: &str, extra: &[u8]| {
             !s.is_empty()
                 && !s.starts_with('-')

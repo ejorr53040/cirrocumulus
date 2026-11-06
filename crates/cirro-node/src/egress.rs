@@ -40,7 +40,7 @@ const LAN_RANGES: &str = "10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/
 /// declares the table (a no-op if it exists), rewrites its rules from
 /// scratch and adds to its sets, so it never duplicates a rule and never
 /// drops another agent's subnet.
-pub fn ensure_node_policy(subnet: &str, egress_iface: Option<&str>) -> io::Result<()> {
+pub(crate) fn ensure_node_policy(subnet: &str, egress_iface: Option<&str>) -> io::Result<()> {
     let mut script = format!(
         "table ip {TABLE} {{\n\
          \tset node_subnets {{ type ipv4_addr; flags interval; }}\n\
@@ -72,7 +72,7 @@ pub fn ensure_node_policy(subnet: &str, egress_iface: Option<&str>) -> io::Resul
 
 /// Removes the whole egress policy. For `cirro node uninstall`; the agent
 /// itself never calls this. Removing a policy that isn't there is fine.
-pub fn remove_node_policy() -> io::Result<()> {
+pub(crate) fn remove_node_policy() -> io::Result<()> {
     match nft(&["delete", "table", "ip", TABLE], None) {
         Err(e) if e.to_string().contains("No such file or directory") => Ok(()),
         other => other,
@@ -82,7 +82,7 @@ pub fn remove_node_policy() -> io::Result<()> {
 /// Turns on IPv4 forwarding, first recording its value at `record` if
 /// nothing has been recorded there yet, so `cirro node uninstall` can put
 /// back what the Node had before Cirrocumulus.
-pub fn enable_ip_forward(record: &Path) -> io::Result<()> {
+pub(crate) fn enable_ip_forward(record: &Path) -> io::Result<()> {
     const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
     if !record.exists() {
         let before = std::fs::read_to_string(IP_FORWARD)?;
@@ -96,7 +96,7 @@ pub fn enable_ip_forward(record: &Path) -> io::Result<()> {
 /// node uninstall`. A missing record means no agent ever ran here (or a
 /// previous uninstall already restored it) -- a no-op, not an error, the
 /// same tolerance [`remove_node_policy`] gives a missing table.
-pub fn restore_ip_forward(record: &Path) -> io::Result<()> {
+pub(crate) fn restore_ip_forward(record: &Path) -> io::Result<()> {
     const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
     let before = match std::fs::read_to_string(record) {
         Ok(value) => value,
@@ -108,7 +108,7 @@ pub fn restore_ip_forward(record: &Path) -> io::Result<()> {
 }
 
 /// The interface the Node's IPv4 default route goes out of, if it has one.
-pub fn default_route_iface() -> Option<String> {
+pub(crate) fn default_route_iface() -> Option<String> {
     let output = Command::new("ip")
         .args(["-o", "-4", "route", "show", "default"])
         .output()

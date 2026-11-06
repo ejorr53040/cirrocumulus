@@ -3,11 +3,11 @@
 /// A VMM process, identified by its pid and start time together so that a
 /// pid reused by some other process is never mistaken for the VMM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProcessId {
-    pub pid: u32,
+pub(crate) struct ProcessId {
+    pub(crate) pid: u32,
     /// The process's start time from `/proc/<pid>/stat`, in clock ticks
     /// since boot.
-    pub start_time: u64,
+    pub(crate) start_time: u64,
 }
 
 impl ProcessId {
@@ -18,7 +18,7 @@ impl ProcessId {
     }
 
     /// Whether this exact process is still running. A zombie has ended.
-    pub fn is_running(self) -> bool {
+    pub(crate) fn is_running(self) -> bool {
         proc_stat(self.pid).is_some_and(|(state, start)| state != 'Z' && start == self.start_time)
     }
 }
