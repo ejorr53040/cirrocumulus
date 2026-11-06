@@ -12,6 +12,7 @@
 //! it would have created and does nothing.
 
 use crate::egress;
+use crate::layout;
 use crate::release::{self, ReleaseBinaries};
 use crate::state::{Record, Store};
 use crate::subnet::Subnet;
@@ -21,10 +22,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-const IP_FORWARD_RECORD: &str = "ip_forward.before";
-const NODE_CONFIG_FILE: &str = "node.json";
-const RELEASE_SUBDIR: &str = "release";
 
 /// What `cirro node install` was given.
 pub struct InstallConfig {
@@ -145,7 +142,7 @@ pub fn install(cfg: &InstallConfig) -> io::Result<()> {
     let release = match &cfg.release_override {
         Some(r) => r.clone(),
         None => {
-            let release_dir = cfg.state_dir.join(RELEASE_SUBDIR);
+            let release_dir = layout::release(&cfg.state_dir);
             fs::create_dir_all(&release_dir)?;
             release::fetch(&release_dir)?
         }
@@ -196,7 +193,7 @@ pub async fn uninstall(state_dir: &Path, force: bool) -> io::Result<()> {
     let _ = remove_group(&node_config.group);
     remove_from_host_firewall(&node_config.subnet);
     let _ = egress::remove_node_policy();
-    egress::restore_ip_forward(&state_dir.join(IP_FORWARD_RECORD))?;
+    egress::restore_ip_forward(&layout::ip_forward_record(state_dir))?;
 
     fs::remove_dir_all(state_dir)?;
     Ok(())
@@ -204,7 +201,7 @@ pub async fn uninstall(state_dir: &Path, force: bool) -> io::Result<()> {
 
 /// The records of every VM in `state_dir`, none before the agent first ran.
 fn records(state_dir: &Path, subnet: &str) -> io::Result<Vec<Record>> {
-    let db = state_dir.join("state.db");
+    let db = layout::state_db(state_dir);
     if !db.exists() {
         return Ok(Vec::new());
     }
@@ -216,7 +213,7 @@ fn records(state_dir: &Path, subnet: &str) -> io::Result<Vec<Record>> {
 /// uninstall, no agent ever will.
 async fn clean_up_vms(state_dir: &Path, config: &NodeConfig) -> io::Result<()> {
     let subnet: Subnet = config.subnet.parse().map_err(io::Error::other)?;
-    let jails = vm::jails(&vm::jail_base(state_dir), &config.release.firecracker);
+    let jails = vm::jails(&layout::jail_base(state_dir), &config.release.firecracker);
     for vm_address in vm::host_state_in(&jails, &subnet) {
         vm::clean_up(&jails, vm_address).await;
     }
@@ -341,11 +338,11 @@ fn succeeds(program: &str, arg: &str) -> bool {
 
 fn write_node_config(state_dir: &Path, config: &NodeConfig) -> io::Result<()> {
     let json = serde_json::to_string_pretty(config).map_err(io::Error::other)?;
-    fs::write(state_dir.join(NODE_CONFIG_FILE), json)
+    fs::write(layout::node_config(state_dir), json)
 }
 
 fn read_node_config(state_dir: &Path) -> io::Result<NodeConfig> {
-    let json = fs::read_to_string(state_dir.join(NODE_CONFIG_FILE))?;
+    let json = fs::read_to_string(layout::node_config(state_dir))?;
     serde_json::from_str(&json).map_err(io::Error::other)
 }
 

@@ -4,6 +4,7 @@
 //! OpenSSH `ssh` per Machine running to know whether the Machine is up.
 
 use super::{ApiError, bad_request, internal};
+use crate::layout;
 use crate::state::{MachineAppRecord, MachineRecord, Store};
 use cirro_edge::{Lease, Resolution};
 use cirro_proto::{
@@ -75,8 +76,8 @@ struct Link {
 impl Machines {
     pub(super) fn new(state_dir: &Path) -> Machines {
         Machines {
-            key: state_dir.join("ssh_key"),
-            known_hosts: state_dir.join("known_hosts"),
+            key: layout::ssh_key(state_dir),
+            known_hosts: layout::known_hosts(state_dir),
             keygen: Mutex::new(()),
             adding: tokio::sync::Mutex::new(()),
             entries: Mutex::new(BTreeMap::new()),

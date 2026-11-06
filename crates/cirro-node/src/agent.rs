@@ -17,6 +17,7 @@
 //! the same name, appending to the same console log.
 
 use crate::egress;
+use crate::layout;
 use crate::metrics::{Recorder, RunningVm, Sampler};
 use crate::rootfs_open;
 use crate::state::{Record, Store};
@@ -265,9 +266,9 @@ pub async fn run(config: Config) -> io::Result<()> {
     // start is a mistake), then the state dir's subnet.
     refuse_if_already_running(&config.socket)?;
 
-    let logs_dir = config.state_dir.join("logs");
+    let logs_dir = layout::logs(&config.state_dir);
     std::fs::create_dir_all(&logs_dir)?;
-    let parked_dir = config.state_dir.join("parked");
+    let parked_dir = layout::parked(&config.state_dir);
     match std::fs::DirBuilder::new().mode(0o700).create(&parked_dir) {
         Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
         _ => {}
@@ -275,7 +276,7 @@ pub async fn run(config: Config) -> io::Result<()> {
     // Also when an earlier agent made it: it holds guests' memory.
     std::fs::set_permissions(&parked_dir, std::fs::Permissions::from_mode(0o700))?;
     let store = Store::open(
-        &config.state_dir.join("state.db"),
+        &layout::state_db(&config.state_dir),
         &config.subnet.to_string(),
     )?;
 
@@ -284,7 +285,7 @@ pub async fn run(config: Config) -> io::Result<()> {
     if egress_iface.is_none() {
         warn!("no IPv4 default route, so VMs won't reach the internet");
     }
-    egress::enable_ip_forward(&config.state_dir.join("ip_forward.before"))?;
+    egress::enable_ip_forward(&layout::ip_forward_record(&config.state_dir))?;
     egress::ensure_node_policy(&config.subnet.to_string(), egress_iface.as_deref())
         .map_err(|e| io::Error::other(format!("apply the Node's egress policy: {e}")))?;
     let gid = resolve_group(&config.socket_group)?;
@@ -306,7 +307,7 @@ pub async fn run(config: Config) -> io::Result<()> {
             firecracker: config.firecracker,
             jailer: config.jailer,
             kernel: config.kernel,
-            jail_base: vm::jail_base(&config.state_dir),
+            jail_base: layout::jail_base(&config.state_dir),
             node_address: config.subnet.node_address(),
             cirro_gid: gid,
         },

@@ -322,11 +322,6 @@ fn enable_io_accounting() {
     }
 }
 
-/// Where a Node keeps its VMs' jails ([`NodeConfig::jail_base`]).
-pub fn jail_base(state_dir: &Path) -> PathBuf {
-    state_dir.join("jail")
-}
-
 /// The cgroup jailer creates every VM's own cgroup under. jailer creates
 /// it on first use; the Node agent removes it once it's empty.
 pub fn parent_cgroup() -> PathBuf {
