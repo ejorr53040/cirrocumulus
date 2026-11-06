@@ -175,7 +175,6 @@ impl Scheme {
     }
 }
 
-/// Serves the requests on one client connection.
 async fn serve_connection<R, S>(stream: S, router: Arc<R>, peer: SocketAddr, scheme: Scheme)
 where
     R: Router,

@@ -961,7 +961,6 @@ impl Undo {
     }
 }
 
-/// The jail directory of the VM named `id`.
 fn jail_dir(jails: &Path, id: &str) -> PathBuf {
     jails.join(id)
 }

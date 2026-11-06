@@ -105,7 +105,6 @@ impl NodeCa {
         &self.cert_pem
     }
 
-    /// A certificate for `host`, signed by the CA.
     fn certify(&self, host: &str, provider: &CryptoProvider) -> Result<HostCertificate, String> {
         let key = KeyPair::generate().map_err(|e| e.to_string())?;
         let mut params =
@@ -192,7 +191,6 @@ struct HostCertificates {
     acme: Option<Arc<Acme>>,
     provider: Arc<CryptoProvider>,
     routed: Box<dyn Fn(&str) -> bool + Send + Sync>,
-    /// Each hostname's certificate.
     signed: Mutex<HashMap<String, HostCertificate>>,
 }
 

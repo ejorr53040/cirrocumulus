@@ -219,7 +219,6 @@ impl Store {
             .map_err(io_error)
     }
 
-    /// Every Machine's record.
     pub(crate) fn load_machines(&self) -> io::Result<Vec<MachineRecord>> {
         let mut statement = self
             .conn
@@ -255,7 +254,6 @@ impl Store {
             .map_err(io_error)
     }
 
-    /// Every Machine-backed App's record.
     pub(crate) fn load_machine_apps(&self) -> io::Result<Vec<MachineAppRecord>> {
         let mut statement = self
             .conn

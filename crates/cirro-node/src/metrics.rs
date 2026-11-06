@@ -168,7 +168,6 @@ impl Sampler {
         Readings { node, vms }
     }
 
-    /// The Node's counters.
     pub(crate) fn node(&self) -> io::Result<NodeSample> {
         let stat = read(&self.root.join("proc/stat"))?;
         // cpu user nice system idle iowait irq softirq steal guest guest_nice;

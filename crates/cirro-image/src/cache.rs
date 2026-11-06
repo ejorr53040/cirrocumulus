@@ -74,7 +74,6 @@ impl ImageCache {
         self.remember(&reference.whole(), &digest)
     }
 
-    /// Every image in the cache.
     pub fn list(&self) -> Result<Vec<CachedImage>, Error> {
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(entries) => entries,

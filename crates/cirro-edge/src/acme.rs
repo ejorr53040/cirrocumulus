@@ -70,9 +70,7 @@ pub fn is_public(host: &str) -> bool {
 
 /// Where to get certificates, and who for.
 pub struct AcmeConfig {
-    /// The ACME directory URL.
     pub directory: String,
-    /// The account's contact address.
     pub email: String,
     /// A CA certificate (PEM) to trust for the directory, besides the
     /// system's: for a test CA such as Pebble.
@@ -292,7 +290,6 @@ impl Acme {
             .await
     }
 
-    /// Where `host`'s key and chain are kept.
     fn path(&self, host: &str) -> PathBuf {
         self.dir.join(format!("acme-{host}.pem"))
     }

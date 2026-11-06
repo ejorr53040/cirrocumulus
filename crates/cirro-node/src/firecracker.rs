@@ -75,7 +75,6 @@ impl Client {
         self.send(Method::PUT, path, body).await
     }
 
-    /// Sends one request with a JSON body, `PUT` or `PATCH`.
     async fn send(&self, method: Method, path: &str, body: serde_json::Value) -> Result<(), Error> {
         let uri: hyper::Uri = UnixUri::new(&self.socket_path, path).into();
         let body_bytes = serde_json::to_vec(&body).expect("serialize request body");
@@ -198,9 +197,9 @@ impl Client {
     }
 
     /// Drives the boot sequence: machine config, boot source, root drive,
-    /// then `InstanceStart`. Static device config (network, vsock, ...)
-    /// has to happen between the root drive and `InstanceStart` too, once
-    /// callers need it -- this slice only covers what a plain boot needs.
+    /// then `InstanceStart`. Other static device config (network, vsock)
+    /// is pre-boot only too, so callers attach it ([`Client::attach_tap`],
+    /// [`Client::attach_vsock`]) before calling this.
     pub async fn boot(&self, config: &BootConfig) -> Result<(), Error> {
         self.put(
             "/machine-config",

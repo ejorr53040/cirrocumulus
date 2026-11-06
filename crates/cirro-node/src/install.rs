@@ -74,9 +74,9 @@ impl EdgeConfig {
     }
 }
 
-/// Everything install resolved, persisted so uninstall (and a future
-/// `cirro node agent` launched by the systemd unit) can find it again
-/// without being told the same arguments twice.
+/// Everything install resolved, persisted so uninstall can find it again
+/// without being told the same arguments twice. The agent the systemd unit
+/// launches doesn't read it: it gets its arguments on the unit's command line.
 #[derive(Serialize, Deserialize)]
 struct NodeConfig {
     socket: PathBuf,
@@ -246,9 +246,6 @@ fn refuse_if_vms_running(state_dir: &Path, subnet: &str) -> io::Result<()> {
     }
 }
 
-/// `ensure_group`/`remove_group` are mirror images of each other: check
-/// whether `name` already matches the wanted existence state, and if not,
-/// run the command that would fix it.
 fn set_group_existence(name: &str, want_exists: bool, verb: &str) -> io::Result<()> {
     if nix::unistd::Group::from_name(name)?.is_some() == want_exists {
         return Ok(());
@@ -260,8 +257,9 @@ fn ensure_group(name: &str) -> io::Result<()> {
     set_group_existence(name, true, "groupadd")
 }
 
-/// Best-effort: a group that's already gone (or never created, e.g. an
-/// install that only ever used a numeric gid) isn't a failure to undo.
+/// Deletes the group with `groupdel`. A group that's already gone (or never
+/// created, e.g. an install that only ever used a numeric gid) is `Ok`;
+/// only a failing `groupdel` is an error.
 fn remove_group(name: &str) -> io::Result<()> {
     set_group_existence(name, false, "groupdel")
 }
@@ -336,7 +334,6 @@ fn ufw_route_rule(subnet: &str, allow: bool) -> Vec<String> {
     args.into_iter().map(String::from).collect()
 }
 
-/// Whether `program arg` runs and exits 0.
 fn succeeds(program: &str, arg: &str) -> bool {
     Command::new(program)
         .arg(arg)
@@ -418,16 +415,17 @@ fn unit_path(unit_name: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    //! Needs no root at all: a real SQLite state dir and the test's own
+    //! process (a real, genuinely running pid) standing in for a VM's
+    //! VMM, so [`ProcessId::is_running`] sees the truth without mocking
+    //! it. Exercises the refusal decision `uninstall` makes, independent
+    //! of the group/systemd-unit mutation the full CLI path needs root
+    //! for (covered instead by `crates/cirro/tests/node_install.rs`).
+
     use super::*;
     use crate::process::ProcessId;
     use cirro_proto::{EndReason, Ended, VmInfo};
 
-    /// Needs no root at all: a real SQLite state dir and the test's own
-    /// process (a real, genuinely running pid) standing in for a VM's
-    /// VMM, so [`ProcessId::is_running`] sees the truth without mocking
-    /// it. Exercises the refusal decision `uninstall` makes, independent
-    /// of the group/systemd-unit mutation the full CLI path needs root
-    /// for (covered instead by `crates/cirro/tests/node_install.rs`).
     fn tempdir() -> PathBuf {
         crate::test_util::tempdir("cirro-install-test")
     }

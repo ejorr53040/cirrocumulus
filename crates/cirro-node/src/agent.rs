@@ -1,9 +1,9 @@
 //! The Node agent (ADR 0002): the long-running, privileged `cirro node
 //! agent` process that owns every VM on this Node. It serves the
 //! `cirro-proto` HTTP+JSON API on a Unix socket, allocates VM addresses and
-//! drives [`crate::vm`] for each request.
+//! drives `crate::vm` for each request.
 //!
-//! Each running VM is owned by its own supervisor task ([`Vm::supervise`]).
+//! Each running VM is owned by its own supervisor task (`Vm::supervise`).
 //! When the VM ends, for whatever reason, the task records it as an Ended VM
 //! whose console log stays in the state dir until `rm` or name reuse.
 //!
