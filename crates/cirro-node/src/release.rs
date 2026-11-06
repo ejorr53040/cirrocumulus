@@ -85,7 +85,7 @@ pub struct ReleaseBinaries {
 /// constants before trusting it. Idempotent: a file already present with
 /// the right hash is kept, not re-fetched, so a second `cirro node
 /// install` does no network I/O at all.
-pub fn fetch(dest_dir: &Path) -> io::Result<ReleaseBinaries> {
+pub(crate) fn fetch(dest_dir: &Path) -> io::Result<ReleaseBinaries> {
     let firecracker = dest_dir.join("firecracker");
     let jailer = dest_dir.join("jailer");
     if verify(&firecracker, FIRECRACKER_BIN_SHA256).is_err()

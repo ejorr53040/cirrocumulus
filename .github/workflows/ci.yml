@@ -233,8 +233,9 @@ jobs:
           "$HOME/.cargo/bin/rustup" toolchain install
       - name: cirro-image tests
         # This job exists to run the ext4 tests, so one that skips fails it.
+        # --nocapture: a passing test's "skipping:" line is otherwise hidden.
         run: |
-          cargo test --locked -p cirro-image 2>&1 | tee image-tests.log
+          cargo test --locked -p cirro-image -- --nocapture 2>&1 | tee image-tests.log
           if grep -q "^skipping:" image-tests.log; then
             echo "::error::ext4 tests skipped instead of running; see the log for why"
             exit 1
