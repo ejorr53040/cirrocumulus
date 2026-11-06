@@ -1,5 +1,4 @@
 mod client;
-mod open_rootfs;
 
 use cirro_image::ImageCache;
 use cirro_image::run_config::merge_env;
@@ -338,7 +337,7 @@ fn main() -> ExitCode {
     // it neither needs nor should share it with the process it was spawned
     // to serve.
     if let Command::OpenRootfs { uid, gid, path } = &cli.command {
-        return open_rootfs::run(*uid, *gid, path);
+        return cirro_node::rootfs_open::helper(*uid, *gid, path);
     }
     let runtime = tokio::runtime::Runtime::new().expect("start the tokio runtime");
     let result = runtime.block_on(async {
