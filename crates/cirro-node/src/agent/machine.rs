@@ -141,12 +141,21 @@ impl Machines {
     }
 
     pub(super) fn has_app(&self, name: &str) -> bool {
-        has_app(&self.entries.lock().unwrap(), name)
+        self.entries
+            .lock()
+            .unwrap()
+            .values()
+            .any(|m| m.apps.contains_key(name))
     }
 
     /// The Machine-backed App whose route has `host`, if any.
     pub(super) fn app_with_host(&self, host: &str) -> Option<String> {
-        app_with_host(&self.entries.lock().unwrap(), host)
+        self.entries.lock().unwrap().values().find_map(|m| {
+            m.apps
+                .iter()
+                .find(|(_, app)| app.route.host == host)
+                .map(|(name, _)| name.clone())
+        })
     }
 
     /// Where the edge sends a request for `host`, when a Machine-backed App
@@ -246,18 +255,13 @@ impl Machines {
     pub(super) fn public_key(&self) -> Result<String, ApiError> {
         let _making = self.keygen.lock().unwrap();
         if !self.key.exists() {
-            let made = std::process::Command::new("ssh-keygen")
-                .args(["-q", "-t", "ed25519", "-N", "", "-C", "cirro-node", "-f"])
-                .arg(&self.key)
-                .stdin(Stdio::null())
-                .output()
-                .map_err(|e| internal(format!("run ssh-keygen: {e}")))?;
-            if !made.status.success() {
-                return Err(internal(format!(
-                    "make the Node agent's SSH key: {}",
-                    String::from_utf8_lossy(&made.stderr).trim()
-                )));
-            }
+            crate::cmd::run(
+                std::process::Command::new("ssh-keygen")
+                    .args(["-q", "-t", "ed25519", "-N", "", "-C", "cirro-node", "-f"])
+                    .arg(&self.key),
+                None,
+            )
+            .map_err(|e| internal(format!("make the Node agent's SSH key: {e}")))?;
         }
         std::fs::read_to_string(self.key.with_extension("pub"))
             .map_err(|e| internal(format!("read the Node agent's SSH public key: {e}")))
@@ -738,19 +742,6 @@ async fn fingerprint(key: &str) -> Result<String, ApiError> {
         .nth(1)
         .map(str::to_string)
         .ok_or_else(|| internal(format!("ssh-keygen couldn't read the host key {key:?}")))
-}
-
-fn has_app(entries: &BTreeMap<String, Machine>, name: &str) -> bool {
-    entries.values().any(|m| m.apps.contains_key(name))
-}
-
-fn app_with_host(entries: &BTreeMap<String, Machine>, host: &str) -> Option<String> {
-    entries.values().find_map(|m| {
-        m.apps
-            .iter()
-            .find(|(_, app)| app.route.host == host)
-            .map(|(name, _)| name.clone())
-    })
 }
 
 /// `n` different ports free on the Node's 127.0.0.1 a moment ago: all

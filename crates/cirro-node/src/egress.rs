@@ -79,11 +79,12 @@ pub(crate) fn remove_node_policy() -> io::Result<()> {
     }
 }
 
+const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
+
 /// Turns on IPv4 forwarding, first recording its value at `record` if
 /// nothing has been recorded there yet, so `cirro node uninstall` can put
 /// back what the Node had before Cirrocumulus.
 pub(crate) fn enable_ip_forward(record: &Path) -> io::Result<()> {
-    const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
     if !record.exists() {
         let before = std::fs::read_to_string(IP_FORWARD)?;
         std::fs::write(record, before.trim())?;
@@ -97,7 +98,6 @@ pub(crate) fn enable_ip_forward(record: &Path) -> io::Result<()> {
 /// previous uninstall already restored it) -- a no-op, not an error, the
 /// same tolerance [`remove_node_policy`] gives a missing table.
 pub(crate) fn restore_ip_forward(record: &Path) -> io::Result<()> {
-    const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
     let before = match std::fs::read_to_string(record) {
         Ok(value) => value,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),

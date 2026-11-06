@@ -221,10 +221,8 @@ struct Replaced {
 struct Agent {
     node: vm::NodeConfig,
     subnet: Subnet,
-    /// Console logs, one per name, kept with the Ended VM record.
+    /// Console logs, one per start, kept with the Ended VM record.
     logs_dir: PathBuf,
-    /// Parked VMs' snapshots, one directory per name. Root-only: they hold
-    /// the guests' memory.
     parked_dir: PathBuf,
     vms: Mutex<BTreeMap<String, Entry>>,
     store: Mutex<Store>,
@@ -609,19 +607,31 @@ impl Agent {
             guest,
             console_log: log,
         };
-        // Started on its own task, so the start runs to completion (success,
-        // or a full unwind) even if the client disconnects and hyper drops
-        // this request's future.
         let (name, route) = (run.name, run.route);
+        let agent = self.clone();
+        self.detached("starting", agent.start_vm(name, spec, route, replaced))
+            .await
+    }
+
+    /// Runs `work` on its own task, so it runs to completion (success, or a
+    /// full unwind) even if the client disconnects and hyper drops the
+    /// request's future. Held requests are told to look again once it ends,
+    /// after everything `work` holds is released.
+    async fn detached(
+        self: &Arc<Self>,
+        what: &str,
+        work: impl Future<Output = Result<VmInfo, ApiError>> + Send + 'static,
+    ) -> Result<VmInfo, ApiError> {
+        let settled = Settled(self.clone());
         tokio::spawn(
             async move {
-                let _settled = Settled(self.clone());
-                self.start_vm(name, spec, route, replaced).await
+                let _settled = settled;
+                work.await
             }
             .in_current_span(),
         )
         .await
-        .unwrap_or_else(|e| Err(internal(format!("starting the VM panicked: {e}"))))
+        .unwrap_or_else(|e| Err(internal(format!("{what} the VM panicked: {e}"))))
     }
 
     fn refuse_if_shutting_down(&self) -> Result<(), ApiError> {
@@ -688,26 +698,19 @@ impl Agent {
         }))
     }
 
-    /// Parks a VM whose park `claim` holds. On its own task, like a start,
-    /// so the park finishes, and the claim is released, even if the client
-    /// goes away.
+    /// Parks a VM whose park `claim` holds. Detached, so the park finishes,
+    /// and the claim is released, even if the client goes away.
     async fn park_claimed(
         self: Arc<Self>,
         name: String,
         claim: ParkClaim,
     ) -> Result<VmInfo, ApiError> {
-        tokio::spawn(
-            async move {
-                // Dropped in reverse: the claim is released before held
-                // requests are told to look again.
-                let _settled = Settled(self.clone());
-                let _claim = claim;
-                self.park(&name).await
-            }
-            .in_current_span(),
-        )
+        let agent = self.clone();
+        self.detached("parking", async move {
+            let _claim = claim;
+            agent.park(&name).await
+        })
         .await
-        .unwrap_or_else(|e| Err(internal(format!("parking the VM panicked: {e}"))))
     }
 
     async fn park(&self, name: &str) -> Result<VmInfo, ApiError> {
@@ -790,23 +793,17 @@ impl Agent {
             };
             (spec, parked)
         };
-        // On its own task, like a start, so it finishes even if the client
-        // goes away.
-        tokio::spawn(
-            async move {
-                let _settled = Settled(self.clone());
-                let woken = self.clone().finish_wake(name.clone(), spec, parked).await;
-                let mut failures = self.wake_failures.lock().unwrap();
-                match &woken {
-                    Ok(_) => failures.remove(&name),
-                    Err(ApiError(_, why)) => failures.insert(name, why.clone()),
-                };
-                woken
-            }
-            .in_current_span(),
-        )
+        let agent = self.clone();
+        self.detached("waking", async move {
+            let woken = agent.clone().finish_wake(name.clone(), spec, parked).await;
+            let mut failures = agent.wake_failures.lock().unwrap();
+            match &woken {
+                Ok(_) => failures.remove(&name),
+                Err(ApiError(_, why)) => failures.insert(name, why.clone()),
+            };
+            woken
+        })
         .await
-        .unwrap_or_else(|e| Err(internal(format!("waking the VM panicked: {e}"))))
     }
 
     async fn finish_wake(
@@ -838,15 +835,13 @@ impl Agent {
                 ));
             }
         };
-        let started = VmInfo {
-            name: name.clone(),
-            vm_address: Some(spec.vm_address),
-            mem_mib: spec.mem_mib,
-            vcpus: spec.vcpus,
-            started_at: now(),
-            ended: None,
-            route: parked.info.route.clone(),
-        };
+        let started = started_info(
+            &name,
+            spec.vm_address,
+            spec.mem_mib,
+            spec.vcpus,
+            parked.info.route.clone(),
+        );
         // Emptied by the wake, and gone before a park of the new VM can make
         // it again.
         let _ = std::fs::remove_dir(&spec.snapshot);
@@ -905,15 +900,7 @@ impl Agent {
                 ));
             }
         };
-        let started = VmInfo {
-            name: name.clone(),
-            vm_address: Some(spec.vm_address),
-            mem_mib: spec.mem_mib,
-            vcpus: spec.vcpus,
-            started_at: now(),
-            ended: None,
-            route,
-        };
+        let started = started_info(&name, spec.vm_address, spec.mem_mib, spec.vcpus, route);
         let info = match self.keep(started, &spec.console_log, vm).await {
             Ok(info) => info,
             Err(e) => {
@@ -1333,14 +1320,20 @@ impl Agent {
     async fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
         self.machines.disconnect_all();
-        while self
-            .vms
-            .lock()
-            .unwrap()
-            .values()
-            .any(|e| matches!(e, Entry::Starting { .. }))
-        {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        loop {
+            let settled = self.settled.notified();
+            tokio::pin!(settled);
+            settled.as_mut().enable();
+            let starting = self
+                .vms
+                .lock()
+                .unwrap()
+                .values()
+                .any(|e| matches!(e, Entry::Starting { .. }));
+            if !starting {
+                break;
+            }
+            settled.await;
         }
         // Only succeed once empty, so a jail still in use is never removed.
         let _ = std::fs::remove_dir(self.node.jails());
@@ -1458,12 +1451,34 @@ fn next_log_number(logs_dir: &Path) -> u64 {
 /// end, or when it doesn't exist yet. A long-running App's log has no
 /// bound, so it is never read whole.
 fn read_log(log: &Path, offset: u64) -> io::Result<Vec<u8>> {
+    let mut file = match std::fs::File::open(log) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
     let mut bytes = Vec::new();
-    if let Ok(mut file) = std::fs::File::open(log) {
-        file.seek(SeekFrom::Start(offset))?;
-        file.take(LOG_CHUNK).read_to_end(&mut bytes)?;
-    }
+    file.seek(SeekFrom::Start(offset))?;
+    file.take(LOG_CHUNK).read_to_end(&mut bytes)?;
     Ok(bytes)
+}
+
+/// A VM that has just started (or woken) at `vm_address`.
+fn started_info(
+    name: &str,
+    vm_address: Ipv4Addr,
+    mem_mib: u32,
+    vcpus: u8,
+    route: Option<Route>,
+) -> VmInfo {
+    VmInfo {
+        name: name.to_owned(),
+        vm_address: Some(vm_address),
+        mem_mib,
+        vcpus,
+        started_at: now(),
+        ended: None,
+        route,
+    }
 }
 
 /// `vcpus`/`mem_mib` (whichever `field` names) are within `[min, max]`, the

@@ -5,7 +5,7 @@
 //! host side of its veth, both named by [`vm::host_id`].
 
 use crate::vm;
-pub(crate) use cirro_proto::{NodeRates, VmRates};
+use cirro_proto::{NodeRates, VmRates};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};

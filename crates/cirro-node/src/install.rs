@@ -96,7 +96,7 @@ struct NodeConfig {
 /// crate already shells out to `ip`/`nft` elsewhere). Runs first and
 /// changes nothing, so a Node that fails here is exactly as it was before
 /// `install` was called.
-pub fn check_prereqs() -> io::Result<()> {
+fn check_prereqs() -> io::Result<()> {
     let kvm = Path::new("/dev/kvm");
     if !(kvm.exists() && is_rw(kvm)) {
         return Err(io::Error::other(

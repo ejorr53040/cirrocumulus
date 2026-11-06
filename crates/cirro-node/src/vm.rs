@@ -47,7 +47,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
 /// The address every guest configures on `eth0` (ADR 0003).
-pub(crate) const GUEST_ADDRESS: Ipv4Addr = Ipv4Addr::new(172, 16, 0, 2);
+const GUEST_ADDRESS: Ipv4Addr = Ipv4Addr::new(172, 16, 0, 2);
 /// The guest's gateway: the tap's address inside the VM's namespace.
 const GUEST_GATEWAY: Ipv4Addr = Ipv4Addr::new(172, 16, 0, 1);
 /// The tap's MAC, the same in every namespace like the Guest address (ADR
@@ -620,13 +620,12 @@ impl Vm {
         // jailer execs into Firecracker without forking, so the pid and its
         // start time are Firecracker's from here on.
         self.process = child.id().and_then(ProcessId::of);
+        self.vmm = Some(Vmm::Child(child));
         if self.process.is_none() {
-            self.vmm = Some(Vmm::Child(child));
             return Err(Error(
                 "jailer exited before its process could be identified".into(),
             ));
         }
-        self.vmm = Some(Vmm::Child(child));
 
         // 3. The tap inside the namespace, a veth pair to the Node, 1:1 NAT
         //    between the Guest address and the VM address inside the

@@ -55,7 +55,6 @@ pub struct BootConfig {
 /// (the underlying `hyper_util` client is itself a cheap handle), but
 /// there's only ever one Firecracker process per socket path, so callers
 /// typically just make one and use it for that VM's whole lifetime.
-#[derive(Clone)]
 pub struct Client {
     inner: HyperClient<hyperlocal::UnixConnector, Full<Bytes>>,
     socket_path: PathBuf,
@@ -71,7 +70,7 @@ impl Client {
 
     /// Sends one `PUT` request with a JSON body to a path on the API, per
     /// <https://github.com/firecracker-microvm/firecracker/blob/main/docs/api_requests/actions.md>.
-    pub async fn put(&self, path: &str, body: serde_json::Value) -> Result<(), Error> {
+    async fn put(&self, path: &str, body: serde_json::Value) -> Result<(), Error> {
         self.send(Method::PUT, path, body).await
     }
 
