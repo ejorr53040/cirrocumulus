@@ -404,7 +404,7 @@ fn main() -> ExitCode {
                 https,
                 acme_email,
             }) => cirro_image::check_mke2fs()
-                .map_err(|e| io::Error::other(e.0))
+                .map_err(|e| io::Error::other(e.to_string()))
                 .and_then(|()| {
                     install::install(&install::InstallConfig {
                         state_dir,

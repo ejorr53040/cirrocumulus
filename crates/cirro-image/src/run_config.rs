@@ -45,7 +45,7 @@ pub fn merge_env(env: &[String], overrides: &[String]) -> Vec<String> {
 /// the way Docker does: names come from the image's `passwd` and `group`,
 /// a user's group defaults to its primary one, and a numeric uid the image
 /// doesn't list gets gid 0.
-pub fn resolve_user(
+pub(crate) fn resolve_user(
     user: &str,
     passwd: Option<&str>,
     group: Option<&str>,

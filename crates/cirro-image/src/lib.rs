@@ -26,15 +26,16 @@ use std::process::Command;
 use tar::{EntryType, Header};
 
 /// The oldest `mke2fs` that can build a filesystem from a tarball.
-pub const MIN_MKE2FS: (u32, u32, u32) = (1, 47, 1);
+pub(crate) const MIN_MKE2FS: (u32, u32, u32) = (1, 47, 1);
 
 /// Written as the guest's `/etc/resolv.conf`: the guest gets its address
 /// from the kernel command line, which carries no DNS server.
 const RESOLV_CONF: &[u8] = b"nameserver 1.1.1.1\nnameserver 8.8.8.8\n";
 const HOSTS: &[u8] = b"127.0.0.1\tlocalhost\n::1\tlocalhost\n";
 
+/// Something that went wrong, said for a person.
 #[derive(Debug)]
-pub struct Error(pub String);
+pub struct Error(String);
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -51,7 +52,6 @@ fn err(context: &str, e: impl std::fmt::Display) -> Error {
 /// Where one entry of the final tree comes from.
 #[derive(Debug)]
 struct Source {
-    /// Index into `Flattened::layers`.
     layer: usize,
     header: Header,
     /// Offset of the entry's data in its uncompressed layer.
@@ -326,7 +326,7 @@ impl Flattened {
         }
         for (path, source) in hardlinks {
             let target = source.link_name.as_deref().unwrap_or(Path::new(""));
-            let target = normalise(target).map_err(|e| io::Error::other(e.0))?;
+            let target = normalise(target).map_err(io::Error::other)?;
             let mut header = source.header.clone();
             // `mke2fs` gives the shared inode the link entry's metadata, so
             // it must match the target's.
