@@ -28,6 +28,14 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+/// The hidden `cirro` subcommand that is the helper.
+pub const HELPER: &str = "__open-rootfs";
+/// The helper's exit status when it ran as the caller and refused the
+/// rootfs.
+pub const DENIED: u8 = 1;
+/// The helper's exit status when the credential drop itself went wrong.
+pub const FAILED: u8 = 2;
+
 /// The running process's own binary, even once its path names another file.
 const SELF_EXE: &str = "/proc/self/exe";
 
@@ -57,7 +65,7 @@ pub(crate) fn open_as(uid: u32, gid: u32, path: &Path) -> Result<std::fs::File, 
     // after dropping to the caller's uid.
     let mut cmd = Command::new(SELF_EXE);
     cmd.arg0("cirro")
-        .arg("__open-rootfs")
+        .arg(HELPER)
         .arg(uid.to_string())
         .arg(gid.to_string())
         .arg(path)
@@ -86,11 +94,15 @@ pub(crate) fn open_as(uid: u32, gid: u32, path: &Path) -> Result<std::fs::File, 
         .map_err(|e| Error::Failed(format!("wait for the rootfs-open helper: {e}")))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(Error::Denied(if stderr.is_empty() {
+        let why = if stderr.is_empty() {
             format!("the rootfs-open helper exited with {}", output.status)
         } else {
             stderr
-        }));
+        };
+        return Err(match output.status.code() {
+            Some(code) if code == i32::from(DENIED) => Error::Denied(why),
+            _ => Error::Failed(why),
+        });
     }
 
     let mut buf = [0u8; 1];

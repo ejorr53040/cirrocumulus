@@ -134,16 +134,21 @@ impl Store {
                 Ok(Record {
                     info: VmInfo {
                         name: row.get(0)?,
-                        vm_address: vm_address.and_then(|a| a.parse::<Ipv4Addr>().ok()),
+                        vm_address: vm_address
+                            .map(|a| a.parse::<Ipv4Addr>().map_err(|e| unreadable(1, e)))
+                            .transpose()?,
                         mem_mib: row.get(4)?,
                         vcpus: row.get(5)?,
                         started_at: from_sql(row.get(6)?),
-                        ended: ended_at.zip(end_reason).and_then(|(at, reason)| {
-                            Some(Ended {
-                                at: from_sql(at),
-                                reason: parse_reason(&reason)?,
+                        ended: ended_at
+                            .zip(end_reason)
+                            .map(|(at, reason)| {
+                                Ok::<_, rusqlite::Error>(Ended {
+                                    at: from_sql(at),
+                                    reason: parse_reason(&reason).map_err(|e| unreadable(8, e))?,
+                                })
                             })
-                        }),
+                            .transpose()?,
                         route: route_host.zip(route_port).map(|(host, port)| Route {
                             host,
                             port,
@@ -341,8 +346,14 @@ fn reason_text(reason: EndReason) -> String {
         .expect("an end reason serializes as a string")
 }
 
-fn parse_reason(text: &str) -> Option<EndReason> {
-    serde_json::from_value(serde_json::Value::String(text.to_string())).ok()
+fn parse_reason(text: &str) -> Result<EndReason, serde_json::Error> {
+    serde_json::from_value(serde_json::Value::String(text.to_string()))
+}
+
+/// A stored value that doesn't parse: refused rather than read as unset,
+/// which would make an Ended VM look like a running one.
+fn unreadable(column: usize, e: impl std::error::Error + Send + Sync + 'static) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, Box::new(e))
 }
 
 fn io_error(e: rusqlite::Error) -> io::Error {

@@ -101,7 +101,7 @@ enum Command {
     /// Internal: opens a rootfs path as the given uid/gid and sends the fd
     /// back over stdin with SCM_RIGHTS (the Node agent's rootfs
     /// credential drop, issue #14). Not for direct use.
-    #[command(name = "__open-rootfs", hide = true)]
+    #[command(name = cirro_node::rootfs_open::HELPER, hide = true)]
     OpenRootfs { uid: u32, gid: u32, path: PathBuf },
 }
 

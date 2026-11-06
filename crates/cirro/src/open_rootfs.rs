@@ -6,6 +6,7 @@
 //! path, refuses anything but a regular file, and hands the fd back to
 //! the agent over its inherited stdin with `SCM_RIGHTS`.
 
+use cirro_node::rootfs_open;
 use nix::fcntl::{self, FcntlArg, OFlag};
 use nix::sys::socket::{ControlMessage, MsgFlags, sendmsg};
 use nix::unistd::{getgid, getuid};
@@ -27,7 +28,7 @@ pub(crate) fn run(uid: u32, gid: u32, path: &Path) -> ExitCode {
             "refusing to open {}: running as {actual_uid}:{actual_gid}, expected {uid}:{gid}",
             path.display()
         );
-        return ExitCode::FAILURE;
+        return ExitCode::from(rootfs_open::FAILED);
     }
 
     // O_NOFOLLOW: a final symlink component was never part of the path the
@@ -44,23 +45,23 @@ pub(crate) fn run(uid: u32, gid: u32, path: &Path) -> ExitCode {
         Ok(file) => file,
         Err(e) => {
             eprintln!("open {}: {e}", path.display());
-            return ExitCode::FAILURE;
+            return ExitCode::from(rootfs_open::DENIED);
         }
     };
     match file.metadata() {
         Ok(meta) if meta.is_file() => {}
         Ok(_) => {
             eprintln!("{} is not a regular file", path.display());
-            return ExitCode::FAILURE;
+            return ExitCode::from(rootfs_open::DENIED);
         }
         Err(e) => {
             eprintln!("stat {}: {e}", path.display());
-            return ExitCode::FAILURE;
+            return ExitCode::from(rootfs_open::DENIED);
         }
     }
     if let Err(e) = fcntl::fcntl(&file, FcntlArg::F_SETFL(OFlag::empty())) {
         eprintln!("clear O_NONBLOCK on {}: {e}", path.display());
-        return ExitCode::FAILURE;
+        return ExitCode::from(rootfs_open::FAILED);
     }
 
     let fds = [file.as_raw_fd()];
@@ -68,7 +69,7 @@ pub(crate) fn run(uid: u32, gid: u32, path: &Path) -> ExitCode {
     let cmsg = [ControlMessage::ScmRights(&fds)];
     if let Err(e) = sendmsg::<()>(0, &iov, &cmsg, MsgFlags::empty(), None) {
         eprintln!("send the opened rootfs to the Node agent: {e}");
-        return ExitCode::FAILURE;
+        return ExitCode::from(rootfs_open::FAILED);
     }
     ExitCode::SUCCESS
 }
