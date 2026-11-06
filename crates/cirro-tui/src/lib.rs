@@ -4,7 +4,7 @@ mod dashboard;
 
 pub use dashboard::{Action, Dashboard};
 
-use cirro_proto::{MachineAppInfo, Stats, VmRates};
+use cirro_proto::{MachineAppInfo, NodeRates, Stats, VmRates};
 use std::fmt::Write;
 
 /// `stats` as plain text, for `cirro top --once`: a line for the Node,
@@ -15,15 +15,7 @@ pub fn snapshot(stats: &Stats, machine_apps: &[MachineAppInfo]) -> String {
     let mut out = String::new();
     match stats.node.last() {
         Some(node) => {
-            let _ = writeln!(
-                out,
-                "NODE  CPU {:.1}%  MEM {}/{}  NET {}/s in, {}/s out",
-                node.cpu_percent,
-                bytes(node.memory_used_bytes),
-                bytes(node.memory_total_bytes),
-                bytes(node.rx_per_sec),
-                bytes(node.tx_per_sec),
-            );
+            let _ = writeln!(out, "NODE  {}", node_summary(node, "  "));
         }
         None => out.push_str("NODE  (sampling)\n"),
     }
@@ -45,15 +37,28 @@ pub fn snapshot(stats: &Stats, machine_apps: &[MachineAppInfo]) -> String {
         let _ = writeln!(out, "{:<32} {:<24} STATUS", "MACHINE-BACKED APP", "MACHINE");
     }
     for app in machine_apps {
-        let machine = format!("{}:{}", app.machine, app.route.port);
         let _ = writeln!(
             out,
-            "{:<32} {machine:<24} {}",
+            "{:<32} {:<24} {}",
             app.name,
+            machine_port(app),
             app.status.as_str()
         );
     }
     out
+}
+
+/// The Node's latest CPU, memory and network, with `between` separating
+/// the network from the rest: the dashboard puts it on a line of its own.
+pub(crate) fn node_summary(node: &NodeRates, between: &str) -> String {
+    format!(
+        "CPU {:.1}%  MEM {}/{}{between}NET {} in, {} out",
+        node.cpu_percent,
+        bytes(node.memory_used_bytes),
+        bytes(node.memory_total_bytes),
+        per_sec(node.rx_per_sec),
+        per_sec(node.tx_per_sec),
+    )
 }
 
 /// A VM's latest rates as table cells: CPU, memory, network in and out,
@@ -82,6 +87,17 @@ pub fn duration(secs: u64) -> String {
     }
 }
 
+/// `mib` MiB of memory or disk in the largest unit that keeps it at least
+/// 1: `256M`, `1.5G`.
+pub fn mem(mib: u64) -> String {
+    bytes(mib << 20)
+}
+
+/// Where a Machine-backed App runs: its Machine and port, as `pi:8080`.
+pub fn machine_port(app: &MachineAppInfo) -> String {
+    format!("{}:{}", app.machine, app.route.port)
+}
+
 /// One line of the `--once` table: a name, then six right-aligned cells.
 fn row(out: &mut String, [name, cells @ ..]: [String; 7]) {
     let _ = write!(out, "{name:<32}");
@@ -93,7 +109,7 @@ fn row(out: &mut String, [name, cells @ ..]: [String; 7]) {
 
 /// `n` bytes in the largest unit that keeps it at least 1: `512B`, `140M`,
 /// `1.5G`.
-pub fn bytes(n: u64) -> String {
+fn bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
     let mut value = n as f64;
     let mut unit = 0;
@@ -130,6 +146,11 @@ mod tests {
             },
             history,
         }
+    }
+
+    #[test]
+    fn memory_shows_in_the_largest_unit_that_keeps_it_at_least_one() {
+        assert_eq!([mem(256), mem(1024), mem(1536)], ["256M", "1.0G", "1.5G"]);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! VMs, a table of Machine-backed Apps, and a detail pane for the selected
 //! VM.
 
-use crate::{bytes, duration, per_sec, rate_cells};
+use crate::{duration, machine_port, mem, node_summary, rate_cells};
 use cirro_proto::{MachineAppInfo, Stats, VmStats};
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyCode;
@@ -199,14 +199,7 @@ impl Dashboard {
         ])
         .areas(inner);
         let summary = match self.stats.node.last() {
-            Some(node) => format!(
-                "CPU {:.1}%  MEM {}/{}\nNET {} in, {} out",
-                node.cpu_percent,
-                bytes(node.memory_used_bytes),
-                bytes(node.memory_total_bytes),
-                per_sec(node.rx_per_sec),
-                per_sec(node.tx_per_sec),
-            ),
+            Some(node) => node_summary(node, "\n"),
             None => "sampling…".to_string(),
         };
         frame.render_widget(Paragraph::new(summary), text);
@@ -290,7 +283,7 @@ impl Dashboard {
         let rows = self.machine_apps.iter().map(|app| {
             Row::new([
                 app.name.clone(),
-                format!("{}:{}", app.machine, app.route.port),
+                machine_port(app),
                 app.status.as_str().to_string(),
             ])
         });
@@ -332,7 +325,7 @@ impl Dashboard {
                 Line::from(format!(
                     "{} vCPU, {} memory",
                     vm.info.vcpus,
-                    bytes(u64::from(vm.info.mem_mib) << 20)
+                    mem(u64::from(vm.info.mem_mib))
                 )),
             ],
         };

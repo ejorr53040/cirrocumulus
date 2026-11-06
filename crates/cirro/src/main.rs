@@ -714,7 +714,7 @@ async fn image_command(command: ImageCommand) -> Result<(), String> {
             println!("{:<40} {:<19} {:>5}", "REFERENCE", "DIGEST", "SIZE");
             for image in cache.list().map_err(|e| e.to_string())? {
                 let size = std::fs::metadata(&image.rootfs).map_or(0, |m| m.len());
-                let size = format_mem(u32::try_from(size >> 20).unwrap_or(u32::MAX));
+                let size = cirro_tui::mem(size >> 20);
                 let digest: String = image.digest.chars().take("sha256:".len() + 12).collect();
                 let references: Vec<&str> = match image.references.as_slice() {
                     [] => vec!["-"],
@@ -897,7 +897,7 @@ async fn ps(socket: &Path, all: bool) -> Result<(), String> {
         let mut row = ps_row([
             &vm.name,
             &address,
-            &format_mem(vm.mem_mib),
+            &cirro_tui::mem(vm.mem_mib.into()),
             &vm.vcpus.to_string(),
             &uptime,
             host,
@@ -923,7 +923,7 @@ async fn ps(socket: &Path, all: bool) -> Result<(), String> {
             "-",
             "-",
             &app.route.host,
-            &format!("{}:{}", app.machine, app.route.port),
+            &cirro_tui::machine_port(&app),
         ]);
         if all {
             row.push_str("  ");
@@ -1146,13 +1146,6 @@ fn parse_user(s: &str) -> Result<User, String> {
     Ok(User { uid, gid })
 }
 
-fn format_mem(mib: u32) -> String {
-    if mib.is_multiple_of(1024) {
-        format!("{}G", mib / 1024)
-    } else {
-        format!("{mib}M")
-    }
-}
 
 #[cfg(test)]
 mod tests {
