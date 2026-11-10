@@ -1674,7 +1674,7 @@ fn run_boots_an_image_from_a_registry_and_runs_its_command() {
 /// M5: the agent samples every running VM once a second, and `top --once`
 /// prints what each is using.
 #[test]
-fn top_once_shows_a_busy_vm_using_cpu_and_memory() {
+fn top_shows_a_busy_vm_using_cpu_and_memory() {
     let Some(agent) = Agent::start(226) else {
         return;
     };
@@ -1695,7 +1695,7 @@ fn top_once_shows_a_busy_vm_using_cpu_and_memory() {
     // A rate needs two samples, a second apart.
     let deadline = Instant::now() + TIMEOUT;
     let (cpu, row) = loop {
-        let top = stdout(agent.cirro().args(["top", "--once"]).assert().success());
+        let top = stdout(agent.cirro().args(["top"]).assert().success());
         let row = row(&top, "busy")
             .unwrap_or_else(|| panic!("top doesn't list busy:\n{top}"))
             .to_string();
@@ -3349,12 +3349,12 @@ fn an_agent_starts_while_a_machine_is_down() {
     wait_for_machine_text(&agent, "pi", " up ", RECONNECT);
 }
 
-/// `cirro top --once`'s row for `name` once it contains `text`, within
+/// `cirro top`'s row for `name` once it contains `text`, within
 /// `within`.
 fn wait_for_top_text(agent: &Agent, name: &str, text: &str, within: Duration) -> String {
     let deadline = Instant::now() + within;
     loop {
-        let top = stdout(agent.cirro().args(["top", "--once"]).assert().success());
+        let top = stdout(agent.cirro().args(["top"]).assert().success());
         if let Some(row) = row(&top, name)
             && row.contains(text)
         {

@@ -1,7 +1,7 @@
 # Cirrocumulus
 
 A Firecracker mini cloud in Rust: every workload runs in its own jailed
-Firecracker microVM, managed from the `cirro` CLI and its terminal dashboard.
+Firecracker microVM, managed from the `cirro` CLI.
 
 These pages are the long form of the [README](https://github.com/ejorr53040/cirrocumulus#readme):
 how Cirrocumulus works underneath, what it defends against, and why it was
