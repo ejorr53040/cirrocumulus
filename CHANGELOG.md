@@ -8,7 +8,7 @@ things).
 ## [0.1.0] - Unreleased
 
 The first release: one Node, running OCI images in jailed Firecracker
-microVMs, with a terminal dashboard, park and wake, and an edge that routes
+microVMs, with park and wake, and an edge that routes
 HTTP(S) to Apps by hostname.
 
 ### Added
@@ -31,8 +31,9 @@ HTTP(S) to Apps by hostname.
 - **Egress policy.** One Node-wide nftables table masquerades VMs' traffic
   and drops SMTP port 25, VM-to-VM and private-range LAN destinations, and anything a VM sends
   from an address that isn't its own.
-- **Dashboard.** `cirro top`: live CPU, memory, disk and network use of the
-  Node and each VM, at 1 s.
+- **Usage snapshot.** `cirro top`: CPU, memory, disk and network use of the
+  Node and each VM, as text. There is no live dashboard; screens are
+  [The Loam](https://github.com/ejorr53040/the-loam)'s (ADR 0012).
 - **Park and wake.** `cirro park` snapshots a VM and frees its RAM;
   `cirro wake` starts it again where it was, in 43 ms p50 and 54 ms p99 for a
   256 MiB guest on the reference laptop. The guest's kernel reseeds its RNG

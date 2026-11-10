@@ -1,21 +1,17 @@
-//! `cirro top`: the terminal dashboard.
-
-mod dashboard;
-
-pub use dashboard::{Action, Dashboard};
+//! The CLI's plain-text tables and units, for `cirro top` and `cirro ps`.
 
 use cirro_proto::{MachineAppInfo, NodeRates, Stats, VmRates};
 use std::fmt::Write;
 
-/// `stats` as plain text, for `cirro top --once`: a line for the Node,
+/// `stats` as plain text, for `cirro top`: a line for the Node,
 /// then a row per running VM with its latest rates (`-` until the agent has
 /// two samples of it), then a row per Machine-backed App with its Machine,
 /// port and status, which take the place of rates: they run elsewhere.
-pub fn snapshot(stats: &Stats, machine_apps: &[MachineAppInfo]) -> String {
+pub(crate) fn snapshot(stats: &Stats, machine_apps: &[MachineAppInfo]) -> String {
     let mut out = String::new();
     match stats.node.last() {
         Some(node) => {
-            let _ = writeln!(out, "NODE  {}", node_summary(node, "  "));
+            let _ = writeln!(out, "NODE  {}", node_summary(node));
         }
         None => out.push_str("NODE  (sampling)\n"),
     }
@@ -48,11 +44,10 @@ pub fn snapshot(stats: &Stats, machine_apps: &[MachineAppInfo]) -> String {
     out
 }
 
-/// The Node's latest CPU, memory and network, with `between` separating
-/// the network from the rest: the dashboard puts it on a line of its own.
-pub(crate) fn node_summary(node: &NodeRates, between: &str) -> String {
+/// The Node's latest CPU, memory and network.
+fn node_summary(node: &NodeRates) -> String {
     format!(
-        "CPU {:.1}%  MEM {}/{}{between}NET {} in, {} out",
+        "CPU {:.1}%  MEM {}/{}  NET {} in, {} out",
         node.cpu_percent,
         bytes(node.memory_used_bytes),
         bytes(node.memory_total_bytes),
@@ -63,7 +58,7 @@ pub(crate) fn node_summary(node: &NodeRates, between: &str) -> String {
 
 /// A VM's latest rates as table cells: CPU, memory, network in and out,
 /// disk read and write. All `-` until the agent has two samples of it.
-pub(crate) fn rate_cells(rates: Option<&VmRates>) -> [String; 6] {
+fn rate_cells(rates: Option<&VmRates>) -> [String; 6] {
     match rates {
         Some(r) => [
             format!("{:.1}%", r.cpu_percent),
@@ -78,7 +73,7 @@ pub(crate) fn rate_cells(rates: Option<&VmRates>) -> [String; 6] {
 }
 
 /// `secs` in its largest whole unit: `45s`, `12m`, `3h`, `2d`.
-pub fn duration(secs: u64) -> String {
+pub(crate) fn duration(secs: u64) -> String {
     match secs {
         s if s < 60 => format!("{s}s"),
         s if s < 3600 => format!("{}m", s / 60),
@@ -89,12 +84,12 @@ pub fn duration(secs: u64) -> String {
 
 /// `mib` MiB of memory or disk in the largest unit that keeps it at least
 /// 1: `256M`, `1.5G`.
-pub fn mem(mib: u64) -> String {
+pub(crate) fn mem(mib: u64) -> String {
     bytes(mib << 20)
 }
 
 /// Where a Machine-backed App runs: its Machine and port, as `pi:8080`.
-pub fn machine_port(app: &MachineAppInfo) -> String {
+pub(crate) fn machine_port(app: &MachineAppInfo) -> String {
     format!("{}:{}", app.machine, app.route.port)
 }
 
@@ -109,7 +104,7 @@ fn row(out: &mut String, [name, cells @ ..]: [String; 7]) {
 
 /// `n` bytes in the largest unit that keeps it at least 1: `512B`, `140M`,
 /// `1.5G`.
-pub fn bytes(n: u64) -> String {
+pub(crate) fn bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
     let mut value = n as f64;
     let mut unit = 0;
@@ -124,7 +119,7 @@ pub fn bytes(n: u64) -> String {
     }
 }
 
-pub(crate) fn per_sec(n: u64) -> String {
+fn per_sec(n: u64) -> String {
     format!("{}/s", bytes(n))
 }
 

@@ -1,4 +1,5 @@
 mod client;
+mod text;
 
 use cirro_image::ImageCache;
 use cirro_image::run_config::merge_env;
@@ -86,12 +87,8 @@ enum Command {
     Park { name: String },
     /// Start a parked VM again from its snapshot and print its VM address
     Wake { name: String },
-    /// Live terminal dashboard
-    Top {
-        /// Print one snapshot as text and exit
-        #[arg(long)]
-        once: bool,
-    },
+    /// CPU, memory, disk and network use of the Node and each VM, as text
+    Top,
     /// Time boot, park and wake on this Node, with a throwaway VM per run
     Bench(BenchArgs),
     /// Manage an app's SQLite database
@@ -377,8 +374,7 @@ fn main() -> ExitCode {
             }
             Command::Run(args) => run(&cli.socket, args).await,
             Command::Bench(args) => bench(&cli.socket, args).await,
-            Command::Top { once: true } => top_once(&cli.socket).await,
-            Command::Top { once: false } => top(&cli.socket).await,
+            Command::Top => top(&cli.socket).await,
             Command::Image(command) => image_command(command).await,
             Command::Machine(command) => machine_command(&cli.socket, command).await,
             Command::Ps { all } => ps(&cli.socket, all).await,
@@ -711,7 +707,7 @@ async fn image_command(command: ImageCommand) -> Result<(), String> {
             println!("{:<40} {:<19} {:>5}", "REFERENCE", "DIGEST", "SIZE");
             for image in cache.list().map_err(|e| e.to_string())? {
                 let size = std::fs::metadata(&image.rootfs).map_or(0, |m| m.len());
-                let size = cirro_tui::bytes(size);
+                let size = text::bytes(size);
                 let digest: String = image.digest.chars().take("sha256:".len() + 12).collect();
                 let references: Vec<&str> = match image.references.as_slice() {
                     [] => vec!["-"],
@@ -750,89 +746,11 @@ fn image_cache_dir() -> Result<PathBuf, String> {
     Ok(base.join("cirro").join("images"))
 }
 
-/// The live dashboard, until `q`. The stats refresh once a second, as
-/// often as the agent samples.
 async fn top(socket: &Path) -> Result<(), String> {
-    let mut terminal = ratatui::try_init().map_err(|e| format!("setting up the terminal: {e}"))?;
-    let result = top_loop(socket, &mut terminal).await;
-    ratatui::restore();
-    result
-}
-
-async fn top_loop(socket: &Path, terminal: &mut ratatui::DefaultTerminal) -> Result<(), String> {
-    use ratatui::crossterm::event::{self, Event, KeyEventKind};
-    let mut dashboard = cirro_tui::Dashboard::default();
-    let mut next_refresh = std::time::Instant::now();
-    // Stops run in the background (a graceful one can take its whole
-    // timeout) and report back here.
-    let (stopped, mut stop_results) = tokio::sync::mpsc::unbounded_channel();
-    loop {
-        if std::time::Instant::now() >= next_refresh {
-            let refreshed = async {
-                let stats = client::call::<Stats>(socket, Method::GET, "/stats", None::<&()>);
-                let apps = client::call(socket, Method::GET, "/machine-apps", None::<&()>);
-                Ok::<_, String>((stats.await?, apps.await?))
-            };
-            match refreshed.await {
-                Ok((stats, machine_apps)) => {
-                    dashboard.set_stats(stats);
-                    dashboard.set_machine_apps(machine_apps);
-                }
-                Err(e) => dashboard.set_refresh_error(e),
-            }
-            next_refresh = std::time::Instant::now() + Duration::from_secs(1);
-        }
-        while let Ok((name, result)) = stop_results.try_recv() {
-            dashboard.set_status(match result {
-                Ok(()) => format!("stopped {name}"),
-                Err(e) => format!("stopping {name}: {e}"),
-            });
-        }
-        terminal
-            .draw(|frame| dashboard.draw(frame))
-            .map_err(|e| format!("drawing the dashboard: {e}"))?;
-        let wait = next_refresh.saturating_duration_since(std::time::Instant::now());
-        if !event::poll(wait).map_err(|e| format!("reading the terminal: {e}"))? {
-            continue;
-        }
-        let Event::Key(key) = event::read().map_err(|e| format!("reading the terminal: {e}"))?
-        else {
-            continue;
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        match dashboard.key(key.code) {
-            cirro_tui::Action::None => {}
-            cirro_tui::Action::Quit => return Ok(()),
-            cirro_tui::Action::ShowLog(name) => match log_tail(socket, &name).await {
-                Ok(log) => dashboard.set_log(&name, &String::from_utf8_lossy(&log)),
-                Err(e) => dashboard.set_status(e),
-            },
-            cirro_tui::Action::Stop(name) => {
-                dashboard.set_status(format!("stopping {name}…"));
-                let socket = socket.to_path_buf();
-                let stopped = stopped.clone();
-                tokio::spawn(async move {
-                    let result = stop(
-                        &socket,
-                        &name,
-                        false,
-                        cirro_proto::DEFAULT_STOP_TIMEOUT_SECS,
-                    )
-                    .await;
-                    let _ = stopped.send((name, result));
-                });
-            }
-        }
-    }
-}
-
-async fn top_once(socket: &Path) -> Result<(), String> {
     let stats: Stats = client::call(socket, Method::GET, "/stats", None::<&()>).await?;
     let machine_apps: Vec<MachineAppInfo> =
         client::call(socket, Method::GET, "/machine-apps", None::<&()>).await?;
-    print!("{}", cirro_tui::snapshot(&stats, &machine_apps));
+    print!("{}", text::snapshot(&stats, &machine_apps));
     Ok(())
 }
 
@@ -869,14 +787,14 @@ async fn ps(socket: &Path, all: bool) -> Result<(), String> {
             .vm_address
             .map_or_else(|| "-".to_string(), |a| a.to_string());
         let uptime = match vm.ended {
-            None => cirro_tui::duration(now.saturating_sub(vm.started_at)),
+            None => text::duration(now.saturating_sub(vm.started_at)),
             Some(_) => "-".to_string(),
         };
         let host = vm.route.as_ref().map_or("-", |r| r.host.as_str());
         let mut row = ps_row([
             &vm.name,
             &address,
-            &cirro_tui::mem(vm.mem_mib.into()),
+            &text::mem(vm.mem_mib.into()),
             &vm.vcpus.to_string(),
             &uptime,
             host,
@@ -888,7 +806,7 @@ async fn ps(socket: &Path, all: bool) -> Result<(), String> {
                 Some(ended) => row.push_str(&format!(
                     "  {} {} ago",
                     ended.reason.as_str(),
-                    cirro_tui::duration(now.saturating_sub(ended.at))
+                    text::duration(now.saturating_sub(ended.at))
                 )),
             }
         }
@@ -902,7 +820,7 @@ async fn ps(socket: &Path, all: bool) -> Result<(), String> {
             "-",
             "-",
             &app.route.host,
-            &cirro_tui::machine_port(&app),
+            &text::machine_port(&app),
         ]);
         if all {
             row.push_str("  ");
@@ -949,29 +867,6 @@ async fn logs(socket: &Path, name: &str, follow: bool) -> Result<(), String> {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-}
-
-/// The last [`LOG_CHUNK`] bytes of `name`'s console log, read through to
-/// its end: the agent hands out at most one chunk per request.
-// ponytail: reads the whole log to find its end; an offset-from-end query
-// on the agent would avoid that if `top` on huge logs gets slow.
-async fn log_tail(socket: &Path, name: &str) -> Result<Vec<u8>, String> {
-    let mut tail = Vec::new();
-    let mut offset = 0u64;
-    loop {
-        let path = format!("/vms/{name}/logs?offset={offset}");
-        let (_, bytes) = client::send(socket, Method::GET, &path, None::<&()>).await?;
-        let full = bytes.len() as u64 == LOG_CHUNK;
-        offset += bytes.len() as u64;
-        tail.extend_from_slice(&bytes);
-        let keep = LOG_CHUNK as usize;
-        if tail.len() > keep {
-            tail.drain(..tail.len() - keep);
-        }
-        if !full {
-            return Ok(tail);
-        }
     }
 }
 

@@ -117,7 +117,7 @@ cirro run --name slow --host slow.localhost --port 80 -e START_DELAY=5 \
     ./hello-http.ext4 -- /entrypoint
 ```
 
-### cpu-burn and mem-hog in the dashboard
+### cpu-burn and mem-hog in `cirro top`
 
 ```sh
 cirro run --name burn --vcpus 2 -e WORKERS=2 ./cpu-burn.ext4 -- /entrypoint

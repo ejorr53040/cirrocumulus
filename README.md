@@ -11,14 +11,10 @@
 Every workload gets its own Firecracker microVM, locked down with jailer.
 Manage everything from your terminal.
 
-> Early: one Node runs OCI images in jailed microVMs, with a live dashboard,
-> park and wake, and an HTTP(S) edge that routes to Apps by hostname. `ssh`,
-> `db` and the multi-node control plane (`server`, `node join`) are listed in
-> `--help` but exit with "not yet implemented". See the [changelog](CHANGELOG.md).
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/ejorr53040/cirrocumulus/main/docs/cirro-top.gif" alt="cirro run, then cirro top showing the VM's live CPU and memory" width="90%">
-</p>
+> Early: one Node runs OCI images in jailed microVMs, with park and wake, and
+> an HTTP(S) edge that routes to Apps by hostname. `ssh`, `db` and the
+> multi-node control plane (`server`, `node join`) are listed in `--help` but
+> exit with "not yet implemented". See the [changelog](CHANGELOG.md).
 
 ## Why Cirrocumulus?
 
@@ -33,8 +29,9 @@ small, identical cells.
 
 - `cirro run nginx:alpine`: an OCI image becomes a jailed microVM, built
   without root
-- `cirro top`: an htop-style dashboard of every VM's CPU, memory, disk and
-  network
+- `cirro top`: a snapshot of every VM's CPU, memory, disk and network use;
+  for screens, use [The Loam](https://github.com/ejorr53040/the-loam)
+  ([ADR 0012](docs/adr/0012-the-loam-is-the-ui.md))
 - Park and wake: snapshot an idle VM to disk and free its RAM; wake it in
   54 ms p99
 - Apps: route a hostname to a VM; it wakes on request and parks when idle
@@ -47,7 +44,7 @@ small, identical cells.
 
 ```mermaid
 flowchart LR
-    U[cirro CLI and cirro top] -- Unix socket --> A[Node agent]
+    U[cirro CLI] -- Unix socket --> A[Node agent]
     C[Clients] -- HTTP / HTTPS by hostname --> E[Edge, in the agent]
     E -- wake if parked, then proxy --> V
     A -- jailer, netns, cgroups, nftables --> V[Firecracker microVMs<br/>guest-init as PID 1]
@@ -159,7 +156,7 @@ cirro image pull <image>          # pull and build ahead of time
 cirro image ls                    # cached images
 cirro image rm <image|digest>
 cirro ps [--all]                  # list VMs (--all includes Ended VMs)
-cirro top [--once]                # live CPU, memory, disk and network use
+cirro top                         # CPU, memory, disk and network use, once
 cirro logs [--follow] <name>      # a VM's console log
 cirro stop [--force] [--timeout <secs>] <name>
 cirro rm <name>                   # delete an Ended VM's record and log, or a parked VM's snapshot
