@@ -13,6 +13,7 @@
 # Security
 
 - [Threat model: multi-tenant isolation with microVMs](threat-model.md)
+- [Security review, 2026-11-11: sandbox escapes and networking](security-review-2026-11-11.md)
 
 # Design decisions
 

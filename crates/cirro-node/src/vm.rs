@@ -319,6 +319,11 @@ impl Vm {
     /// runs. On failure, everything done so far is undone and the snapshot
     /// is put back, so the wake can be tried again.
     pub(crate) async fn wake(node: &NodeConfig, spec: &WakeSpec) -> Result<Vm, Error> {
+        // The files came out of the last VM's jail, where its VMM could
+        // have swapped one for a link to a file it wants handed over.
+        for file in SNAPSHOT_FILES {
+            refuse_unless_plain_file(&spec.snapshot.join(file))?;
+        }
         let mut vm = Vm::empty(spec.console_log.clone());
         match vm.wake_steps(node, spec).await {
             Ok(()) => Ok(vm),
@@ -525,7 +530,7 @@ impl Vm {
         move_files(&spec.snapshot, SNAPSHOT_FILES, &self.jail_root, WAKE_FILES)
             .map_err(|e| err("move the snapshot into the jail", e))?;
         for file in WAKE_FILES {
-            std::os::unix::fs::chown(self.jail_root.join(file), Some(uid), Some(uid))
+            std::os::unix::fs::lchown(self.jail_root.join(file), Some(uid), Some(uid))
                 .map_err(|e| err(&format!("chown {file} in jail"), e))?;
         }
         // 6. Load and resume. The snapshot names the tap, the drive and the
@@ -642,6 +647,17 @@ impl Vm {
             ],
         )
         .await?;
+        // The egress policy is IPv4's, so the Node takes no IPv6 from the
+        // veth, on top of the policy's own `ip6` drop. Before the
+        // namespace's side is up, and long before a guest runs. A Node
+        // without IPv6 has nothing to turn off.
+        let ipv6_off = format!("{}/conf/{id}/disable_ipv6", crate::egress::IPV6_SYSCTLS);
+        match std::fs::write(ipv6_off, "1") {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(err("turn IPv6 off on the VM's veth", e));
+            }
+            _ => {}
+        }
         ip_batch(
             Some(&id),
             &[
@@ -854,6 +870,23 @@ fn move_files(
         }
     }
     result
+}
+
+/// Fails unless `path` is a regular file with no other name: not a symlink,
+/// and not a hard link to a file that also lives somewhere else.
+fn refuse_unless_plain_file(path: &Path) -> Result<(), Error> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| err(&format!("snapshot file {}", path.display()), e))?;
+    if meta.is_file() && meta.nlink() == 1 {
+        Ok(())
+    } else {
+        Err(Error(format!(
+            "snapshot file {} is a link or not a regular file, so it isn't the one park \
+             wrote; `cirro rm` the VM to discard its snapshot",
+            path.display()
+        )))
+    }
 }
 
 /// [`natural_end`] for a VMM this agent holds, which also counts an OOM kill

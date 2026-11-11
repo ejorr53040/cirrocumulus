@@ -27,7 +27,7 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::{Pid, getgid};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
@@ -1237,6 +1237,40 @@ fn console_logs_are_not_world_readable() {
     agent.assert_no_cirro_state();
 }
 
+/// The egress policy is IPv4's, so the Node takes no IPv6 at all from a VM's
+/// veth: otherwise whatever got into the VM's namespace could reach the
+/// Node's own services at the veth's link-local address.
+#[test]
+fn the_node_takes_no_ipv6_from_a_vms_veth() {
+    if !Path::new("/proc/sys/net/ipv6").exists() {
+        eprintln!("skipping: no IPv6 here");
+        return;
+    }
+    let Some(agent) = Agent::start(207) else {
+        return;
+    };
+    agent
+        .run("v4only", &rootfs().guest_init, &["/app/counter"])
+        .success();
+
+    let veth = format!("cirro-{:02x}02", agent.octet);
+    let disabled = std::fs::read_to_string(format!("/proc/sys/net/ipv6/conf/{veth}/disable_ipv6"))
+        .expect("read the veth's IPv6 setting");
+    assert_eq!(disabled.trim(), "1", "IPv6 is on for the VM's veth");
+    let addresses = stdout_of(&["ip", "-6", "addr", "show", "dev", &veth]);
+    assert!(
+        addresses.trim().is_empty(),
+        "the VM's veth has an IPv6 address:\n{addresses}"
+    );
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "v4only"])
+        .assert()
+        .success();
+    agent.assert_no_cirro_state();
+}
+
 #[test]
 fn a_user_outside_the_socket_group_gets_a_clear_permission_error() {
     // The test user isn't in group 0 (root), so the socket is closed to it.
@@ -2003,6 +2037,63 @@ fn a_parked_vm_whose_snapshot_is_gone_says_so_and_can_be_removed() {
     agent.assert_no_snapshots();
 }
 
+/// A jail's files are its VMM's, so an escaped VMM could leave a symlink or
+/// a hard link where park expects a snapshot file. Wake hands the snapshot
+/// to the new VM's uid, so it must refuse such a file rather than chown
+/// whatever it points at.
+#[test]
+fn wake_refuses_a_snapshot_file_that_is_a_link_and_chowns_nothing() {
+    let Some(mut agent) = Agent::start(209) else {
+        return;
+    };
+    agent
+        .run("planted", &rootfs().guest_init, &["/app/counter"])
+        .success();
+    agent.cirro().args(["park", "planted"]).assert().success();
+
+    // Swap the real parked dir for one of ours, as the snapshot-gone test
+    // does, holding a stand-in for a host file the VMM wants.
+    agent.stop_agent();
+    let parked = agent.state_dir.join("parked");
+    let real = agent.state_dir.join("parked.real");
+    std::fs::rename(&parked, &real).expect("set the real parked dir aside");
+    let snapshot = parked.join("planted");
+    std::fs::create_dir_all(&snapshot).expect("make a planted snapshot dir");
+    for file in ["mem", "rootfs.ext4"] {
+        std::fs::write(snapshot.join(file), b"").expect("write a snapshot file");
+    }
+    let victim = agent.state_dir.join("victim");
+    std::fs::write(&victim, b"host file").expect("write the victim");
+    let owner = || std::fs::metadata(&victim).expect("stat the victim").uid();
+    let ours = owner();
+
+    for kind in ["symlink", "hard link"] {
+        let planted = snapshot.join("vmstate");
+        let _ = std::fs::remove_file(&planted);
+        match kind {
+            "symlink" => std::os::unix::fs::symlink(&victim, &planted),
+            _ => std::fs::hard_link(&victim, &planted),
+        }
+        .expect("plant the link");
+        agent.spawn().expect("start the agent again");
+        let err = stderr(agent.cirro().args(["wake", "planted"]).assert().failure());
+        assert!(
+            err.contains("vmstate") && err.contains("link"),
+            "wake through a {kind} should name the file it refused, got: {err}"
+        );
+        assert_eq!(owner(), ours, "wake chowned the {kind}'s target");
+        agent.stop_agent();
+    }
+
+    std::fs::remove_dir_all(&parked).expect("remove the planted parked dir");
+    std::fs::remove_file(&victim).expect("remove the victim");
+    std::fs::rename(&real, &parked).expect("put the real parked dir back");
+    agent.spawn().expect("start the agent again");
+    agent.cirro().args(["rm", "planted"]).assert().success();
+    agent.assert_no_cirro_state();
+    agent.assert_no_snapshots();
+}
+
 /// M6's exit: `cirro bench` boots, parks, wakes and removes a throwaway VM
 /// over and over, and prints each operation's p50 and p99 as the CLI sees
 /// them, leaving nothing behind.
@@ -2218,6 +2309,73 @@ fn requests_for_a_parked_app_wake_it_once_and_are_all_answered() {
     agent.cirro().args(["rm", "tally"]).assert().success();
     agent.assert_no_cirro_state();
     agent.assert_no_snapshots();
+}
+
+/// The edge's clients are anyone on the internet, so a 503 for a wake that
+/// failed inside the Node says only that it failed: the error itself, with
+/// the guest's console and the Node's paths, is for `cirro wake` and the
+/// agent's log.
+#[test]
+fn a_503_for_a_failed_wake_keeps_the_nodes_error_from_the_client() {
+    let Some(mut agent) = Agent::start(206) else {
+        return;
+    };
+    run_app(&agent, "broken", "broken.test", &["/app/counter"]).success();
+    wait_for_edge(&agent, "broken.test");
+    agent.cirro().args(["park", "broken"]).assert().success();
+
+    // A snapshot of empty files, which Firecracker can't load.
+    agent.stop_agent();
+    let parked = agent.state_dir.join("parked");
+    let real = agent.state_dir.join("parked.real");
+    std::fs::rename(&parked, &real).expect("set the real parked dir aside");
+    let snapshot = parked.join("broken");
+    std::fs::create_dir_all(&snapshot).expect("make a broken snapshot dir");
+    for file in ["vmstate", "mem", "rootfs.ext4"] {
+        std::fs::write(snapshot.join(file), b"").expect("write a snapshot file");
+    }
+    agent.spawn().expect("start the agent again");
+
+    for _ in 0..2 {
+        let response = edge_get(&agent, "broken.test").expect("ask the edge");
+        assert!(
+            response.starts_with("HTTP/1.1 503") && response.contains("failed to wake"),
+            "a request for an App that fails to wake should get a 503: {response:?}"
+        );
+        for internal in ["console", "snapshot", "firecracker", "/home/"] {
+            assert!(
+                !response.contains(internal),
+                "the 503 shows the client the Node's own error ({internal}): {response:?}"
+            );
+        }
+    }
+    let err = stderr(agent.cirro().args(["wake", "broken"]).assert().failure());
+    assert!(err.contains("load the snapshot"), "{err}");
+
+    agent.stop_agent();
+    std::fs::remove_dir_all(&parked).expect("remove the broken parked dir");
+    std::fs::rename(&real, &parked).expect("put the real parked dir back");
+    agent.spawn().expect("start the agent again");
+    agent.cirro().args(["rm", "broken"]).assert().success();
+    agent.assert_no_cirro_state();
+    agent.assert_no_snapshots();
+}
+
+/// The agent holds a request's whole body in memory before reading it as
+/// JSON, so it takes only as much as a request could need.
+#[test]
+fn the_agent_refuses_a_request_body_too_big_to_be_a_request() {
+    let Some(agent) = Agent::start_without_kvm(205) else {
+        return;
+    };
+    let body = "x".repeat((1 << 20) + 1);
+    let response = post_raw(&agent.socket, "/vms", &body).expect("post an oversized body");
+    assert!(
+        response.starts_with("HTTP/1.0 413") || response.starts_with("HTTP/1.1 413"),
+        "an oversized body should be refused as too large: {:?}",
+        &response[..response.len().min(200)]
+    );
+    agent.cirro().arg("ps").assert().success();
 }
 
 /// M7: requests for an App that can't be woken are answered at once with a
@@ -3281,6 +3439,11 @@ fn a_machine_that_goes_down_is_reconnected_once_it_is_back() {
     assert!(
         down.contains("pi"),
         "the 503 doesn't name the Machine: {down:?}"
+    );
+    // What `ssh` said names the Machine's address: not for the edge's clients.
+    assert!(
+        !down.contains("127.0.0.1") && !down.contains("ssh"),
+        "the 503 shows the client what ssh said: {down:?}"
     );
     wait_for_machine(&agent, "pi", "unreachable");
 

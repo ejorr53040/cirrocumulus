@@ -8,11 +8,12 @@
 //! Firecracker (`/snapshot/load`).
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::{Method, Request, StatusCode};
 use hyper_util::client::legacy::Client as HyperClient;
 use hyperlocal::{UnixClientExt, Uri as UnixUri};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// A non-2xx response from the Firecracker API, or a transport failure
 /// talking to it at all.
@@ -39,6 +40,15 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// The most of an error response the client holds in memory: a VMM that has
+/// been taken over mustn't fill the agent's with an error that never ends.
+const MAX_ERROR_BODY: usize = 64 * 1024;
+
+/// How long Firecracker has to answer a request, and one that writes or
+/// reads a whole guest's memory.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// What `boot` needs to bring a VM up, matching the fields
 /// `run_plain.sh` passes to `/machine-config`, `/boot-source` and
@@ -74,7 +84,30 @@ impl Client {
         self.send(Method::PUT, path, body).await
     }
 
+    /// Sends one request and waits for its answer, but not for good: the
+    /// socket is the VMM's own, and a VMM that has been taken over can
+    /// accept a request and never answer it.
     async fn send(&self, method: Method, path: &str, body: serde_json::Value) -> Result<(), Error> {
+        let limit = if path.starts_with("/snapshot/") {
+            SNAPSHOT_TIMEOUT
+        } else {
+            REQUEST_TIMEOUT
+        };
+        tokio::time::timeout(limit, self.send_unbounded(method, path, body))
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::Connect(format!(
+                    "{path} went unanswered for {limit:?}"
+                )))
+            })
+    }
+
+    async fn send_unbounded(
+        &self,
+        method: Method,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<(), Error> {
         let uri: hyper::Uri = UnixUri::new(&self.socket_path, path).into();
         let body_bytes = serde_json::to_vec(&body).expect("serialize request body");
 
@@ -96,8 +129,7 @@ impl Client {
             return Ok(());
         }
 
-        let body_bytes = response
-            .into_body()
+        let body_bytes = Limited::new(response.into_body(), MAX_ERROR_BODY)
             .collect()
             .await
             .map(|c| c.to_bytes())
@@ -242,4 +274,34 @@ impl Client {
 fn path_str(p: &Path) -> &str {
     p.to_str()
         .unwrap_or_else(|| panic!("path is not valid UTF-8: {}", p.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The API socket is the VMM's own, so a VMM that has been taken over
+    /// can accept a request and never answer it. A stop that waited on it
+    /// for good could never go on to kill the VMM.
+    #[tokio::test(start_paused = true)]
+    async fn a_firecracker_that_never_answers_is_an_error_not_a_hang() {
+        let dir = crate::test_util::tempdir("cirro-fc-silent");
+        let socket = dir.join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let silent = tokio::spawn(async move {
+            let _held = listener.accept().await;
+            std::future::pending::<()>().await
+        });
+
+        let client = Client::new(&socket);
+        let asked = client.send_ctrl_alt_del();
+        let answer = tokio::time::timeout(Duration::from_secs(3600), asked).await;
+
+        assert!(
+            matches!(answer, Ok(Err(Error::Connect(_)))),
+            "a request Firecracker never answers should fail on its own: {answer:?}"
+        );
+        silent.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

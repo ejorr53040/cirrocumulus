@@ -2,6 +2,7 @@
 //! request to the agent, and every response's shape.
 
 use super::*;
+use http_body_util::{LengthLimitError, Limited};
 
 pub(super) type ApiResponse = Response<Full<Bytes>>;
 
@@ -158,14 +159,23 @@ pub(super) fn internal(message: String) -> ApiError {
     ApiError(StatusCode::INTERNAL_SERVER_ERROR, message)
 }
 
+/// The most of a request body the agent holds in memory: far more than a
+/// request with a long command and environment needs.
+const MAX_BODY: usize = 1 << 20;
+
 pub(super) async fn read_json<T: serde::de::DeserializeOwned>(
     req: Request<Incoming>,
 ) -> Result<T, ApiError> {
-    let body = req
-        .into_body()
+    let body = Limited::new(req.into_body(), MAX_BODY)
         .collect()
         .await
-        .map_err(|e| bad_request(&format!("read request body: {e}")))?
+        .map_err(|e| match e.downcast_ref::<LengthLimitError>() {
+            Some(_) => ApiError(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("the request body is over {MAX_BODY} bytes"),
+            ),
+            None => bad_request(&format!("read request body: {e}")),
+        })?
         .to_bytes();
     serde_json::from_slice(&body).map_err(|e| bad_request(&format!("invalid request body: {e}")))
 }

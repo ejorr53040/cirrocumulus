@@ -201,6 +201,13 @@ impl ImageCache {
                         found.join(", ")
                     )));
                 };
+                // The registry's own words, about to name a file in the cache.
+                let hex = digest.strip_prefix("sha256:").unwrap_or("");
+                if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(Error(format!(
+                        "{reference}'s {PLATFORM} entry {digest:?} isn't a digest (sha256:<64 hex>)"
+                    )));
+                }
                 if self.cached(&digest)?.is_some() {
                     return Ok(digest);
                 }

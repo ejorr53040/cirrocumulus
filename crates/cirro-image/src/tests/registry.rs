@@ -115,9 +115,10 @@ impl Registry {
             .iter()
             .map(|(platform, digest)| {
                 let (os, arch) = platform.split_once('/').unwrap();
-                let size = self.content.lock().unwrap().manifests[&format!("{repo}/{digest}")]
-                    .1
-                    .len();
+                // 0 for an entry naming no manifest the registry has.
+                let content = self.content.lock().unwrap();
+                let manifest = content.manifests.get(&format!("{repo}/{digest}"));
+                let size = manifest.map_or(0, |m| m.1.len());
                 serde_json::json!({
                     "mediaType": MANIFEST, "digest": digest, "size": size,
                     "platform": {"architecture": arch, "os": os},
