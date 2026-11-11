@@ -1243,7 +1243,7 @@ fn console_logs_are_not_world_readable() {
 #[test]
 fn the_node_takes_no_ipv6_from_a_vms_veth() {
     if !Path::new("/proc/sys/net/ipv6").exists() {
-        eprintln!("skipping: this host has no IPv6");
+        eprintln!("skipping: no IPv6 here");
         return;
     }
     let Some(agent) = Agent::start(207) else {
@@ -1253,10 +1253,11 @@ fn the_node_takes_no_ipv6_from_a_vms_veth() {
         .run("v4only", &rootfs().guest_init, &["/app/counter"])
         .success();
 
-    let disabled = std::fs::read_to_string("/proc/sys/net/ipv6/conf/cirro-cf02/disable_ipv6")
+    let veth = format!("cirro-{:02x}02", agent.octet);
+    let disabled = std::fs::read_to_string(format!("/proc/sys/net/ipv6/conf/{veth}/disable_ipv6"))
         .expect("read the veth's IPv6 setting");
     assert_eq!(disabled.trim(), "1", "IPv6 is on for the VM's veth");
-    let addresses = stdout_of(&["ip", "-6", "addr", "show", "dev", "cirro-cf02"]);
+    let addresses = stdout_of(&["ip", "-6", "addr", "show", "dev", &veth]);
     assert!(
         addresses.trim().is_empty(),
         "the VM's veth has an IPv6 address:\n{addresses}"
@@ -3438,6 +3439,11 @@ fn a_machine_that_goes_down_is_reconnected_once_it_is_back() {
     assert!(
         down.contains("pi"),
         "the 503 doesn't name the Machine: {down:?}"
+    );
+    // What `ssh` said names the Machine's address: not for the edge's clients.
+    assert!(
+        !down.contains("127.0.0.1") && !down.contains("ssh"),
+        "the 503 shows the client what ssh said: {down:?}"
     );
     wait_for_machine(&agent, "pi", "unreachable");
 

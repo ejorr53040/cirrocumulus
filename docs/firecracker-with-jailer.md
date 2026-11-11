@@ -3,7 +3,8 @@
 [jailer](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md)
 is the Firecracker project's own sandbox for the VMM process: it puts
 Firecracker in a chroot, a new mount namespace (and a PID namespace if asked,
-which Cirrocumulus doesn't), a network namespace you name, and cgroups, then drops to an unprivileged uid and execs Firecracker.
+which Cirrocumulus doesn't), a network namespace you name, and cgroups, then
+drops to an unprivileged uid and execs Firecracker.
 Cirrocumulus runs every VM this way. These are the things that cost us time.
 
 ## What the Node agent passes

@@ -8,6 +8,9 @@
 //! guest can send from any address it likes, and the Node's rp_filter is
 //! loose on many distros.
 //!
+//! The policy is IPv4's. Guests are given no IPv6 address, so a second
+//! table, `ip6 cirro`, drops all IPv6 from VMs' veths.
+//!
 //! It all lives in one nftables table, `ip cirro`, which the Node agent
 //! ensures at startup and never removes; only `cirro node uninstall` does
 //! (#11). Every rule matches only Cirrocumulus interfaces (`cirro-*`, the
@@ -26,7 +29,11 @@ use std::io;
 use std::path::Path;
 use std::process::Command;
 
-/// The table's name, in the `ip` family.
+/// Where the kernel keeps its IPv6 settings, when it has IPv6 at all.
+pub(crate) const IPV6_SYSCTLS: &str = "/proc/sys/net/ipv6";
+
+/// The table's name, in the `ip` family, and in `ip6` for the one rule
+/// there.
 const TABLE: &str = "cirro";
 
 /// Destinations VMs may not open connections to: private, carrier-grade
@@ -67,16 +74,34 @@ pub(crate) fn ensure_node_policy(subnet: &str, egress_iface: Option<&str>) -> io
             "add element ip {TABLE} egress_ifaces {{ \"{iface}\" }}\n"
         ));
     }
+    // The policy above is IPv4's, and guests are given no IPv6, so the Node
+    // takes none from a VM's veth. `vm` also turns IPv6 off on each veth,
+    // which a later write to `net.ipv6.conf.all.disable_ipv6` would undo.
+    if Path::new(IPV6_SYSCTLS).exists() {
+        script.push_str(&format!(
+            "table ip6 {TABLE} {{\n\
+             \tchain forward {{ type filter hook forward priority filter; policy accept; }}\n\
+             \tchain input {{ type filter hook input priority filter; policy accept; }}\n\
+             }}\n\
+             flush chain ip6 {TABLE} forward\n\
+             flush chain ip6 {TABLE} input\n\
+             add rule ip6 {TABLE} forward iifname \"{HOST_ID_PREFIX}*\" drop\n\
+             add rule ip6 {TABLE} input iifname \"{HOST_ID_PREFIX}*\" drop\n"
+        ));
+    }
     nft(&["-f", "-"], Some(&script))
 }
 
 /// Removes the whole egress policy. For `cirro node uninstall`; the agent
 /// itself never calls this. Removing a policy that isn't there is fine.
 pub(crate) fn remove_node_policy() -> io::Result<()> {
-    match nft(&["delete", "table", "ip", TABLE], None) {
-        Err(e) if e.to_string().contains("No such file or directory") => Ok(()),
-        other => other,
+    for family in ["ip", "ip6"] {
+        match nft(&["delete", "table", family, TABLE], None) {
+            Err(e) if !e.to_string().contains("No such file or directory") => return Err(e),
+            _ => {}
+        }
     }
+    Ok(())
 }
 
 const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";

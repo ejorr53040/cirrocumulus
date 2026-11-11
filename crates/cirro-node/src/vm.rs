@@ -322,7 +322,7 @@ impl Vm {
         // The files came out of the last VM's jail, where its VMM could
         // have swapped one for a link to a file it wants handed over.
         for file in SNAPSHOT_FILES {
-            refuse_a_link(&spec.snapshot.join(file))?;
+            refuse_unless_plain_file(&spec.snapshot.join(file))?;
         }
         let mut vm = Vm::empty(spec.console_log.clone());
         match vm.wake_steps(node, spec).await {
@@ -648,9 +648,11 @@ impl Vm {
         )
         .await?;
         // The egress policy is IPv4's, so the Node takes no IPv6 from the
-        // veth. Before the namespace's side is up, and long before a guest
-        // runs. A Node without IPv6 has nothing to turn off.
-        match std::fs::write(format!("/proc/sys/net/ipv6/conf/{id}/disable_ipv6"), "1") {
+        // veth, on top of the policy's own `ip6` drop. Before the
+        // namespace's side is up, and long before a guest runs. A Node
+        // without IPv6 has nothing to turn off.
+        let ipv6_off = format!("{}/conf/{id}/disable_ipv6", crate::egress::IPV6_SYSCTLS);
+        match std::fs::write(ipv6_off, "1") {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                 return Err(err("turn IPv6 off on the VM's veth", e));
             }
@@ -872,7 +874,7 @@ fn move_files(
 
 /// Fails unless `path` is a regular file with no other name: not a symlink,
 /// and not a hard link to a file that also lives somewhere else.
-fn refuse_a_link(path: &Path) -> Result<(), Error> {
+fn refuse_unless_plain_file(path: &Path) -> Result<(), Error> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::symlink_metadata(path)
         .map_err(|e| err(&format!("snapshot file {}", path.display()), e))?;

@@ -22,10 +22,10 @@ rated by what it adds to such an escape.
 | # | Severity | Finding | Status | Confirmed by |
 | --- | --- | --- | --- | --- |
 | 1 | High | Wake chowns whatever a taken-over VMM left in place of its snapshot files | Fixed | Test |
-| 2 | Medium | The Node takes IPv6 from VMs' veths, past the IPv4-only egress policy | Fixed | Test (the setting), reading (the reach) |
+| 2 | Medium | The Node takes IPv6 from VMs' veths, past the IPv4-only egress policy | Fixed | Test (the veth's setting), reading (the reach, and the nftables rule's effect) |
 | 3 | Medium | The edge's 503s show internet clients the agent's own errors and the guest's console | Fixed | Test |
 | 4 | Low | The agent buffers a request body of any size | Fixed | Test |
-| 5 | Low | The agent buffers a Firecracker API error of any size | Fixed | Reading |
+| 5 | Low | The agent waits without limit on a Firecracker API answer, and buffers an error of any size | Fixed | Test (the wait), reading (the size) |
 | 6 | Low | A registry's index entry is used as a cache file name unchecked | Fixed | Test |
 | 7 | Low | The docs claim a PID namespace the agent never asks jailer for | Docs fixed | Reading |
 | 8 | Medium | Console logs have no size limit: a guest can fill the state dir's disk | Open | Reading |
@@ -57,9 +57,11 @@ A VMM that guest code had taken over could therefore, before being parked:
 Idle park makes the trigger automatic for an App with `idle_park_secs`: the
 next request through the edge wakes it.
 
-Fix (`vm.rs`, `wake_steps`): before the snapshot leaves the root-only parked
-dir, each file must be a regular file with a link count of 1, and the chown
-is now `lchown`. A snapshot that fails the check is refused with an error
+Fix (`vm.rs`, `Vm::wake` and `wake_steps`): before a wake makes any host
+state, each file in the root-only parked dir must be a regular file with a
+link count of 1, and the chown is now `lchown`. The files aren't checked again
+after the move into the new jail; that is safe because the new VMM has loaded
+no guest yet when the chown runs. A snapshot that fails the check is refused with an error
 naming the file; `cirro rm` discards it.
 
 Test: `wake_refuses_a_snapshot_file_that_is_a_link_and_chowns_nothing`
@@ -77,14 +79,26 @@ the veth's link-local address and reach every service the Node listens for
 on `::` (sshd, the edge, anything else), which the IPv4 rule exists to
 prevent.
 
-Fix (`vm.rs`, `host_steps`): the agent writes `1` to
-`net.ipv6.conf.<veth>.disable_ipv6` right after creating the veth, before
-the namespace's end comes up, so the kernel drops every IPv6 packet arriving
-on it. A Node with no IPv6 at all has nothing to write.
+Fix, in two layers:
 
-Test: `the_node_takes_no_ipv6_from_a_vms_veth` checks the setting and that
-the veth has no IPv6 address. The reach itself (connecting from inside a
-namespace) wasn't demonstrated; it needs root in the namespace.
+- `egress.rs`: the Node's policy gains a second table, `ip6 cirro`, that
+  drops everything arriving from a `cirro-*` interface, on input and forward.
+  `cirro node uninstall` removes it with the first.
+- `vm.rs`, `host_steps`: the agent writes `1` to
+  `net.ipv6.conf.<veth>.disable_ipv6` once the veth exists and before the
+  namespace's end comes up, so the veth gets no IPv6 address. This alone
+  wouldn't last: a later write to `net.ipv6.conf.all.disable_ipv6` turns it
+  back on for every interface, which is why the table is there too.
+
+A Node whose kernel has no IPv6 gets neither. A VM that was already running
+when the agent is upgraded is covered by the table as soon as the new agent
+starts, and keeps its veth's IPv6 address until it next starts.
+
+Test: `the_node_takes_no_ipv6_from_a_vms_veth` checks the veth's setting and
+that it has no IPv6 address. Two things weren't demonstrated, since both need
+root: the reach itself (connecting from inside a namespace), and that the
+`ip6` rule drops (the tests show only that nftables accepts it, since every
+agent start applies it).
 
 ### 3. The edge's 503s show clients the agent's own errors (Medium)
 
@@ -103,8 +117,11 @@ a conflict (the App's state, such as "its snapshot is gone") still answers
 in the agent's words. Any other failure answers ``App "x" failed to wake;
 `cirro logs x` may say why``. A down Machine's 503 names the Machine and no
 more. `cirro wake`, `cirro machine ls` and the agent's log keep the detail.
+One cost: a wake refused because the agent is shutting down or the subnet is
+full now gets the same "failed to wake" line, which says less than it could.
 
-Test: `a_503_for_a_failed_wake_keeps_the_nodes_error_from_the_client`.
+Tests: `a_503_for_a_failed_wake_keeps_the_nodes_error_from_the_client`, and
+an assertion added to `a_machine_that_goes_down_is_reconnected_once_it_is_back`.
 
 ### 4. The agent buffers a request body of any size (Low)
 
@@ -117,14 +134,22 @@ Fix (`agent/api.rs`): bodies are capped at 1 MiB; a larger one gets a 413.
 
 Test: `the_agent_refuses_a_request_body_too_big_to_be_a_request`.
 
-### 5. The agent buffers a Firecracker API error of any size (Low)
+### 5. The agent trusts Firecracker's API to answer, and briefly (Low)
 
-The same shape on the other side: the Firecracker client collected a non-2xx
-response's whole body. The API socket is in the jail and owned by the VMM, so
-a taken-over VMM could answer a stop or a park with an error that never ends.
+The API socket is in the jail and owned by the VMM, so a taken-over VMM
+chooses how it answers. The client had no timeout: a VMM that accepted a
+request and never answered left a graceful stop waiting on Ctrl-Alt-Del for
+good, with the forced stop that should follow queued behind it, so the VM
+could no longer be stopped through the agent. The client also collected a
+non-2xx response's whole body, however long.
 
-Fix (`firecracker.rs`): the error body is capped at 64 KiB. No test: the cap
-is one wrapper around the read.
+Fix (`firecracker.rs`): every request has 10 seconds to be answered, and the
+two snapshot requests, which move a guest's whole memory, 10 minutes. A
+graceful stop that gets no answer goes on to kill the VMM, as it already did
+for any other error. Error bodies are capped at 64 KiB.
+
+Test: `a_firecracker_that_never_answers_is_an_error_not_a_hang` (a unit test
+against a socket that accepts and stays silent). The cap has no test.
 
 ### 6. A registry's index entry is used as a cache file name unchecked (Low)
 
@@ -185,7 +210,7 @@ A fix needs the connect to refuse symlinks under the jail root
 ### 10. Two agents whose subnets share their low 16 bits collide (Low)
 
 Every host object a VM owns (namespace, veth, cgroup, uid) is named from the
-low 16 bits of its VM address. Two agents on one host with, say,
+low 16 bits of its VM address. Two agents on one computer with, say,
 `10.77.0.0/24` and `10.78.0.0/24` would both name their first VM
 `cirro-0002`. The second agent's `ip netns add` fails, and its unwind, which
 registers every undo step before the first step runs, then deletes the first
@@ -197,7 +222,7 @@ subnet already in the `node_subnets` set.
 
 ### 11. Turning on `ip_forward` makes the Node a router (Info)
 
-The agent sets `net.ipv4.ip_forward=1` for the whole host, and its forward
+The agent sets `net.ipv4.ip_forward=1` for the whole computer, and its forward
 chain accepts by default. A Node with two other interfaces (a LAN and a
 VPN, say) starts forwarding between them unless a host firewall forbids it.
 Docker makes the same trade and sets the forward policy to drop. Worth a

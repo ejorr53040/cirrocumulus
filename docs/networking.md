@@ -55,9 +55,9 @@ masquerades VMs' traffic out of the Node's default route, and drops:
 - anything a VM sends from an address that isn't its own, since a guest can
   forge its source address and every rule above matches on it.
 
-The table is IPv4's. Guests are given no IPv6 address, their namespaces
-don't forward IPv6, and the Node turns IPv6 off on its end of every VM's
-veth, so nothing a namespace sends over IPv6 reaches the Node.
+The table is IPv4's. Guests are given no IPv6 address and their namespaces
+don't forward IPv6. A second table, `ip6 cirro`, drops whatever IPv6 still
+arrives from a VM's veth, and the Node turns IPv6 off on its end of each one.
 
 The table only ever drops, so a host firewall such as ufw still applies on
 top. `cirro node install` adds the rule that lets VMs' traffic through it:
