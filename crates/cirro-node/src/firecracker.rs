@@ -8,7 +8,7 @@
 //! Firecracker (`/snapshot/load`).
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::{Method, Request, StatusCode};
 use hyper_util::client::legacy::Client as HyperClient;
 use hyperlocal::{UnixClientExt, Uri as UnixUri};
@@ -96,8 +96,9 @@ impl Client {
             return Ok(());
         }
 
-        let body_bytes = response
-            .into_body()
+        // Capped: a VMM that has been taken over mustn't fill the agent's
+        // memory with an error that never ends.
+        let body_bytes = Limited::new(response.into_body(), 64 * 1024)
             .collect()
             .await
             .map(|c| c.to_bytes())

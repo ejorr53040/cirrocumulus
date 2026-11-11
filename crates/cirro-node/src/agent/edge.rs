@@ -66,9 +66,7 @@ impl Router for Edge {
                     let why = tried
                         .flatten()
                         .or_else(|| agent.wake_failures.lock().unwrap().get(&name).cloned());
-                    return Resolution::Unavailable(why.unwrap_or_else(|| {
-                        format!("App {name:?} failed to wake; `cirro logs {name}` may say why")
-                    }));
+                    return Resolution::Unavailable(why.unwrap_or_else(|| failed_to_wake(&name)));
                 }
                 Step::Wake(name) => {
                     let woken =
@@ -79,11 +77,26 @@ impl Router for Edge {
                         // Another request's wake may have got there first,
                         // or the App can't be woken (its snapshot is gone).
                         Ok(Err(ApiError(StatusCode::CONFLICT, why))) => tried = Some(Some(why)),
-                        Ok(Err(ApiError(_, why))) => return Resolution::Unavailable(why),
+                        Ok(Err(e)) => return Resolution::Unavailable(wake_failure(&name, &e)),
                     }
                 }
             }
         }
+    }
+}
+
+fn failed_to_wake(name: &str) -> String {
+    format!("App {name:?} failed to wake; `cirro logs {name}` may say why")
+}
+
+/// Why a wake failed, as the edge's clients may hear it. A conflict is the
+/// App's state in the agent's own words. Anything else carries what went
+/// wrong inside the Node (the guest's console, the Node's paths), which is
+/// for `cirro wake` and the agent's log, not for whoever sent a request.
+pub(super) fn wake_failure(name: &str, e: &ApiError) -> String {
+    match e {
+        ApiError(StatusCode::CONFLICT, why) => why.clone(),
+        _ => failed_to_wake(name),
     }
 }
 

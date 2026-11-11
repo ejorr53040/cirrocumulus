@@ -126,6 +126,27 @@ fn an_index_resolves_to_its_linux_amd64_image() {
     assert_eq!(image.digest, amd);
 }
 
+/// An index's entries are the registry's own words, and each becomes a file
+/// name in the cache: one that isn't a digest could name a file outside it.
+#[test]
+fn an_index_entry_that_isnt_a_digest_is_refused() {
+    let registry = Registry::start();
+    registry.tag_index("app", "evil", &[("linux/amd64", "../outside".into())]);
+    let dir = tempdir();
+    // What the cache would take for an image it already has, one level up.
+    std::fs::write(dir.join("outside.json"), r#"{"references":[],"config":{}}"#).unwrap();
+    std::fs::write(dir.join("outside.ext4"), b"").unwrap();
+    let cache = ImageCache::new(dir.join("images")).with_plain_http(vec![registry.host.clone()]);
+    std::fs::create_dir_all(dir.join("images")).unwrap();
+
+    let refused = pull(&cache, &format!("{}/app:evil", registry.host))
+        .map(|image| image.rootfs)
+        .unwrap_err()
+        .to_string();
+
+    assert!(refused.contains("isn't a digest"), "{refused}");
+}
+
 #[test]
 fn an_image_without_a_linux_amd64_build_is_refused_by_name() {
     let registry = Registry::start();

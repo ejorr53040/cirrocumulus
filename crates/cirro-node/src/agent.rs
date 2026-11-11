@@ -799,7 +799,7 @@ impl Agent {
             let mut failures = agent.wake_failures.lock().unwrap();
             match &woken {
                 Ok(_) => failures.remove(&name),
-                Err(ApiError(_, why)) => failures.insert(name, why.clone()),
+                Err(e) => failures.insert(name.clone(), edge::wake_failure(&name, e)),
             };
             woken
         })

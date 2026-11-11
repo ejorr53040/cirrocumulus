@@ -172,12 +172,12 @@ impl Machines {
                     SocketAddr::from((Ipv4Addr::LOCALHOST, app.local_port)),
                     Lease::new(()),
                 ),
+                // Without `last_error`: what `ssh` said names the Machine's
+                // address, which is for `cirro machine ls`, not the edge's
+                // clients.
                 MachineStatus::Unreachable => Resolution::Unavailable(format!(
-                    "Machine {:?} is unreachable{}",
-                    machine.record.name,
-                    link.last_error
-                        .as_ref()
-                        .map_or(String::new(), |e| format!(": {e}"))
+                    "Machine {:?} is unreachable",
+                    machine.record.name
                 )),
             })
         })
