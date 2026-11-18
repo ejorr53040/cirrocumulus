@@ -28,10 +28,10 @@ rated by what it adds to such an escape.
 | 5 | Low | The agent waits without limit on a Firecracker API answer, and buffers an error of any size | Fixed | Test (the wait), reading (the size) |
 | 6 | Low | A registry's index entry is used as a cache file name unchecked | Fixed | Test |
 | 7 | Low | The docs claim a PID namespace the agent never asks jailer for | Docs fixed | Reading |
-| 8 | Medium | Console logs have no size limit: a guest can fill the state dir's disk | Open | Reading |
-| 9 | Low | A taken-over VMM can point the agent's Firecracker API calls at another VM | Open | Reading |
-| 10 | Low | Two agents whose subnets share their low 16 bits tear down each other's VMs | Open | Reading |
-| 11 | Info | Turning on `ip_forward` makes the Node a router for its other interfaces | Open | Reading |
+| 8 | Medium | Console logs have no size limit: a guest can fill the state dir's disk | Fixed later (#73) | Test |
+| 9 | Low | A taken-over VMM can point the agent's Firecracker API calls at another VM | Fixed later (#73) | Test |
+| 10 | Low | Two agents whose subnets share their low 16 bits tear down each other's VMs | Fixed later (#73) | Test |
+| 11 | Info | Turning on `ip_forward` makes the Node a router for its other interfaces | Docs fixed later (#73) | Reading |
 
 ## Fixed
 
@@ -178,7 +178,9 @@ process has, so the practical loss is small. The docs now say what is there.
 Passing `--new-pid-ns` would need the agent to find the VMM's pid another way
 (jailer writes it to a file in the jail) and is left as a design choice.
 
-## Open
+## Open at the time
+
+All four were closed later, in #73; each section ends with how.
 
 ### 8. Console logs have no size limit (Medium)
 
@@ -194,6 +196,11 @@ Not fixed because each fix is a design choice: jailer's
 rootfs, and piping the console through the agent ends with the agent, which
 VMs are meant to outlive (ADR 0002). It belongs with M11's quotas.
 
+Closed in #73: once a second the agent punches a hole over the head of
+any running VM's log past 4 MiB, keeping its newest 2 MiB and every offset,
+so Firecracker keeps writing the file directly and `cirro logs -f` follows
+across a trim.
+
 ### 9. A taken-over VMM can point the agent's API calls at another VM (Low)
 
 The agent reaches a VM's Firecracker at `<jail>/root/run/firecracker.socket`
@@ -206,6 +213,9 @@ cost is a stopped or paused neighbour.
 
 A fix needs the connect to refuse symlinks under the jail root
 (`openat2` with `RESOLVE_BENEATH`, then connecting through `/proc/self/fd`).
+
+Closed in #73, that way: both the API socket and `v.sock` are reached
+through `connect_beneath`.
 
 ### 10. Two agents whose subnets share their low 16 bits collide (Low)
 
@@ -220,6 +230,8 @@ own third octet. Nothing stops an operator.
 A fix is for a starting agent to refuse a subnet whose host ids overlap a
 subnet already in the `node_subnets` set.
 
+Closed in #73, that way.
+
 ### 11. Turning on `ip_forward` makes the Node a router (Info)
 
 The agent sets `net.ipv4.ip_forward=1` for the whole computer, and its forward
@@ -227,6 +239,9 @@ chain accepts by default. A Node with two other interfaces (a LAN and a
 VPN, say) starts forwarding between them unless a host firewall forbids it.
 Docker makes the same trade and sets the forward policy to drop. Worth a
 line in the install docs.
+
+Closed in #73: `docs/networking.md` says so and tells operators to set
+the host firewall's forward policy to drop.
 
 ## Checked and found sound
 
