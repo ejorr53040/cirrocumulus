@@ -328,8 +328,13 @@ impl Vm {
         match vm.wake_steps(node, spec).await {
             Ok(()) => Ok(vm),
             Err(e) => {
-                if let Err(back) =
-                    move_files(&vm.jail_root, WAKE_FILES, &spec.snapshot, SNAPSHOT_FILES)
+                // A wake that failed before its jail was made moved nothing
+                // into it, and an empty `jail_root` would have this move
+                // files named like the snapshot's out of the agent's working
+                // directory and over the snapshot.
+                if !vm.jail_root.as_os_str().is_empty()
+                    && let Err(back) =
+                        move_files(&vm.jail_root, WAKE_FILES, &spec.snapshot, SNAPSHOT_FILES)
                 {
                     tracing::warn!("put the snapshot back after a failed wake: {back}");
                 }
@@ -1110,6 +1115,15 @@ fn namespace_ruleset(vm_address: Ipv4Addr) -> String {
 }
 
 async fn try_deliver_config(vsock: &Path, config: &str) -> Result<(), String> {
+    use std::os::unix::fs::FileTypeExt;
+    // The socket is in the jail, which the VMM owns, and connect follows a
+    // symlink: one put in its place would send guest-init's config, as root,
+    // to whatever socket it names. A swap between this check and the
+    // connect is still possible.
+    let found = std::fs::symlink_metadata(vsock).map_err(|e| e.to_string())?;
+    if !found.file_type().is_socket() {
+        return Err(format!("{} isn't a socket", vsock.display()));
+    }
     let stream = UnixStream::connect(vsock)
         .await
         .map_err(|e| e.to_string())?;
