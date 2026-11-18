@@ -29,7 +29,9 @@ impl RunConfig {
 /// added after them. glibc's `getenv` takes the first match, so a key must
 /// appear once.
 pub fn merge_env(env: &[String], overrides: &[String]) -> Vec<String> {
-    let key = |entry: &str| entry.split_once('=').map_or(entry, |(k, _)| k).to_string();
+    fn key(entry: &str) -> &str {
+        entry.split_once('=').map_or(entry, |(k, _)| k)
+    }
     let mut merged: Vec<String> = env.to_vec();
     for entry in overrides {
         let k = key(entry);
