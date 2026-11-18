@@ -37,7 +37,7 @@ use cirro_proto::EndReason;
 use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::net::Ipv4Addr;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -471,8 +471,15 @@ impl Vm {
                 .map_err(|e| err("copy kernel into jail", e))?;
         }
         let rootfs_in_jail = root.join("rootfs.ext4");
-        let mut rootfs_dest =
-            std::fs::File::create(&rootfs_in_jail).map_err(|e| err("create rootfs in jail", e))?;
+        // 0600 from the moment it exists: it's the guest's disk, and the
+        // chown below gives it only an owner, not a mode.
+        let mut rootfs_dest = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&rootfs_in_jail)
+            .map_err(|e| err("create rootfs in jail", e))?;
         // Copies from the fd the agent already opened as the caller (#14),
         // never the path again: `&File` reads from its current offset (0,
         // since nothing has read it yet), and `io::copy` specializes
@@ -580,7 +587,16 @@ impl Vm {
         enable_io_accounting();
         let root = jail_dir(&node.jails(), &id).join("root");
         self.jail_root = root.clone();
-        std::fs::create_dir_all(&node.jail_base).map_err(|e| err("create jail base dir", e))?;
+        // Root-only: jails hold guests' disks and snapshot memory, which
+        // Firecracker writes at whatever mode it likes. Set on every start,
+        // since an earlier agent may have made it wider.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&node.jail_base)
+            .map_err(|e| err("create jail base dir", e))?;
+        std::fs::set_permissions(&node.jail_base, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| err("make the jail base dir root-only", e))?;
         // 0640 from the moment it exists (never briefly at the create-call's
         // default mode) and root:cirro: console logs hold whatever the VM's
         // command printed, so a group member can read their own VM's log,

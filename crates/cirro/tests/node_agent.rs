@@ -1237,6 +1237,43 @@ fn console_logs_are_not_world_readable() {
     agent.assert_no_cirro_state();
 }
 
+/// A VM's jail holds its disk, and after a wake its memory too, so the jails
+/// are root's alone: a local user can't reach into them.
+#[test]
+fn jails_are_root_only() {
+    let Some(agent) = Agent::start(208) else {
+        return;
+    };
+
+    agent
+        .run("web", &rootfs().guest_init, &["/app/http_app"])
+        .success();
+    let jails = agent.state_dir.join("jail");
+    let mode = std::fs::metadata(&jails)
+        .expect("stat the jail base dir")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "the jail base dir should be 0700, was {mode:o}"
+    );
+    let listed = std::fs::read_dir(jails.join("firecracker"));
+    assert!(
+        listed
+            .as_ref()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied),
+        "the test user could look into the jails: {listed:?}"
+    );
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "web"])
+        .assert()
+        .success();
+    agent.assert_no_cirro_state();
+}
+
 /// The egress policy is IPv4's, so the Node takes no IPv6 at all from a VM's
 /// veth: otherwise whatever got into the VM's namespace could reach the
 /// Node's own services at the veth's link-local address.
