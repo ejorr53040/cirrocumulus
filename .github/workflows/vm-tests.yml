@@ -1,7 +1,12 @@
 # The tests that boot real Firecracker VMs, which GitHub's hosted runners
 # can't run (no KVM). They run on a self-hosted runner labelled `kvm`, and
-# only once the repository variable KVM_RUNNER is `true`, so forks and a
-# repository without such a runner aren't left with a job that never starts.
+# only once the repository variable KVM_RUNNER is `true`, so a repository
+# without such a runner isn't left with a job that never starts.
+#
+# Pull requests don't run this. The runner is a persistent host whose test
+# agent has passwordless sudo, so a PR's code would run as root there. Run a
+# branch on demand instead, which needs write access:
+# `gh workflow run vm-tests.yml --ref <branch>`.
 #
 # The runner host needs what the tests' module docs list: /dev/kvm, cgroup
 # v2, the sudoers rule for the test agent, nftables, and the `firecracker`
@@ -14,7 +19,6 @@ name: VM tests
 on:
   push:
     branches: [main]
-  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -32,7 +36,7 @@ defaults:
 jobs:
   vm-tests:
     name: Real Firecracker VMs
-    if: vars.KVM_RUNNER == 'true' && github.event.pull_request.head.repo.fork != true
+    if: vars.KVM_RUNNER == 'true'
     runs-on: [self-hosted, linux, x64, kvm]
     timeout-minutes: 30
     steps:
