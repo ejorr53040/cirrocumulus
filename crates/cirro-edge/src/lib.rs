@@ -290,7 +290,12 @@ async fn proxy(
 ) -> Result<Response<Body>, String> {
     let stream = tokio::time::timeout(CONNECT_TIMEOUT, connect(upstream))
         .await
-        .map_err(|_| format!("connecting to it timed out after {CONNECT_TIMEOUT:?}"))?
+        .map_err(|_| {
+            format!(
+                "nothing accepted a connection on port {} within {CONNECT_TIMEOUT:?}",
+                upstream.port()
+            )
+        })?
         .map_err(|e| format!("connect: {e}"))?;
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
