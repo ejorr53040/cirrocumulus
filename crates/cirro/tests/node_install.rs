@@ -198,6 +198,13 @@ fn install_creates_a_group_state_dir_and_enabled_unit_and_is_idempotent() {
         .lines()
         .find_map(|line| line.strip_prefix("ExecStart="))
         .unwrap_or_else(|| panic!("unit missing ExecStart: {unit_contents}"));
+    // A root-owned copy, not the binary install ran from, which its user
+    // could change.
+    assert_eq!(
+        exec_start.split_whitespace().next(),
+        Some(install.state_dir.join("bin/cirro").to_str().unwrap()),
+        "the unit doesn't run install's own copy of cirro"
+    );
     // The agent's flags parse: `--help` only answers once everything before
     // it has.
     let parsed = std::process::Command::new(env!("CARGO_BIN_EXE_cirro"))

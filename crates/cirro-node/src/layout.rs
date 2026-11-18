@@ -55,3 +55,9 @@ pub(crate) fn node_config(state_dir: &Path) -> PathBuf {
 pub(crate) fn release(state_dir: &Path) -> PathBuf {
     state_dir.join("release")
 }
+
+/// The copy of `cirro` the systemd unit runs. Root-only, unlike wherever
+/// install was run from.
+pub(crate) fn bin(state_dir: &Path) -> PathBuf {
+    state_dir.join("bin")
+}

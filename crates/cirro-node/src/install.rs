@@ -21,6 +21,7 @@ use crate::vm;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -356,7 +357,7 @@ fn read_node_config(state_dir: &Path) -> io::Result<NodeConfig> {
 /// with identical config writes the identical unit content and re-enables
 /// an already-enabled unit, both no-ops.
 fn install_unit(config: &NodeConfig, state_dir: &Path) -> io::Result<()> {
-    let cirro_bin = std::env::current_exe()?;
+    let cirro_bin = install_binary(state_dir)?;
     let unit = format!(
         "[Unit]\n\
          Description=Cirrocumulus Node agent\n\
@@ -392,6 +393,24 @@ fn install_unit(config: &NodeConfig, state_dir: &Path) -> io::Result<()> {
         None,
     )
     .map(drop)
+}
+
+/// Copies the running `cirro` to the state dir and returns the copy's path,
+/// for ExecStart. The unit runs it as root at every boot, so it mustn't be
+/// a file someone else can change, and `cirro` is often run from a user's
+/// own build or download dir.
+fn install_binary(state_dir: &Path) -> io::Result<PathBuf> {
+    let dir = layout::bin(state_dir);
+    fs::create_dir_all(&dir)?;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    let installed = dir.join("cirro");
+    // Staged and renamed into place: a running agent has the old copy
+    // open, and writing over it fails (ETXTBSY).
+    let staged = dir.join("cirro.new");
+    fs::copy(std::env::current_exe()?, &staged)?;
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))?;
+    fs::rename(&staged, &installed)?;
+    Ok(installed)
 }
 
 /// Stops, disables and removes the unit. Missing/not-enabled is fine --
