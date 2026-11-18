@@ -18,7 +18,6 @@ use oci_client::{Client, Reference};
 use reqwest::Url;
 use reqwest::header::{HeaderValue, WWW_AUTHENTICATE};
 use serde::{Deserialize, Serialize};
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -492,32 +491,29 @@ fn bearer_challenge(value: &HeaderValue) -> Option<(String, Option<String>)> {
     Some((realm?, service))
 }
 
+/// Registries whose token service is on another host of their own. Any
+/// other registry's realm must be on the registry's own origin.
+const TOKEN_HOSTS: &[(&str, &str)] = &[
+    ("index.docker.io", "auth.docker.io"),
+    ("registry-1.docker.io", "auth.docker.io"),
+    ("registry.gitlab.com", "gitlab.com"),
+];
+
 /// `realm` as a URL, if a token may be requested from it: the registry's
-/// scheme, and the registry's host or one sharing its last two DNS labels
-/// (`auth.docker.io` for `registry-1.docker.io`). Addresses match only
-/// themselves.
-// ponytail: the last two labels stand in for the registry's domain. Under a
-// multi-label public suffix (`co.uk`-style) unrelated registries share them;
-// a public-suffix list would fix that, which isn't worth a dependency for the
-// registries cirro pulls from.
+/// own scheme, host and port, or the token host [`TOKEN_HOSTS`] names for it.
+/// Hosts that merely share a domain don't share an owner (tenants of one
+/// PaaS domain, names under `co.uk`), so a hostile registry could otherwise
+/// point the pull at one of them.
 fn allowed_realm(registry: &Url, realm: &str) -> Option<Url> {
     let realm = Url::parse(realm).ok()?;
     let (host, registry_host) = (realm.host_str()?, registry.host_str()?);
-    let same_domain = host == registry_host
-        || (!is_ip(host) && !is_ip(registry_host) && last_two(host) == last_two(registry_host));
-    (realm.scheme() == registry.scheme() && same_domain).then_some(realm)
-}
-
-fn is_ip(host: &str) -> bool {
-    host.parse::<IpAddr>().is_ok()
-}
-
-/// The last two DNS labels of `host`, or all of it when it has only one.
-fn last_two(host: &str) -> &str {
-    match host.rmatch_indices('.').nth(1) {
-        Some((i, _)) => &host[i + 1..],
-        None => host,
-    }
+    let same_origin =
+        host == registry_host && realm.port_or_known_default() == registry.port_or_known_default();
+    let token_host = realm.port().is_none()
+        && TOKEN_HOSTS
+            .iter()
+            .any(|&(r, t)| r == registry_host && t == host);
+    (realm.scheme() == registry.scheme() && (same_origin || token_host)).then_some(realm)
 }
 
 /// What went wrong pulling `what` (a manifest or blob of `reference`),
@@ -735,6 +731,18 @@ mod realm_tests {
         let probe = Url::parse("https://10.0.0.1/v2/").unwrap();
         assert!(allowed_realm(&probe, "https://10.0.0.1/token").is_some());
         assert!(allowed_realm(&probe, "https://10.0.0.2/token").is_none());
+    }
+
+    #[test]
+    fn a_realm_on_a_neighbour_under_a_shared_domain_or_another_port_is_refused() {
+        // Tenants of one PaaS domain, or hosts under a multi-label public
+        // suffix, share their last two labels without sharing an owner.
+        let probe = Url::parse("https://evil.herokuapp.com/v2/").unwrap();
+        assert!(allowed_realm(&probe, "https://victim.herokuapp.com/token").is_none());
+        let probe = Url::parse("https://evil-reg.co.uk/v2/").unwrap();
+        assert!(allowed_realm(&probe, "https://intranet.acme.co.uk/token").is_none());
+        let probe = Url::parse("https://registry.example:5000/v2/").unwrap();
+        assert!(allowed_realm(&probe, "https://registry.example:6000/token").is_none());
     }
 
     #[test]
