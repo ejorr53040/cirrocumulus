@@ -150,6 +150,11 @@ impl Acme {
         if !is_public(host) {
             return Ok(());
         }
+        // Claimed first: an order that ends records its certificate or its
+        // failure before it gives up its claim, so the checks below see it.
+        let Some(mut order) = PendingOrder::start(self, host) else {
+            return Ok(());
+        };
         let fresh = self
             .certificates
             .lock()
@@ -165,9 +170,6 @@ impl Acme {
         if fresh || waiting {
             return Ok(());
         }
-        let Some(mut order) = PendingOrder::start(self, host) else {
-            return Ok(());
-        };
         match self.order(&mut order).await {
             Ok(certificate) => {
                 self.failed.lock().unwrap().remove(host);
