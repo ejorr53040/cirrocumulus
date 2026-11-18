@@ -15,16 +15,22 @@ use cirro_guest_init::FORWARDING_MARKER;
 use cirro_guest_init::config::{self, Config};
 use nix::errno::Errno;
 use nix::mount::{MsFlags, mount};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::reboot::{RebootMode, reboot, set_cad_enabled};
 use nix::sys::signal::{self, SaFlags, SigAction, SigHandler, SigSet, Signal};
 use nix::sys::socket::{
-    AddressFamily, Backlog, SockFlag, SockType, VsockAddr, accept, bind, listen, socket,
+    AddressFamily, Backlog, SockFlag, SockType, VsockAddr, accept, bind, listen, setsockopt,
+    socket, sockopt,
 };
+use nix::sys::time::{TimeVal, TimeValLike};
 use nix::sys::wait::waitpid;
-use nix::unistd::{ForkResult, Gid, Pid, Uid, chdir, execve, fork, setgid, setgroups, setuid};
+use nix::unistd::{
+    ForkResult, Gid, Pid, Uid, User, chdir, execve, fork, initgroups, setgid, setgroups, setuid,
+};
 use std::ffi::CString;
+use std::fs::File;
 use std::io::Write;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -77,12 +83,16 @@ const BOOT_MARKER: &str = "GUEST_INIT_MOUNTS_OK";
 /// `/dev` (devtmpfs) is best-effort, matching Step 0's own script, since a
 /// kernel built without devtmpfs support would otherwise make PID 1 fail
 /// outright over a filesystem no one has asked to use yet.
+///
+/// All three are `nosuid`. `/proc` and `/sys` are also `nodev` and `noexec`,
+/// as `docker run` mounts them. `/dev` isn't `nodev`: its device nodes are how
+/// the app opens `/dev/null` and the disks.
 fn mount_pseudo_filesystems() {
     mount(
         Some("proc"),
         Path::new("/proc"),
         Some("proc"),
-        MsFlags::empty(),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
         None::<&str>,
     )
     .expect("mount /proc");
@@ -91,7 +101,7 @@ fn mount_pseudo_filesystems() {
         Some("sysfs"),
         Path::new("/sys"),
         Some("sysfs"),
-        MsFlags::empty(),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
         None::<&str>,
     )
     .expect("mount /sys");
@@ -100,7 +110,7 @@ fn mount_pseudo_filesystems() {
         Some("devtmpfs"),
         Path::new("/dev"),
         Some("devtmpfs"),
-        MsFlags::empty(),
+        MsFlags::MS_NOSUID,
         None::<&str>,
     );
 }
@@ -116,36 +126,53 @@ fn mount_pseudo_filesystems() {
 ///
 /// Reads until EOF: the host closes its end once the whole config has been
 /// written.
-fn read_config_from_vsock() -> Config {
+fn read_config_from_vsock() -> Result<Config, String> {
     let listen_fd = socket(
         AddressFamily::Vsock,
         SockType::Stream,
         SockFlag::empty(),
         None,
     )
-    .expect("create vsock socket");
+    .map_err(|e| format!("create vsock socket: {e}"))?;
 
     let addr = VsockAddr::new(nix::libc::VMADDR_CID_ANY, config::CONFIG_PORT);
-    bind(listen_fd.as_raw_fd(), &addr).expect("bind vsock config port");
-    listen(&listen_fd, Backlog::MAXCONN).expect("listen on vsock config port");
+    bind(listen_fd.as_raw_fd(), &addr).map_err(|e| format!("bind vsock config port: {e}"))?;
+    listen(&listen_fd, Backlog::MAXCONN)
+        .map_err(|e| format!("listen on vsock config port: {e}"))?;
 
-    let conn_fd = accept(listen_fd.as_raw_fd()).expect("accept vsock config connection");
+    wait_readable(&listen_fd)?;
+    let conn_fd = accept(listen_fd.as_raw_fd())
+        .map_err(|e| format!("accept vsock config connection: {e}"))?;
     // SAFETY: `accept` returns a valid, newly owned fd on success.
     let conn_fd = unsafe { OwnedFd::from_raw_fd(conn_fd) };
+    // A sender that connects and then stalls would otherwise hold PID 1 forever.
+    let timeout = TimeVal::milliseconds(i64::from(CONFIG_WAIT_MS));
+    setsockopt(&conn_fd, sockopt::ReceiveTimeout, &timeout)
+        .map_err(|e| format!("set vsock config read timeout: {e}"))?;
 
-    let mut config_json = Vec::new();
-    let mut buf = [0u8; 4096];
+    config::read_config(File::from(conn_fd))
+}
+
+/// How long guest-init waits for the agent's config connection, and then for
+/// each read of it. The agent gives up after 10 s, so this fires only when no
+/// agent is coming: a backstop that powers the VM off rather than letting PID
+/// 1 wait forever.
+const CONFIG_WAIT_MS: u16 = 30_000;
+
+/// Waits until `fd` is readable, for at most `CONFIG_WAIT_MS`. A signal (a host
+/// shutdown request, see `handle_sigint`) doesn't end the wait: the request is
+/// held for the app, and `main` forwards it once the app is forked.
+fn wait_readable(fd: impl AsFd) -> Result<(), String> {
+    let timeout = PollTimeout::from(CONFIG_WAIT_MS);
     loop {
-        match nix::unistd::read(&conn_fd, &mut buf) {
-            Ok(0) => break,
-            Ok(n) => config_json.extend_from_slice(&buf[..n]),
+        let mut fds = [PollFd::new(fd.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut fds, timeout) {
+            Ok(0) => return Err(format!("no config connection within {CONFIG_WAIT_MS} ms")),
+            Ok(_) => return Ok(()),
             Err(Errno::EINTR) => continue,
-            Err(e) => panic!("read vsock config: {e}"),
+            Err(e) => return Err(format!("poll vsock config port: {e}")),
         }
     }
-
-    let config_json = String::from_utf8(config_json).expect("vsock config is valid UTF-8");
-    config::parse_config(&config_json).expect("parse config")
 }
 
 /// Forks and execs the configured app in the child.
@@ -181,14 +208,10 @@ fn exec_app(config: &Config) -> String {
     {
         return format!("chdir {dir}: {e}");
     }
-    if let Some(user) = config.user {
-        let gid = Gid::from_raw(user.gid);
-        if let Err(e) = setgroups(&[gid])
-            .and_then(|()| setgid(gid))
-            .and_then(|()| setuid(Uid::from_raw(user.uid)))
-        {
-            return format!("switch to user {}:{}: {e}", user.uid, user.gid);
-        }
+    if let Some(user) = config.user
+        && let Err(e) = switch_user(user)
+    {
+        return e;
     }
     let path = launch::lookup(&env, "PATH").expect("app_env always sets PATH");
     let Some(file) = launch::resolve(&config.exec, path, is_executable) else {
@@ -215,6 +238,39 @@ fn exec_app(config: &Config) -> String {
         Ok(never) => match never {},
         Err(e) => e.to_string(),
     }
+}
+
+/// Drops to `user` as `docker run` does: the supplementary groups are the
+/// ones the image's `/etc/group` lists for the user's name, plus the primary
+/// gid. A uid with no `/etc/passwd` entry has no name to look groups up by,
+/// so it keeps only the primary gid; so does one in an image with no
+/// `/etc/passwd` or `/etc/group` at all (musl reports a missing file as
+/// `ENOENT`, not as no entry).
+///
+/// No `PR_SET_NO_NEW_PRIVS`: `docker run` doesn't set it either, and the
+/// images it runs rely on setuid binaries such as `su`. Guest root isn't a
+/// boundary (docs/threat-model.md).
+fn switch_user(user: config::User) -> Result<(), String> {
+    let uid = Uid::from_raw(user.uid);
+    let gid = Gid::from_raw(user.gid);
+    let fail = |e: Errno| format!("switch to user {}:{}: {e}", user.uid, user.gid);
+    let entry = match User::from_uid(uid) {
+        Err(Errno::ENOENT) => None,
+        found => found.map_err(fail)?,
+    };
+    let grouped = match entry {
+        Some(entry) => {
+            let name = CString::new(entry.name).map_err(|_| "NUL byte in user name".to_string())?;
+            initgroups(&name, gid)
+        }
+        None => Err(Errno::ENOENT),
+    };
+    match grouped {
+        Err(Errno::ENOENT) => setgroups(&[gid]).map_err(fail)?,
+        other => other.map_err(fail)?,
+    }
+    setgid(gid).map_err(fail)?;
+    setuid(uid).map_err(fail)
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -292,7 +348,13 @@ fn main() {
     // truncating or dropping the marker entirely. So flush explicitly.
     std::io::stdout().flush().expect("flush boot marker");
 
-    let config = read_config_from_vsock();
+    let config = match read_config_from_vsock() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("guest-init: {e}; shutting down");
+            shutdown();
+        }
+    };
     let app_pid = spawn_configured_app(&config);
     APP_PID.store(app_pid.as_raw(), Ordering::SeqCst);
     if SHUTDOWN_PENDING.load(Ordering::SeqCst) {
