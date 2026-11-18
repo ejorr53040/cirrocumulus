@@ -2,7 +2,7 @@
 //! VMs, a table of Machine-backed Apps, and a detail pane for the selected
 //! VM.
 
-use crate::{duration, machine_port, mem, node_summary, rate_cells};
+use crate::{duration, escape_control_str, machine_port, mem, node_summary, rate_cells};
 use cirro_proto::{MachineAppInfo, Stats, VmStats};
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyCode;
@@ -323,7 +323,7 @@ impl Dashboard {
                 let fit = usize::from(text.height);
                 lines[lines.len().saturating_sub(fit)..]
                     .iter()
-                    .map(|l| Line::from(l.to_string()))
+                    .map(|l| Line::from(escape_control_str(l)))
                     .collect()
             }
             _ => vec![

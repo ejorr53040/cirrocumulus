@@ -619,7 +619,7 @@ async fn run_ssh(mut ssh: Command, link: &Mutex<Link>) -> Ended {
             } else if line == HOST_KEY_FAILED {
                 ended.host_key_changed = true;
             } else if !is_chatter(&line) {
-                ended.last = line;
+                ended.last = without_controls(line);
             }
         }
     }
@@ -756,10 +756,33 @@ fn free_local_ports(n: usize) -> io::Result<Vec<u16>> {
 
 /// The last thing `ssh` said, which is why it failed when it did.
 fn last_line(stderr: &str) -> String {
-    stderr
-        .lines()
-        .rev()
-        .find(|l| !is_chatter(l))
-        .unwrap_or("ssh failed")
-        .to_string()
+    without_controls(
+        stderr
+            .lines()
+            .rev()
+            .find(|l| !is_chatter(l))
+            .unwrap_or("ssh failed")
+            .to_string(),
+    )
+}
+
+/// `line` without control characters but tabs: the Machine's side of the
+/// connection chooses what `ssh` prints, and a terminal shows it in
+/// `cirro machine ls` and refusals.
+fn without_controls(mut line: String) -> String {
+    line.retain(|c| c == '\t' || !c.is_control());
+    line
+}
+
+#[cfg(test)]
+mod tests {
+    use super::last_line;
+
+    #[test]
+    fn what_ssh_said_keeps_no_control_characters() {
+        assert_eq!(
+            last_line("banner \x1b]0;owned\x07 \u{9b}2J\tend\nTransferred: sent 1, received 2\n"),
+            "banner ]0;owned 2J\tend"
+        );
+    }
 }

@@ -443,7 +443,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("cirro: {message}");
+            eprintln!("cirro: {}", cirro_tui::escape_control_str(&message));
             ExitCode::FAILURE
         }
     }
@@ -921,6 +921,9 @@ fn ps_row([name, address, mem, vcpus, uptime, host, machine]: [&str; 7]) -> Stri
 
 async fn logs(socket: &Path, name: &str, follow: bool) -> Result<(), String> {
     let mut offset = 0u64;
+    // Read but not yet shown: the end of a read that the next one may
+    // finish (see `unfinished`).
+    let mut held = Vec::new();
     let mut out = std::io::stdout();
     loop {
         let (headers, bytes) = client::send(
@@ -930,25 +933,40 @@ async fn logs(socket: &Path, name: &str, follow: bool) -> Result<(), String> {
             None::<&()>,
         )
         .await?;
-        out.write_all(&bytes)
-            .and_then(|()| out.flush())
-            .map_err(|e| format!("writing the log: {e}"))?;
         offset += bytes.len() as u64;
+        held.extend_from_slice(&bytes);
         // A full chunk means the log already held more. Anything short is
         // where it ended as it was read, so a plain `logs` stops there even
         // while the App keeps writing.
-        if bytes.len() as u64 == LOG_CHUNK {
-            continue;
-        }
+        let full = bytes.len() as u64 == LOG_CHUNK;
         // The agent reads the VM's state before its log, so once it says
         // ended, this read got everything.
         let ended = headers
             .get(VM_STATE_HEADER)
             .is_some_and(|state| state == "ended");
-        if !follow || ended {
+        let done = !full && (!follow || ended);
+        let shown = held.len() - if done { 0 } else { unfinished(&held) };
+        // The guest wrote it, so it mustn't drive the terminal.
+        out.write_all(&cirro_tui::escape_control(&held[..shown]))
+            .and_then(|()| out.flush())
+            .map_err(|e| format!("writing the log: {e}"))?;
+        held.drain(..shown);
+        if done {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        if !full {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+}
+
+/// How many bytes at the end of `log` the next read may change the meaning
+/// of, so they wait for it before being escaped: a UTF-8 sequence cut
+/// short, or a CR that may be a CRLF's.
+fn unfinished(log: &[u8]) -> usize {
+    match log.utf8_chunks().last() {
+        Some(chunk) if !chunk.invalid().is_empty() => chunk.invalid().len(),
+        _ => usize::from(log.last() == Some(&b'\r')),
     }
 }
 
@@ -1052,7 +1070,9 @@ async fn machine_command(socket: &Path, command: MachineCommand) -> Result<(), S
                     m.ssh,
                     m.host_key,
                     m.status.as_str(),
-                    m.last_error.as_deref().unwrap_or("-")
+                    m.last_error
+                        .as_deref()
+                        .map_or_else(|| "-".into(), cirro_tui::escape_control_str)
                 );
             }
             Ok(())
@@ -1145,7 +1165,7 @@ fn parse_user(s: &str) -> Result<User, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{GUEST_INIT_BINARY, nearest_rank};
+    use super::{GUEST_INIT_BINARY, nearest_rank, unfinished};
     use std::time::Duration;
 
     #[test]
@@ -1170,5 +1190,14 @@ mod tests {
             GUEST_INIT_BINARY.len()
         );
         assert_eq!(&GUEST_INIT_BINARY[..4], b"\x7fELF", "not an ELF binary");
+    }
+
+    #[test]
+    fn a_log_read_keeps_back_only_what_the_next_read_may_finish() {
+        assert_eq!(unfinished(b"done\n"), 0);
+        // The first two of `✓`'s three bytes.
+        assert_eq!(unfinished(b"tick \xe2\x9c"), 2);
+        assert_eq!(unfinished(b"line\r"), 1);
+        assert_eq!(unfinished(b"bad \xff in the middle"), 0);
     }
 }

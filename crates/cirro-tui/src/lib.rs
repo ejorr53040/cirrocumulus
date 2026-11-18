@@ -128,6 +128,41 @@ pub(crate) fn per_sec(n: u64) -> String {
     format!("{}/s", bytes(n))
 }
 
+/// `input` as text that can't drive the terminal it's printed to, for
+/// text a guest or a Machine wrote: C0 controls (except `\n`, `\t` and the
+/// CR of a CRLF) and DEL as `\xNN`, C1 controls as `\u{XX}`, and bytes that
+/// aren't UTF-8 as `\xNN`. Other text comes back unchanged.
+pub fn escape_control(input: &[u8]) -> Vec<u8> {
+    let mut out = String::with_capacity(input.len());
+    for chunk in input.utf8_chunks() {
+        let mut chars = chunk.valid().chars().peekable();
+        while let Some(c) = chars.next() {
+            let shown = match c {
+                '\n' | '\t' => true,
+                // A bare CR moves back over what's already on the line.
+                '\r' => chars.peek() == Some(&'\n'),
+                _ => !c.is_control(),
+            };
+            if shown {
+                out.push(c);
+            } else if c.is_ascii() {
+                let _ = write!(out, "\\x{:02x}", u32::from(c));
+            } else {
+                let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
+            }
+        }
+        for b in chunk.invalid() {
+            let _ = write!(out, "\\x{b:02x}");
+        }
+    }
+    out.into_bytes()
+}
+
+/// [`escape_control`] for text.
+pub fn escape_control_str(s: &str) -> String {
+    String::from_utf8(escape_control(s.as_bytes())).expect("escaping keeps text UTF-8")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +250,26 @@ mod tests {
                 vec!["MACHINE-BACKED", "APP", "MACHINE", "STATUS"],
                 vec!["blog", "pi:8080", "up"],
             ]
+        );
+    }
+
+    #[test]
+    fn control_characters_are_escaped_and_other_text_kept() {
+        let input = "red \x1b[31mtext\x1b[0m\tbell\x07 del\x7f é ✓\r\nover\rwrite\n";
+        assert_eq!(
+            escape_control_str(input),
+            "red \\x1b[31mtext\\x1b[0m\tbell\\x07 del\\x7f é ✓\r\nover\\x0dwrite\n"
+        );
+    }
+
+    #[test]
+    fn c1_controls_and_bytes_that_arent_utf8_are_escaped() {
+        // U+009B is a one-character CSI on terminals that read C1 codes; a
+        // raw 0x9b byte isn't UTF-8.
+        let input = b"csi \xc2\x9b2J raw \x9b2J";
+        assert_eq!(
+            String::from_utf8(escape_control(input)).unwrap(),
+            "csi \\u{9b}2J raw \\x9b2J"
         );
     }
 }
