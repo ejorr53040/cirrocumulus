@@ -3165,7 +3165,8 @@ fn run_on_machine(
 
 /// M8: a Machine-backed App is served through the edge, over HTTP and
 /// HTTPS, from a port on its Machine's localhost, and `ps` lists it with
-/// its Machine.
+/// its Machine. Its forward isn't in `ssh`'s arguments, which any local
+/// user can read: knowing the port, one could take it first.
 #[test]
 fn a_machine_backed_app_is_served_through_the_edge() {
     let Some(sshd) = Sshd::start(184) else {
@@ -3181,6 +3182,15 @@ fn a_machine_backed_app_is_served_through_the_edge() {
     run_on_machine(&agent, "web", "pi", "pi.test", port).success();
     let answer = wait_for_edge(&agent, "pi.test");
     assert!(answer.ends_with("hello from pi"), "{answer:?}");
+    let ssh = machine_ssh_processes(&agent);
+    assert!(
+        ssh.contains("ExitOnForwardFailure=yes"),
+        "no forwarding ssh running: {ssh}"
+    );
+    assert!(
+        !ssh.contains(" -L ") && !ssh.contains(&format!(":{port}")),
+        "the forward is in ssh's arguments: {ssh}"
+    );
 
     let ca = agent.state_dir.join("test-ca.pem");
     std::fs::write(

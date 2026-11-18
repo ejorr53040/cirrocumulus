@@ -40,6 +40,12 @@ pub(crate) fn known_hosts(state_dir: &Path) -> PathBuf {
     state_dir.join("known_hosts")
 }
 
+/// Each running Machine `ssh`'s config file, which holds its forwards.
+/// Root-only: knowing a forward's port, a local user could take it first.
+pub(crate) fn ssh_configs(state_dir: &Path) -> PathBuf {
+    state_dir.join("ssh")
+}
+
 /// What install resolved, for uninstall.
 pub(crate) fn node_config(state_dir: &Path) -> PathBuf {
     state_dir.join("node.json")

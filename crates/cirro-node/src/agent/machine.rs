@@ -14,10 +14,12 @@ use hyper::StatusCode;
 use nix::sys::signal::Signal;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io;
+use std::io::{self, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -31,6 +33,8 @@ pub(super) struct Machines {
     key: PathBuf,
     /// Every Machine's pinned host key, each under the Machine's name.
     known_hosts: PathBuf,
+    /// Where each `ssh`'s config file goes: see `write_forwards`.
+    ssh_configs: PathBuf,
     /// Held while the agent's key is made, so two first uses make one key.
     keygen: Mutex<()>,
     /// Held for a whole add, so two adds can't take one name or pin each
@@ -53,10 +57,6 @@ struct Machine {
 
 struct MachineApp {
     route: Route,
-    /// The port on the Node's 127.0.0.1 that `ssh` forwards to the route's
-    /// port on the Machine's localhost. Chosen afresh on each connect, so
-    /// a new `ssh` never waits for the old one to let go of it.
-    local_port: u16,
 }
 
 impl Drop for Machine {
@@ -72,6 +72,11 @@ struct Link {
     /// The Machine presented a host key other than the pinned one, so no
     /// `ssh` runs to it again until it's removed and added.
     host_key_changed: bool,
+    /// The port on the Node's 127.0.0.1 that this `ssh` forwards to each
+    /// App's route port on the Machine's localhost, by App name. Chosen
+    /// afresh for every `ssh`, so a port something else took after one
+    /// `ssh` ended doesn't keep the next from starting.
+    ports: BTreeMap<String, u16>,
 }
 
 impl Link {
@@ -81,6 +86,7 @@ impl Link {
             status: MachineStatus::Unreachable,
             last_error: None,
             host_key_changed: false,
+            ports: BTreeMap::new(),
         }
     }
 }
@@ -90,6 +96,7 @@ impl Machines {
         Machines {
             key: layout::ssh_key(state_dir),
             known_hosts: layout::known_hosts(state_dir),
+            ssh_configs: layout::ssh_configs(state_dir),
             keygen: Mutex::new(()),
             adding: tokio::sync::Mutex::new(()),
             entries: Mutex::new(BTreeMap::new()),
@@ -100,6 +107,11 @@ impl Machines {
     /// Brings back the Machines a previous agent added, connecting to each
     /// in the background so an unreachable one holds nothing up.
     pub(super) fn restore(&self) -> io::Result<()> {
+        // What a crashed agent's `ssh`s left; none of them runs any more.
+        match std::fs::remove_dir_all(&self.ssh_configs) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
         let (records, app_records) = {
             let store = self.store.lock().unwrap();
             (store.load_machines()?, store.load_machine_apps()?)
@@ -165,11 +177,14 @@ impl Machines {
     pub(super) fn resolve(&self, host: &str) -> Option<Resolution> {
         let entries = self.entries.lock().unwrap();
         entries.values().find_map(|machine| {
-            let app = machine.apps.values().find(|app| app.route.host == host)?;
+            let (name, _) = machine
+                .apps
+                .iter()
+                .find(|(_, app)| app.route.host == host)?;
             let link = machine.link.lock().unwrap();
             Some(match link.status {
                 MachineStatus::Up => Resolution::Upstream(
-                    SocketAddr::from((Ipv4Addr::LOCALHOST, app.local_port)),
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, *link.ports.get(name)?)),
                     Lease::new(()),
                 ),
                 // Without `last_error`: what `ssh` said names the Machine's
@@ -199,7 +214,6 @@ impl Machines {
             request.name.clone(),
             MachineApp {
                 route: request.route.clone(),
-                local_port: 0,
             },
         );
         if let Err(e) = self.start_tunnel(machine) {
@@ -330,6 +344,7 @@ impl Machines {
         let refused = match ssh_command(
             &self.key,
             &self.known_hosts,
+            Path::new("/dev/null"),
             &record.name,
             &target,
             &[],
@@ -411,15 +426,7 @@ impl Machines {
             record,
             apps: apps
                 .into_iter()
-                .map(|(name, route)| {
-                    (
-                        name,
-                        MachineApp {
-                            route,
-                            local_port: 0,
-                        },
-                    )
-                })
+                .map(|(name, route)| (name, MachineApp { route }))
                 .collect(),
             link: Arc::new(Mutex::new(Link::down())),
             tunnel: tokio::spawn(async {}),
@@ -433,33 +440,45 @@ impl Machines {
     /// Apps, and tracks what it says.
     fn start_tunnel(&self, machine: &mut Machine) -> io::Result<()> {
         let target = Target::parse(&machine.record.ssh).map_err(io::Error::other)?;
-        // Every port is chosen before anything changes, so a failure leaves
-        // the running `ssh` and the ports the edge uses as they were.
-        let ports = free_local_ports(machine.apps.len())?;
-        let mut options = vec![
-            "-N".to_string(),
-            "-o".into(),
-            "ExitOnForwardFailure=yes".into(),
-        ];
-        for (app, port) in machine.apps.values_mut().zip(ports) {
-            app.local_port = port;
-            options.push("-L".into());
-            options.push(format!(
-                "127.0.0.1:{}:localhost:{}",
-                app.local_port, app.route.port
-            ));
-        }
         if machine.link.lock().unwrap().host_key_changed {
             return Ok(());
         }
-        machine.tunnel.abort();
-        machine.link = Arc::new(Mutex::new(Link::down()));
+        let apps: Vec<(String, u16)> = machine
+            .apps
+            .iter()
+            .map(|(name, app)| (name.clone(), app.route.port))
+            .collect();
+        let link = Arc::new(Mutex::new(Link::down()));
         let (key, known_hosts) = (self.key.clone(), self.known_hosts.clone());
-        let name = machine.record.name.clone();
+        let (configs, name) = (self.ssh_configs.clone(), machine.record.name.clone());
+        let attempt_link = link.clone();
+        let attempt = move || -> io::Result<Attempt> {
+            let (config, ports) = write_forwards(&configs, &apps)?;
+            attempt_link.lock().unwrap().ports = ports;
+            let ssh = ssh_command(
+                &key,
+                &known_hosts,
+                &config.0,
+                &name,
+                &target,
+                &["-N", "-o", "ExitOnForwardFailure=yes"],
+                &[],
+            );
+            Ok(Attempt {
+                ssh,
+                _config: config,
+            })
+        };
+        // Before anything changes, so a failure leaves the running `ssh` and
+        // the ports the edge uses as they were.
+        let first = attempt()?;
+        machine.tunnel.abort();
+        machine.link = link.clone();
         machine.tunnel = tokio::spawn(run_tunnel(
-            name.clone(),
-            move || ssh_command(&key, &known_hosts, &name, &target, &options, &[]),
-            machine.link.clone(),
+            machine.record.name.clone(),
+            first,
+            attempt,
+            link,
         ));
         Ok(())
     }
@@ -483,17 +502,21 @@ impl Machines {
 }
 
 /// `ssh` to the Machine `name` with the agent's key (`key`), trusting only
-/// its pinned host key in `known_hosts` and ignoring root's own SSH config.
+/// its pinned host key in `known_hosts`, and reading `config` instead of
+/// root's own SSH config.
 fn ssh_command(
     key: &Path,
     known_hosts: &Path,
+    config: &Path,
     name: &str,
     target: &Target,
-    options: &[String],
+    options: &[&str],
     command: &[&str],
 ) -> Command {
     let mut cmd = Command::new("ssh");
-    cmd.args(["-F", "/dev/null", "-T"])
+    cmd.arg("-F")
+        .arg(config)
+        .arg("-T")
         .args(["-o", "BatchMode=yes"])
         .args(["-o", "StrictHostKeyChecking=yes"])
         .args(["-o", "GlobalKnownHostsFile=/dev/null"])
@@ -550,16 +573,34 @@ const RETRY_MAX: Duration = Duration::from_secs(30);
 /// changed key is retried like any failure, still never trusted.
 const HOST_KEY_FAILED: &str = "Host key verification failed.";
 
+/// One run of a Machine's `ssh`, with the config file that holds its
+/// forwards, which goes when the run does.
+struct Attempt {
+    ssh: Command,
+    _config: ConfigFile,
+}
+
 /// Keeps the Machine `name`'s `ssh` running, marking the Machine up while
 /// it's logged in. A host key that doesn't match the pinned one ends it for
 /// good: the Machine is never trusted again until it's removed and added.
-// Retries reuse the forwards' ports; if something else took one,
-// every retry fails until an App on the Machine is added or removed, which
-// picks fresh ones.
-async fn run_tunnel(name: String, ssh: impl Fn() -> Command, link: Arc<Mutex<Link>>) {
+/// Each run after `first` is a fresh `attempt`, with ports of its own.
+async fn run_tunnel(
+    name: String,
+    first: Attempt,
+    attempt: impl Fn() -> io::Result<Attempt>,
+    link: Arc<Mutex<Link>>,
+) {
+    let mut next = Ok(first);
     let mut wait = RETRY_FIRST;
     loop {
-        let ended = run_ssh(ssh(), &link).await;
+        let ended = match next {
+            Ok(attempt) => run_ssh(attempt.ssh, &link).await,
+            Err(e) => Ended {
+                logged_in: false,
+                host_key_changed: false,
+                last: format!("set up the forwards: {e}"),
+            },
+        };
         let why = if ended.host_key_changed {
             "host key changed: it isn't the one pinned when the Machine was added; if \
              that's expected, `cirro machine rm` it and add it again"
@@ -568,11 +609,12 @@ async fn run_tunnel(name: String, ssh: impl Fn() -> Command, link: Arc<Mutex<Lin
             ended.last
         };
         warn!(machine = %name, "Machine unreachable: {why}");
-        *link.lock().unwrap() = Link {
-            status: MachineStatus::Unreachable,
-            last_error: Some(why),
-            host_key_changed: ended.host_key_changed,
-        };
+        {
+            let mut link = link.lock().unwrap();
+            link.status = MachineStatus::Unreachable;
+            link.last_error = Some(why);
+            link.host_key_changed = ended.host_key_changed;
+        }
         if ended.host_key_changed {
             return;
         }
@@ -581,6 +623,7 @@ async fn run_tunnel(name: String, ssh: impl Fn() -> Command, link: Arc<Mutex<Lin
         }
         tokio::time::sleep(wait).await;
         wait = (wait * 2).min(RETRY_MAX);
+        next = attempt();
     }
 }
 
@@ -611,11 +654,10 @@ async fn run_ssh(mut ssh: Command, link: &Mutex<Link>) -> Ended {
         while let Ok(Some(line)) = lines.next_line().await {
             if line.starts_with("Authenticated to ") {
                 ended.logged_in = true;
-                *link.lock().unwrap() = Link {
-                    status: MachineStatus::Up,
-                    last_error: None,
-                    host_key_changed: false,
-                };
+                let mut link = link.lock().unwrap();
+                link.status = MachineStatus::Up;
+                link.last_error = None;
+                link.host_key_changed = false;
             } else if line == HOST_KEY_FAILED {
                 ended.host_key_changed = true;
             } else if !is_chatter(&line) {
@@ -744,14 +786,57 @@ async fn fingerprint(key: &str) -> Result<String, ApiError> {
 
 /// `n` different ports free on the Node's 127.0.0.1 a moment ago: all
 /// held at once while they're chosen, so none is handed out twice.
-// Something else can take one before `ssh` binds it; `ssh` then
-// exits (ExitOnForwardFailure) and the Machine shows unreachable until an
-// App on it is added or removed (see run_tunnel).
+// Something else can take one before `ssh` binds it; `ssh` then exits
+// (ExitOnForwardFailure), and its next run picks fresh ones (see
+// run_tunnel).
 fn free_local_ports(n: usize) -> io::Result<Vec<u16>> {
     let held = (0..n)
         .map(|_| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)))
         .collect::<io::Result<Vec<_>>>()?;
     held.iter().map(|l| Ok(l.local_addr()?.port())).collect()
+}
+
+/// Numbers the `ssh` config files, so no two runs share one.
+static CONFIG_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// An `ssh` config file, removed when it's dropped.
+struct ConfigFile(PathBuf);
+
+impl Drop for ConfigFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Writes a root-only config file in `dir` that has `ssh` forward each of
+/// `apps` (its name and route port) from a fresh port on the Node's
+/// 127.0.0.1, and returns the file and those ports by App name. In a file,
+/// not `ssh`'s arguments, which every local user can read: knowing the
+/// ports, one could take them first.
+fn write_forwards(
+    dir: &Path,
+    apps: &[(String, u16)],
+) -> io::Result<(ConfigFile, BTreeMap<String, u16>)> {
+    let local = free_local_ports(apps.len())?;
+    let mut forwards = String::new();
+    let mut ports = BTreeMap::new();
+    for ((app, remote), port) in apps.iter().zip(local) {
+        forwards += &format!("LocalForward 127.0.0.1:{port} localhost:{remote}\n");
+        ports.insert(app.clone(), port);
+    }
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let seq = CONFIG_SEQ.fetch_add(1, Ordering::Relaxed);
+    let config = ConfigFile(dir.join(format!("{seq}.conf")));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&config.0)?
+        .write_all(forwards.as_bytes())?;
+    Ok((config, ports))
 }
 
 /// The last thing `ssh` said, which is why it failed when it did.
