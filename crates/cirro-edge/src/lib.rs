@@ -171,7 +171,6 @@ async fn accept<R: Router>(
 }
 
 /// What a client connection arrived over.
-#[derive(Clone)]
 enum Scheme {
     /// With the ACME CA whose challenges it answers, when there is one.
     Http { acme: Option<Arc<Acme>> },
@@ -195,6 +194,7 @@ where
     R: Router,
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let scheme = Arc::new(scheme);
     let service = service_fn(move |req| {
         let (router, scheme) = (router.clone(), scheme.clone());
         async move { Ok::<_, hyper::Error>(handle(req, router.as_ref(), peer, &scheme).await) }
@@ -266,15 +266,14 @@ async fn handle<R: Router>(
 /// The request's hostname, from `Host` (or the absolute-form URI's
 /// authority), in lowercase and without a port or a trailing dot.
 fn host_of(req: &Request<Incoming>) -> Option<String> {
-    let raw = match req.uri().authority() {
-        Some(authority) => authority.host().to_string(),
+    let host = match req.uri().authority() {
+        Some(authority) => normalize(authority.host()),
         None => {
             let value = req.headers().get(header::HOST)?.to_str().ok()?;
             let authority: hyper::http::uri::Authority = value.parse().ok()?;
-            authority.host().to_string()
+            normalize(authority.host())
         }
     };
-    let host = normalize(&raw);
     (!host.is_empty()).then_some(host)
 }
 
