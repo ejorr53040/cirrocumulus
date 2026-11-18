@@ -16,6 +16,7 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
@@ -192,6 +193,11 @@ fn install_creates_a_group_state_dir_and_enabled_unit_and_is_idempotent() {
         install.state_dir.join("node.json").exists(),
         "node.json not written"
     );
+    let node_json = std::fs::metadata(install.state_dir.join("node.json"))
+        .expect("stat node.json")
+        .permissions()
+        .mode();
+    assert_eq!(node_json & 0o777, 0o600, "node.json should be root-only");
     assert!(install.is_enabled(), "unit not enabled");
     let unit_contents = std::fs::read_to_string(install.unit_file()).expect("read unit file");
     let exec_start = unit_contents

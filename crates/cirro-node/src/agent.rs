@@ -44,7 +44,7 @@ use nix::sys::stat::{Mode, umask};
 use std::collections::BTreeMap;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -274,8 +274,10 @@ pub async fn run(config: Config) -> io::Result<()> {
     }
     // Also when an earlier agent made it: it holds guests' memory.
     std::fs::set_permissions(&parked_dir, std::fs::Permissions::from_mode(0o700))?;
+    let state_db = layout::state_db(&config.state_dir);
+    restrict_state_db(&state_db)?;
     let store = Arc::new(Mutex::new(Store::open(
-        &layout::state_db(&config.state_dir),
+        &state_db,
         &config.subnet.to_string(),
     )?));
 
@@ -1561,6 +1563,32 @@ fn resolve_group(group: &str) -> io::Result<u32> {
             format!("no group named {group:?} for the agent socket"),
         )),
     }
+}
+
+/// Makes the state database root-only, from the moment it exists: it names
+/// every App's route and every Machine's address and host key, which are no
+/// business of other local users. SQLite gives the WAL files it makes the
+/// database's owner and mode; ones an earlier agent left are set here too,
+/// as is a database an earlier agent made 0644.
+fn restrict_state_db(db: &Path) -> io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(db)?;
+    let beside = |suffix: &str| {
+        let mut path = db.as_os_str().to_owned();
+        path.push(suffix);
+        PathBuf::from(path)
+    };
+    for path in [db.to_path_buf(), beside("-wal"), beside("-shm")] {
+        match std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            other => other?,
+        }
+    }
+    Ok(())
 }
 
 /// Seconds since the Unix epoch.

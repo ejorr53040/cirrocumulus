@@ -279,6 +279,21 @@ impl Agent {
             parked.display()
         );
     }
+
+    /// For a test that changes records while the agent is down: swaps the
+    /// still-empty state database the agent made at its first start, which
+    /// is root's and 0600, for an empty one of the test user's. The agent
+    /// keeps that 0600 too but doesn't take it over, so the test can read
+    /// it, as it can the rest of the state dir it made.
+    fn own_the_state_database(&mut self) {
+        self.stop_agent();
+        for file in ["state.db", "state.db-wal", "state.db-shm"] {
+            let _ = std::fs::remove_file(self.state_dir.join(file));
+        }
+        std::fs::File::create(self.state_dir.join("state.db"))
+            .expect("make a state database of our own");
+        self.spawn().expect("start the agent again");
+    }
 }
 
 impl Drop for Agent {
@@ -539,13 +554,14 @@ fn an_agent_refuses_to_start_on_a_running_record_it_cannot_make_sense_of() {
     let Some(mut agent) = Agent::start(236) else {
         return;
     };
+    agent.own_the_state_database();
     agent
         .run("web", &rootfs().guest_init, &["/app/http_app"])
         .success();
     agent.stop_agent();
 
-    // Damage the record of the running VM: the state dir is ours, so a
-    // replacement database can be moved over the agent's.
+    // Damage the record of the running VM: the state dir and its database
+    // are ours, so a replacement database can be moved over the agent's.
     let db = agent.state_dir.join("state.db");
     let original = agent.state_dir.join("state.db.original");
     std::fs::copy(&db, &original).expect("keep the real database");
@@ -1197,6 +1213,25 @@ fn stop_logs_and_rm_reject_invalid_names_up_front() {
         );
     }
     agent.assert_no_cirro_state();
+}
+
+/// The state database names every App's route and every Machine's address
+/// and host key, so it's root's alone, WAL files included.
+#[test]
+fn the_state_database_is_root_only() {
+    let Some(agent) = Agent::start_without_kvm(219) else {
+        return;
+    };
+
+    for file in ["state.db", "state.db-wal", "state.db-shm"] {
+        let meta = std::fs::metadata(agent.state_dir.join(file))
+            .unwrap_or_else(|e| panic!("stat {file}: {e}"));
+        assert_eq!(
+            (meta.uid(), meta.permissions().mode() & 0o777),
+            (0, 0o600),
+            "{file} should be root's, 0600"
+        );
+    }
 }
 
 /// Console logs hold whatever the VM's command printed, so they should be
@@ -1881,6 +1916,7 @@ fn parked_vms_survive_an_agent_restart_and_unowned_snapshots_are_removed() {
     let Some(mut agent) = Agent::start(224) else {
         return;
     };
+    agent.own_the_state_database();
     let mut kept_count = 0;
     for name in ["kept", "orphan"] {
         let (address, _) = vm_address(&stdout(
@@ -1896,8 +1932,9 @@ fn parked_vms_survive_an_agent_restart_and_unowned_snapshots_are_removed() {
         agent.cirro().args(["park", name]).assert().success();
     }
 
-    // Forget `orphan`'s record while the agent is down: the state dir is
-    // ours, so a changed copy of the database can be moved over the agent's.
+    // Forget `orphan`'s record while the agent is down: the state dir and
+    // its database are ours, so a changed copy of the database can be moved
+    // over the agent's.
     agent.stop_agent();
     let db = agent.state_dir.join("state.db");
     let changed = agent.state_dir.join("state.db.changed");

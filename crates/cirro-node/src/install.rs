@@ -20,8 +20,8 @@ use crate::subnet::Subnet;
 use crate::vm;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::io::{self, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -342,9 +342,20 @@ fn succeeds(program: &str, arg: &str) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// Root's alone, from the moment it exists: it names the Node's group,
+/// subnet and ACME email, which are no business of other local users.
 fn write_node_config(state_dir: &Path, config: &NodeConfig) -> io::Result<()> {
     let json = serde_json::to_string_pretty(config).map_err(io::Error::other)?;
-    fs::write(layout::node_config(state_dir), json)
+    let path = layout::node_config(state_dir);
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?
+        .write_all(json.as_bytes())?;
+    // An earlier install wrote it 0644.
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
 }
 
 fn read_node_config(state_dir: &Path) -> io::Result<NodeConfig> {
