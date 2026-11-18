@@ -1,7 +1,7 @@
 //! Certificates from an ACME CA (Let's Encrypt by default) for Apps whose
 //! hostnames are public, proved over HTTP-01: the CA fetches a token from
 //! `http://<host>/.well-known/acme-challenge/<token>`, which the HTTP edge
-//! answers (see [`Acme::challenge`]), so the edge must be
+//! answers (see `Acme::challenge`), so the edge must be
 //! reachable on port 80 under that hostname (ADR 0008).
 //!
 //! Kept in the agent's state dir, root-only: the account, one per ACME
@@ -127,12 +127,12 @@ impl Acme {
 
     /// The key authorization for an HTTP-01 challenge token, while its
     /// challenge is under way.
-    pub fn challenge(&self, token: &str) -> Option<String> {
+    pub(crate) fn challenge(&self, token: &str) -> Option<String> {
         self.challenges.lock().unwrap().get(token).cloned()
     }
 
     /// `host`'s certificate, if it has an unexpired one.
-    pub fn certificate(&self, host: &str) -> Option<Arc<CertifiedKey>> {
+    pub(crate) fn certificate(&self, host: &str) -> Option<Arc<CertifiedKey>> {
         let certificates = self.certificates.lock().unwrap();
         let certificate = certificates.get(host)?;
         certificate

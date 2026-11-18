@@ -3,7 +3,7 @@
 //! [`Flattened::open`] reads an image's layers, bottom first, and works out
 //! the final tree: later layers replace earlier entries, and `.wh.<name>`
 //! whiteouts and `.wh..wh..opq` opaque directories remove them, as the OCI
-//! image spec's layer rules say. [`Flattened::build_ext4`] writes that tree,
+//! image spec's layer rules say. `Flattened::build_ext4` writes that tree,
 //! plus what every guest needs (guest-init as `/init`, its mountpoints, DNS),
 //! as one tar in path order and has `mke2fs -d` turn it into ext4.
 //!
@@ -78,7 +78,7 @@ pub struct Flattened {
 impl Flattened {
     /// Merges `layers` (bottom first; each a tar, plain or gzip-compressed).
     /// Their uncompressed copies go in `scratch`, which the caller owns and
-    /// removes after [`Flattened::build_ext4`].
+    /// removes when it's done with the result.
     pub fn open(layers: &[PathBuf], scratch: &Path) -> Result<Flattened, Error> {
         std::fs::create_dir_all(scratch).map_err(|e| err("create the scratch dir", e))?;
         let mut flat = Flattened {
@@ -213,7 +213,7 @@ impl Flattened {
 
     /// The contents of the regular file at `path` in the final tree, if
     /// there is one. `path` may start with `/`.
-    pub fn read(&self, path: &str) -> Result<Option<Vec<u8>>, Error> {
+    pub(crate) fn read(&self, path: &str) -> Result<Option<Vec<u8>>, Error> {
         let Some(source) = self.tree.get(path.trim_start_matches('/')) else {
             return Ok(None);
         };
@@ -239,7 +239,7 @@ impl Flattened {
     /// Writes the final tree, with guest-init as `/init` and the rest of
     /// what a guest needs, as an ext4 image at `dest`. `scratch` holds the
     /// intermediate tar.
-    pub fn build_ext4(&self, init: &[u8], scratch: &Path, dest: &Path) -> Result<(), Error> {
+    pub(crate) fn build_ext4(&self, init: &[u8], scratch: &Path, dest: &Path) -> Result<(), Error> {
         check_mke2fs()?;
         let tree = self.with_guest_files(init);
         let tar_path = scratch.join("rootfs.tar");

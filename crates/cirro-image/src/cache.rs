@@ -59,7 +59,8 @@ impl ImageCache {
     }
 
     /// Reach these registries (`host:port`) over plain HTTP instead of HTTPS.
-    pub fn with_plain_http(mut self, registries: Vec<String>) -> ImageCache {
+    #[cfg(test)]
+    pub(crate) fn with_plain_http(mut self, registries: Vec<String>) -> ImageCache {
         self.plain_http = registries;
         self
     }
