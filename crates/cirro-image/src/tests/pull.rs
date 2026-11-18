@@ -400,6 +400,31 @@ fn a_challenge_held_back_from_the_probe_fetches_no_token() {
     );
 }
 
+/// A layer's `urls` (a "foreign" layer's other homes) are never fetched: a
+/// registry could otherwise make the pull request any URL it likes.
+#[test]
+fn a_foreign_layers_urls_are_never_fetched() {
+    let registry = Registry::start();
+    let foreign = format!(
+        "http://localhost:{}/foreign",
+        registry.host.rsplit(':').next().unwrap()
+    );
+    let image = Image::new("amd64", vec![app_layer()], app_config()).foreign(vec![foreign]);
+    let digest = registry.put_image("app", &image);
+    registry.tag("app", "v1", &digest);
+
+    assert!(pull(&cache(&registry), &format!("{}/app:v1", registry.host)).is_err());
+
+    assert!(
+        !registry
+            .requests()
+            .iter()
+            .any(|p| p.starts_with("/foreign")),
+        "a layer's url was fetched: {:?}",
+        registry.requests()
+    );
+}
+
 /// A redirect from the realm is not followed to wherever it points.
 #[test]
 fn a_realm_that_redirects_is_not_followed() {

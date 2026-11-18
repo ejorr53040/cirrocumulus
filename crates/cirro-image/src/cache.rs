@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll, ready};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWrite;
 
 /// The only platform a Node runs.
@@ -195,8 +195,9 @@ impl ImageCache {
         init: &[u8],
         limits: Limits,
     ) -> Result<String, Error> {
-        let client = self.client();
+        let mut client = self.client();
         let auth = self.registry_auth(reference).await?;
+        let mut authed = Instant::now();
         let (digest, manifest) = self.resolve(&client, reference, &auth).await?;
         let Some(manifest) = manifest else {
             return Ok(digest);
@@ -237,6 +238,17 @@ impl ImageCache {
 
         let mut layers = Vec::new();
         for (i, layer) in manifest.layers.iter().enumerate() {
+            // oci-client keeps using a bearer token it was handed after the
+            // registry lets it lapse, so a long pull gets a new one between
+            // layers.
+            if authed.elapsed() > TOKEN_REFRESH {
+                client = self.client();
+                let auth = self.registry_auth(reference).await?;
+                client
+                    .store_auth_if_needed(reference.resolve_registry(), &auth)
+                    .await;
+                authed = Instant::now();
+            }
             let path = scratch.0.join(format!("blob-{i}"));
             let file = tokio::fs::File::create(&path)
                 .await
@@ -394,11 +406,17 @@ impl ImageCache {
         }
         let token: TokenResponse = serde_json::from_slice(&body)
             .map_err(|e| err(&format!("{reference}: token from {realm}"), e))?;
-        token
+        let token = token
             .token
             .or(token.access_token)
-            .map(RegistryAuth::Bearer)
-            .ok_or_else(|| Error(format!("{reference}: {realm} sent no token")))
+            .ok_or_else(|| Error(format!("{reference}: {realm} sent no token")))?;
+        // oci-client unwraps the header it builds from the token.
+        if HeaderValue::from_str(&token).is_err() {
+            return Err(Error(format!(
+                "{reference}: {realm} sent a token that can't go in a header"
+            )));
+        }
+        Ok(RegistryAuth::Bearer(token))
     }
 
     /// The image built from manifest `digest`, if it's in the cache. The
@@ -449,6 +467,11 @@ impl ImageCache {
 
 /// Most a token service may answer with; a token is a few kilobytes.
 const TOKEN_LIMIT: usize = 64 << 10;
+
+/// How long a pull uses one registry token before asking for another. A
+/// token lasts 60 s unless its service says otherwise (distribution spec),
+/// and `TokenResponse` doesn't read `expires_in`, so this stays under that.
+const TOKEN_REFRESH: Duration = Duration::from_secs(50);
 
 #[derive(Deserialize)]
 struct TokenResponse {
@@ -570,7 +593,9 @@ fn pull_error(reference: &Reference, what: &str, e: OciDistributionError) -> Err
 
 /// Downloads `blob` into `out`, which takes at most `max` bytes. A blob the
 /// manifest says is too big isn't requested at all, and one that turns out
-/// to be is cut off at `max` rather than read to the end.
+/// to be is cut off at `max` rather than read to the end. Only the registry
+/// is asked: a descriptor's `urls` (a foreign layer's other homes) would
+/// let the registry point the pull at any URL.
 async fn download<W: AsyncWrite + Unpin>(
     client: &Client,
     reference: &Reference,
@@ -588,7 +613,11 @@ async fn download<W: AsyncWrite + Unpin>(
         left: max,
         over: false,
     };
-    let pulled = client.pull_blob(reference, blob, &mut out).await;
+    let blob = OciDescriptor {
+        urls: None,
+        ..blob.clone()
+    };
+    let pulled = client.pull_blob(reference, &blob, &mut out).await;
     if out.over {
         return Err(too_big());
     }

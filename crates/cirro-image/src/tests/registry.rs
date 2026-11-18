@@ -49,6 +49,9 @@ pub(super) struct Image {
     pub(super) config: serde_json::Value,
     /// The media type the manifest gives every layer.
     pub(super) layer_media_type: &'static str,
+    /// When set, every layer lists these `urls` and the registry doesn't
+    /// have the layer itself: a foreign layer.
+    pub(super) foreign_urls: Option<Vec<String>>,
 }
 
 impl Image {
@@ -63,6 +66,7 @@ impl Image {
                 "rootfs": {"type": "layers", "diff_ids": []},
             }),
             layer_media_type: LAYER_GZIP,
+            foreign_urls: None,
         }
     }
 
@@ -70,6 +74,14 @@ impl Image {
     pub(super) fn zstd(self) -> Self {
         Image {
             layer_media_type: "application/vnd.oci.image.layer.v1.tar+zstd",
+            ..self
+        }
+    }
+
+    /// The same image, with its layers to be fetched from `urls` instead.
+    pub(super) fn foreign(self, urls: Vec<String>) -> Self {
+        Image {
+            foreign_urls: Some(urls),
             ..self
         }
     }
@@ -100,8 +112,9 @@ impl Registry {
         let layers: Vec<serde_json::Value> = image
             .layers
             .iter()
-            .map(|l| {
-                serde_json::json!({"mediaType": image.layer_media_type, "digest": self.put_blob(l), "size": l.len()})
+            .map(|l| match &image.foreign_urls {
+                None => serde_json::json!({"mediaType": image.layer_media_type, "digest": self.put_blob(l), "size": l.len()}),
+                Some(urls) => serde_json::json!({"mediaType": image.layer_media_type, "digest": sha256(l), "size": l.len(), "urls": urls}),
             })
             .collect();
         let manifest = serde_json::json!({
