@@ -13,11 +13,11 @@ use rcgen::{
     BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose,
     date_time_ymd,
 };
-use rustls::crypto::CryptoProvider;
+use rustls::ServerConfig;
+use rustls::crypto::ring::{self, sign::any_supported_type};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use rustls::{ServerConfig, version};
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
@@ -105,7 +105,7 @@ impl NodeCa {
         &self.cert_pem
     }
 
-    fn certify(&self, host: &str, provider: &CryptoProvider) -> Result<HostCertificate, String> {
+    fn certify(&self, host: &str) -> Result<HostCertificate, String> {
         let key = KeyPair::generate().map_err(|e| e.to_string())?;
         let mut params =
             CertificateParams::new(vec![host.to_string()]).map_err(|e| e.to_string())?;
@@ -118,12 +118,10 @@ impl NodeCa {
         let cert = params
             .signed_by(&key, &self.issuer)
             .map_err(|e| e.to_string())?;
-        let signing_key = provider
-            .key_provider
-            .load_private_key(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-                key.serialize_der(),
-            )))
-            .map_err(|e| e.to_string())?;
+        let signing_key = any_supported_type(&PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            key.serialize_der(),
+        )))
+        .map_err(|e| e.to_string())?;
         let certified =
             CertifiedKey::new(vec![CertificateDer::from(cert.der().to_vec())], signing_key);
         Ok(HostCertificate {
@@ -169,15 +167,13 @@ pub(crate) fn server_config(
     acme: Option<Arc<Acme>>,
     routed: impl Fn(&str) -> bool + Send + Sync + 'static,
 ) -> io::Result<Arc<ServerConfig>> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut config = ServerConfig::builder_with_provider(provider.clone())
-        .with_protocol_versions(&[&version::TLS13, &version::TLS12])
+    let mut config = ServerConfig::builder_with_provider(Arc::new(ring::default_provider()))
+        .with_safe_default_protocol_versions()
         .map_err(io::Error::other)?
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(HostCertificates {
             ca,
             acme,
-            provider,
             routed: Box::new(routed),
             signed: Mutex::new(HashMap::new()),
         }));
@@ -189,7 +185,6 @@ pub(crate) fn server_config(
 struct HostCertificates {
     ca: Arc<NodeCa>,
     acme: Option<Arc<Acme>>,
-    provider: Arc<CryptoProvider>,
     routed: Box<dyn Fn(&str) -> bool + Send + Sync>,
     signed: Mutex<HashMap<String, HostCertificate>>,
 }
@@ -223,7 +218,7 @@ impl ResolvesServerCert for HostCertificates {
         {
             return Some(certificate.certified.clone());
         }
-        match self.ca.certify(&host, &self.provider) {
+        match self.ca.certify(&host) {
             Ok(certificate) => {
                 let certified = certificate.certified.clone();
                 signed.insert(host, certificate);

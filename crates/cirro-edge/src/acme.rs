@@ -17,7 +17,7 @@ use instant_acme::{
     Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, NewAccount,
     NewOrder, OrderStatus, RetryPolicy,
 };
-use rustls::crypto::CryptoProvider;
+use rustls::crypto::ring::sign::any_supported_type;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::sign::CertifiedKey;
@@ -82,7 +82,6 @@ pub struct Acme {
     dir: PathBuf,
     config: AcmeConfig,
     account: OnceCell<Account>,
-    provider: Arc<CryptoProvider>,
     /// Key authorizations by token, for challenges under way.
     challenges: Mutex<HashMap<String, String>>,
     certificates: Mutex<HashMap<String, HostCertificate>>,
@@ -100,7 +99,6 @@ impl Acme {
             dir: dir.to_path_buf(),
             config,
             account: OnceCell::new(),
-            provider: Arc::new(rustls::crypto::ring::default_provider()),
             challenges: Mutex::new(HashMap::new()),
             certificates: Mutex::new(HashMap::new()),
             ordering: Mutex::new(HashSet::new()),
@@ -308,11 +306,7 @@ impl Acme {
             .map_err(|e| format!("parse the certificate: {e}"))?;
         let not_after = parsed.validity().not_after.timestamp();
         let key = PrivateKeyDer::from_pem_slice(&pem).map_err(|e| format!("parse the key: {e}"))?;
-        let signing_key = self
-            .provider
-            .key_provider
-            .load_private_key(key)
-            .map_err(|e| format!("load the key: {e}"))?;
+        let signing_key = any_supported_type(&key).map_err(|e| format!("load the key: {e}"))?;
         Ok(HostCertificate {
             certified: Arc::new(CertifiedKey::new(chain, signing_key)),
             expires: UNIX_EPOCH + Duration::from_secs(u64::try_from(not_after).unwrap_or(0)),
