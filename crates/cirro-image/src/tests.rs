@@ -45,6 +45,26 @@ impl Layer {
         self
     }
 
+    /// Gives the next entry the extended attribute `name` = `value`, in a
+    /// PAX record as `docker build` writes one.
+    fn xattr(mut self, name: &str, value: &[u8]) -> Self {
+        let key = format!("SCHILY.xattr.{name}");
+        let mut header = Header::new_gnu();
+        header.set_entry_type(EntryType::XHeader);
+        let mut record = Vec::new();
+        // The length counts itself, so fix it up until it's stable.
+        let mut len = key.len() + value.len() + 3;
+        while (len.to_string().len() + key.len() + value.len() + 3) != len {
+            len = len.to_string().len() + key.len() + value.len() + 3;
+        }
+        record.extend_from_slice(format!("{len} {key}=").as_bytes());
+        record.extend_from_slice(value);
+        record.push(b'\n');
+        header.set_size(record.len() as u64);
+        self.entries.push((header, "PaxHeader".into(), record));
+        self
+    }
+
     /// Writes the layer into `dir`, gzipped or not, and returns its path.
     fn write(&self, dir: &Path, name: &str, gzip: bool) -> PathBuf {
         let path = dir.join(name);
@@ -333,6 +353,62 @@ fn a_hardlink_to_a_whited_out_file_fails_the_build() {
         .expect_err("a dangling hardlink should fail the build");
 
     assert!(e.0.contains("isn't a file in the image"), "{e}");
+}
+
+#[test]
+fn a_hardlink_to_a_directory_fails_the_build() {
+    if !have_mke2fs() {
+        return;
+    }
+    let flat = flatten(&[Layer::default()
+        .dir("etc")
+        .link(EntryType::Link, "x", "etc")])
+    .unwrap();
+    let dir = tempdir();
+
+    let e = flat
+        .build_ext4(b"", &dir, &dir.join("rootfs.ext4"))
+        .expect_err("a hardlink to a directory should fail the build");
+
+    assert!(e.0.contains("isn't a file in the image"), "{e}");
+}
+
+#[test]
+fn the_image_keeps_extended_attributes() {
+    let Some(image) = build(&[Layer::default()
+        .xattr("security.capability", b"kept")
+        .file("f", "data")
+        .file("g", "after")])
+    else {
+        return;
+    };
+
+    let attrs = debugfs(&image, "ea_list /f");
+    assert!(
+        attrs.contains("security.capability") && attrs.contains("kept"),
+        "{attrs}"
+    );
+    assert_eq!(debugfs(&image, "cat /f"), "data");
+    assert_eq!(debugfs(&image, "cat /g"), "after");
+}
+
+/// Above 512 MiB, `mke2fs` gives one inode per 16 KiB by default, fewer than
+/// an image of many small files has entries.
+#[test]
+fn an_image_of_many_small_files_has_an_inode_for_each() {
+    let mut layer = Layer::default();
+    for d in 0..110 {
+        layer = layer.dir(&format!("d{d}"));
+        for f in 0..1000 {
+            layer = layer.file(&format!("d{d}/{f}"), "");
+        }
+    }
+    let Some(image) = build(&[layer]) else {
+        return;
+    };
+
+    assert_eq!(debugfs(&image, "cat /d109/999"), "");
+    assert!(debugfs(&image, "stat /d109/999").contains("Type: regular"));
 }
 
 mod pull;

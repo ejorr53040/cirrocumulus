@@ -8,9 +8,10 @@
 //! as one tar in path order and has `mke2fs -d` turn it into ext4.
 //!
 //! Nothing here needs root. `mke2fs` (e2fsprogs 1.47.1 or later) takes each
-//! file's owner and mode from the tar, so a build run as any user keeps the
-//! image's ownership and setuid bits. Image layers are untrusted input, which
-//! is why this runs in the unprivileged CLI and never in the Node agent.
+//! file's owner, mode and extended attributes from the tar, so a build run as
+//! any user keeps the image's ownership, setuid bits and file capabilities.
+//! Image layers are untrusted input, which is why this runs in the
+//! unprivileged CLI and never in the Node agent.
 
 mod cache;
 pub mod run_config;
@@ -56,7 +57,12 @@ struct Source {
     header: Header,
     /// Offset of the entry's data in its uncompressed layer.
     data: u64,
+    /// The data's length, which a PAX record may override from `header`.
+    size: u64,
     link_name: Option<PathBuf>,
+    /// The entry's `SCHILY.xattr.*` PAX records, file capabilities among
+    /// them, to write back for `mke2fs`.
+    xattrs: Vec<(String, Vec<u8>)>,
 }
 
 /// An image's layers merged into its final tree.
@@ -95,7 +101,19 @@ impl Flattened {
         let mut archive = tar::Archive::new(BufReader::new(file));
         let mut entries = Vec::new();
         for entry in archive.entries_with_seek().map_err(|e| err("read", e))? {
-            let entry = entry.map_err(|e| err("read an entry", e))?;
+            let mut entry = entry.map_err(|e| err("read an entry", e))?;
+            let mut xattrs = Vec::new();
+            let pax = entry
+                .pax_extensions()
+                .map_err(|e| err("read PAX records", e))?;
+            for ext in pax.into_iter().flatten() {
+                let ext = ext.map_err(|e| err("read a PAX record", e))?;
+                if let Ok(key) = ext.key()
+                    && key.starts_with("SCHILY.xattr.")
+                {
+                    xattrs.push((key.to_owned(), ext.value_bytes().to_vec()));
+                }
+            }
             let path = entry.path().map_err(|e| err("read a path", e))?;
             let path = normalise(&path)?;
             let link_name = entry
@@ -108,7 +126,9 @@ impl Flattened {
                     layer: i,
                     header: entry.header().clone(),
                     data: entry.raw_file_position(),
+                    size: entry.size(),
                     link_name,
+                    xattrs,
                 },
             ));
         }
@@ -213,7 +233,7 @@ impl Flattened {
     fn data(&self, source: &Source) -> io::Result<impl Read> {
         let mut file = File::open(&self.layers[source.layer])?;
         file.seek(SeekFrom::Start(source.data))?;
-        Ok(file.take(source.header.entry_size()?))
+        Ok(file.take(source.size))
     }
 
     /// Writes the final tree, with guest-init as `/init` and the rest of
@@ -234,8 +254,10 @@ impl Flattened {
         image
             .set_len(size)
             .map_err(|e| err(&format!("size {}", dest.display()), e))?;
+        // One inode per 4 KiB, as `size` assumes: above 512 MiB `mke2fs`
+        // would otherwise give one per 16 KiB, too few for small files.
         let output = Command::new("mke2fs")
-            .args(["-q", "-F", "-t", "ext4", "-d"])
+            .args(["-q", "-F", "-t", "ext4", "-i", "4096", "-d"])
             .arg(&tar_path)
             .arg(dest)
             .output()
@@ -310,6 +332,14 @@ impl Flattened {
                 }
                 Entry::Layer(source) => {
                     let mut header = source.header.clone();
+                    if header.entry_type() != EntryType::Link && !source.xattrs.is_empty() {
+                        builder.append_pax_extensions(
+                            source
+                                .xattrs
+                                .iter()
+                                .map(|(k, v)| (k.as_str(), v.as_slice())),
+                        )?;
+                    }
                     match header.entry_type() {
                         EntryType::Link => hardlinks.push((path, source)),
                         EntryType::Symlink => {
@@ -322,7 +352,8 @@ impl Flattened {
                             builder.append_link(&mut header, path, target)?;
                         }
                         EntryType::Regular | EntryType::Continuous => {
-                            bytes += header.entry_size()?;
+                            header.set_size(source.size);
+                            bytes += source.size;
                             builder.append_data(&mut header, path, self.data(source)?)?;
                         }
                         _ => {
@@ -340,7 +371,12 @@ impl Flattened {
             // `mke2fs` gives the shared inode the link entry's metadata, so
             // it must match the target's.
             match tree.get(&target) {
-                Some(Entry::Layer(t)) => {
+                Some(Entry::Layer(t))
+                    if matches!(
+                        t.header.entry_type(),
+                        EntryType::Regular | EntryType::Continuous
+                    ) =>
+                {
                     header.set_mode(t.header.mode()?);
                     header.set_uid(t.header.uid()?);
                     header.set_gid(t.header.gid()?);
@@ -351,7 +387,7 @@ impl Flattened {
                     header.set_uid(0);
                     header.set_gid(0);
                 }
-                Some(Entry::Dir) | None => {
+                Some(Entry::Layer(_) | Entry::Dir) | None => {
                     return Err(io::Error::other(format!(
                         "{path} is a hard link to {target}, which isn't a file in the image"
                     )));
