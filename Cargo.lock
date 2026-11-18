@@ -363,6 +363,7 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "oci-client",
+ "reqwest",
  "rustls",
  "serde",
  "serde_json",

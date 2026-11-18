@@ -411,5 +411,62 @@ fn an_image_of_many_small_files_has_an_inode_for_each() {
     assert!(debugfs(&image, "stat /d109/999").contains("Type: regular"));
 }
 
+/// A gzip of 1 MiB of zeros is about 1 KiB: a bomb unless expansion is capped.
+#[test]
+fn a_layer_that_expands_past_its_limit_is_refused_and_stops_there() {
+    let dir = tempdir();
+    let layer = dir.join("zeros.tar.gz");
+    let mut gz = GzEncoder::new(File::create(&layer).unwrap(), Compression::fast());
+    gz.write_all(&[0u8; 1 << 20]).unwrap();
+    gz.finish().unwrap();
+    let limits = Limits {
+        layer: 64 << 10,
+        ..LIMITS
+    };
+
+    let e = Flattened::open_within(&[layer], &dir.join("scratch"), limits).unwrap_err();
+
+    assert!(
+        e.to_string().ends_with("expands to more than 64 KiB"),
+        "{e}"
+    );
+    let expanded = std::fs::metadata(dir.join("scratch/layer-0.tar"))
+        .unwrap()
+        .len();
+    assert!(expanded <= (64 << 10) + 1, "wrote {expanded} bytes");
+}
+
+/// Each file costs a 4 KiB block whatever its size, so a file costs 4097
+/// bytes here. Two layers of two files need 16388 bytes, past 12291.
+#[test]
+fn a_tree_bigger_than_its_limit_is_refused_across_layers() {
+    let dir = tempdir();
+    let first = Layer::default()
+        .file("a", "1")
+        .file("b", "2")
+        .write(&dir, "first.tar", false);
+    let second = Layer::default()
+        .file("c", "3")
+        .file("d", "4")
+        .write(&dir, "second.tar", false);
+    let limits = Limits {
+        rootfs: 3 * 4097,
+        ..LIMITS
+    };
+
+    let e = Flattened::open_within(&[first.clone(), second.clone()], &dir.join("s"), limits)
+        .unwrap_err();
+
+    assert_eq!(
+        e.to_string(),
+        "layer 2: the files need more than 12291 bytes of rootfs"
+    );
+    let fits = Limits {
+        rootfs: 4 * 4097,
+        ..LIMITS
+    };
+    Flattened::open_within(&[first, second], &dir.join("fits"), fits).unwrap();
+}
+
 mod pull;
 mod registry;

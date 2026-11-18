@@ -14,11 +14,12 @@ explains what happens between the image reference and the boot, and what it can'
 
 1. **Resolves the reference.** `nginx:alpine` means `docker.io/library/nginx:alpine`;
    `ghcr.io/owner/app:1.2` and `name@sha256:…` (a pinned digest) work too. The registry is
-   asked for the manifest anonymously. If the image is multi-platform, cirro picks its
+   asked for the manifest anonymously, or with the bearer token its own token service
+   gives when it challenges for one. If the image is multi-platform, cirro picks its
    `linux/amd64` image.
 2. **Checks the cache.** Built images are kept per user in `$XDG_CACHE_HOME/cirro/images`
-   (`~/.cache/cirro/images`), one per image digest. A cached image costs one manifest
-   request: the tag is checked every time, so a pushed update is noticed, but nothing
+   (`~/.cache/cirro/images`), one per image digest. A cached image costs a probe and one
+   manifest request: the tag is checked every time, so a pushed update is noticed, but nothing
    is downloaded twice.
 3. **Downloads the config and layers.** Each blob's sha256 is checked before it's used.
 4. **Flattens the layers** into the image's final filesystem tree. Later layers replace
@@ -79,6 +80,11 @@ reference names it, until you remove it.
 - **linux/amd64 only.** Other images are refused by name, with the platforms they do
   have.
 - **gzip or uncompressed layers.** zstd layers are refused before any layer is downloaded.
+- **Size caps.** A config over 16 MiB, a compressed layer over 4 GiB, a layer that expands
+  past 4 GiB, or a rootfs whose files add up to more than 4 GiB is refused. Each is
+  checked as the bytes come in or as the tree is built, so a blob the manifest declares
+  too big is refused before it's downloaded, and one that turns out bigger is cut off at
+  its cap.
 - **Docker Hub's anonymous limit** is about 100 pulls per 6 hours per IP address. Cached
   images keep you well under it; past it, `cirro` says so and suggests `cirro image ls`.
 - **Each VM gets a copy of the rootfs.** That's fine at nginx's size. A shared read-only
