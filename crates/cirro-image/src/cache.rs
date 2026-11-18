@@ -746,7 +746,7 @@ mod realm_tests {
     use reqwest::header::HeaderValue;
 
     #[test]
-    fn a_realm_on_the_registrys_domain_is_allowed() {
+    fn a_realm_on_the_registry_or_its_token_host_is_allowed() {
         let probe = Url::parse("https://registry-1.docker.io/v2/").unwrap();
         assert!(allowed_realm(&probe, "https://auth.docker.io/token").is_some());
         assert!(allowed_realm(&probe, "https://registry-1.docker.io/token").is_some());
