@@ -314,6 +314,11 @@ impl Flattened {
                         EntryType::Link => hardlinks.push((path, source)),
                         EntryType::Symlink => {
                             let target = source.link_name.clone().unwrap_or_default();
+                            // A link carries no data, whatever size the
+                            // layer's header claimed. `append_link` writes
+                            // none, so a size left here would shift every
+                            // entry after it.
+                            header.set_size(0);
                             builder.append_link(&mut header, path, target)?;
                         }
                         EntryType::Regular | EntryType::Continuous => {
@@ -352,6 +357,8 @@ impl Flattened {
                     )));
                 }
             }
+            // As for a symlink above.
+            header.set_size(0);
             builder.append_link(&mut header, path, &target)?;
         }
         builder.into_inner()?.flush()?;

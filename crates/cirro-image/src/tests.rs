@@ -270,6 +270,31 @@ fn the_image_keeps_owners_modes_and_links() {
     );
 }
 
+/// A link entry may claim a size, and carry that many bytes, which a tar
+/// reader skips. The image's tar must give it none, or `mke2fs` reads the
+/// entries after it from the wrong place.
+#[test]
+fn a_link_entry_that_claims_a_size_shifts_nothing_after_it() {
+    let mut layer = Layer::default()
+        .link(EntryType::Symlink, "a", "b")
+        .file("b", "after")
+        .link(EntryType::Link, "c", "b")
+        .link(EntryType::Link, "d", "b");
+    for i in [0, 2] {
+        layer.entries[i].0.set_size(1024);
+        layer.entries[i].2 = vec![b'x'; 1024];
+    }
+    let Some(image) = build(&[layer]) else {
+        return;
+    };
+
+    assert_eq!(debugfs(&image, "cat /b"), "after");
+    assert!(
+        debugfs(&image, "stat /b").contains("Links: 3"),
+        "both hard links should be in the image"
+    );
+}
+
 #[test]
 fn every_guest_gets_init_mountpoints_and_dns() {
     let Some(image) = build(&[Layer::default()
