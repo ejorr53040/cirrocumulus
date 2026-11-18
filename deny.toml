@@ -14,7 +14,9 @@ all-features = true
 yanked = "deny"
 unmaintained = "all"
 unsound = "all"
-ignore = []
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, not vulnerable; only oci-client uses it, to parse an image config's created timestamp, and no release of oci-client drops it yet" },
+]
 
 [licenses]
 # Every license must be on this list and compatible with Apache-2.0
