@@ -1,5 +1,5 @@
-//! The app config the Node agent sends guest-init over vsock (RESEARCH.md
-//! M2): both ends use these types, so they can't disagree on its shape.
+//! The app config the Node agent sends guest-init over vsock: both ends use
+//! these types, so they can't disagree on its shape.
 
 use serde::{Deserialize, Serialize};
 

@@ -1,4 +1,4 @@
-//! `guest-init`: PID 1 inside the Firecracker guest. See RESEARCH.md M2.
+//! `guest-init`: PID 1 inside the Firecracker guest.
 //!
 //! It mounts the pseudo-filesystems, prints a boot marker, reads the app's
 //! config over vsock (so the host supplies it at boot rather than baking it
@@ -105,7 +105,7 @@ fn mount_pseudo_filesystems() {
     );
 }
 
-/// Reads the app config over vsock, per RESEARCH.md M2 slice 6. Firecracker
+/// Reads the app config over vsock. Firecracker
 /// exposes vsock to the host as a Unix socket at a configured path; a host
 /// that connects there and sends `CONNECT <port>\n` gets that connection
 /// relayed straight into whatever this guest has accepted on that port,
@@ -148,7 +148,7 @@ fn read_config_from_vsock() -> Config {
     config::parse_config(&config_json).expect("parse config")
 }
 
-/// Forks and execs the configured app in the child, per RESEARCH.md M2.
+/// Forks and execs the configured app in the child.
 /// This is `fork`+`execve`, not a bare `execve` of PID 1 itself: guest-init
 /// has to stay running as a distinct process to reap zombies, forward
 /// signals and power off on the app's exit, none of which is possible if
