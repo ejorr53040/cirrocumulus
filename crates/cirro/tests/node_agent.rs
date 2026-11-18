@@ -235,9 +235,17 @@ impl Agent {
         format!("10.77.{}.", self.octet)
     }
 
-    /// Everything a VM could leave on the Node, as seen from outside the
-    /// agent. Host object names embed the Node subnet's third octet.
-    fn assert_no_cirro_state(&self) {
+    /// Ends the test: stops the agent, then checks everything a VM could
+    /// leave on the Node, as seen from outside the agent. Host object names
+    /// embed the Node subnet's third octet.
+    ///
+    /// The jail base and the parked dir are root-only (F-002, F-003), so
+    /// they can't be listed from here. The agent removes each on the way out
+    /// only when it's empty, so either one still there means a VM left a jail
+    /// or a snapshot behind. Dropping `self` afterwards removes what records
+    /// and logs the test left, through an agent.
+    fn assert_no_cirro_state(mut self) {
+        self.stop_agent();
         let id_prefix = format!("cirro-{:02x}", self.octet);
         let netns = stdout_of(&["ip", "netns", "list"]);
         assert!(
@@ -251,11 +259,14 @@ impl Agent {
             !routes.contains(&self.subnet_prefix()),
             "leftover routes into the Node subnet:\n{routes}"
         );
-        let jails: Vec<_> = std::fs::read_dir(self.state_dir.join("jail/firecracker"))
-            .into_iter()
-            .flatten()
-            .collect();
-        assert!(jails.is_empty(), "leftover jail dirs: {jails:?}");
+        for dir in ["jail", "parked"] {
+            let dir = self.state_dir.join(dir);
+            assert!(
+                !dir.exists(),
+                "{} is left after the agent stopped: a VM left a jail or snapshot in it",
+                dir.display()
+            );
+        }
         let cgroups: Vec<_> = std::fs::read_dir("/sys/fs/cgroup/cirro")
             .into_iter()
             .flatten()
@@ -267,24 +278,20 @@ impl Agent {
 }
 
 impl Agent {
-    /// Stops the agent and checks that no snapshot is left in its state
-    /// dir. The parked dir is root-only, so it can't be listed from here,
-    /// but the agent removes it on the way out only when it's empty.
-    fn assert_no_snapshots(&mut self) {
-        self.stop_agent();
-        let parked = self.state_dir.join("parked");
-        assert!(
-            !parked.exists(),
-            "a snapshot is left in {} after the agent stopped",
-            parked.display()
-        );
-    }
-
     /// For a test that changes records while the agent is down: swaps the
     /// still-empty state database the agent made at its first start, which
     /// is root's and 0600, for an empty one of the test user's. The agent
     /// keeps that 0600 too but doesn't take it over, so the test can read
     /// it, as it can the rest of the state dir it made.
+    ///
+    /// The swap hides nothing the agent acts on: it runs as root, so it opens
+    /// a database of any owner, and it sets only the mode, never the owner
+    /// (`restrict_state_db`). The production owner and mode are pinned by
+    /// `the_state_database_is_root_only`, and every other restart test runs
+    /// on the root-owned database. No API or CLI edits records, and the
+    /// edits here (a damaged record, a forgotten one) are ones no request can
+    /// make. Were the agent ever to take the database over, the tests' copy
+    /// of it would fail with a permission error, not pass.
     fn own_the_state_database(&mut self) {
         self.stop_agent();
         for file in ["state.db", "state.db-wal", "state.db-shm"] {
@@ -2000,7 +2007,7 @@ fn count(response: &str) -> u64 {
 /// where it was instead of booting again.
 #[test]
 fn a_parked_vm_wakes_where_it_left_off_and_rm_leaves_nothing() {
-    let Some(mut agent) = Agent::start(225) else {
+    let Some(agent) = Agent::start(225) else {
         return;
     };
     let (address, host) = vm_address(&stdout(
@@ -2048,7 +2055,6 @@ fn a_parked_vm_wakes_where_it_left_off_and_rm_leaves_nothing() {
         "rm left counter listed:\n{ps}"
     );
     agent.assert_no_cirro_state();
-    agent.assert_no_snapshots();
 }
 
 /// M6: parked VMs are records like any Ended VM, so they outlive the agent
@@ -2109,7 +2115,6 @@ fn parked_vms_survive_an_agent_restart_and_unowned_snapshots_are_removed() {
         .success();
     agent.cirro().args(["rm", "kept"]).assert().success();
     agent.assert_no_cirro_state();
-    agent.assert_no_snapshots();
 }
 
 /// M6: a woken guest's own connections get out at once, before anything has
@@ -2251,7 +2256,6 @@ fn a_parked_vm_whose_snapshot_is_gone_says_so_and_can_be_removed() {
     std::fs::rename(&hidden, &parked).expect("put the parked dir back");
     agent.spawn().expect("start the agent again");
     agent.assert_no_cirro_state();
-    agent.assert_no_snapshots();
 }
 
 /// A jail's files are its VMM's, so an escaped VMM could leave a symlink or
@@ -2308,7 +2312,6 @@ fn wake_refuses_a_snapshot_file_that_is_a_link_and_chowns_nothing() {
     agent.spawn().expect("start the agent again");
     agent.cirro().args(["rm", "planted"]).assert().success();
     agent.assert_no_cirro_state();
-    agent.assert_no_snapshots();
 }
 
 /// M6's exit: `cirro bench` boots, parks, wakes and removes a throwaway VM
@@ -2316,7 +2319,7 @@ fn wake_refuses_a_snapshot_file_that_is_a_link_and_chowns_nothing() {
 /// them, leaving nothing behind.
 #[test]
 fn bench_times_boot_park_and_wake_and_leaves_nothing() {
-    let Some(mut agent) = Agent::start(220) else {
+    let Some(agent) = Agent::start(220) else {
         return;
     };
     let output = stdout(
@@ -2345,7 +2348,6 @@ fn bench_times_boot_park_and_wake_and_leaves_nothing() {
     let ps = agent.ps(true);
     assert_eq!(ps.lines().count(), 1, "bench left VMs behind:\n{ps}");
     agent.assert_no_cirro_state();
-    agent.assert_no_snapshots();
 }
 
 /// Replacing the agent's binary on disk, as a rebuild or an upgrade does,
@@ -2480,7 +2482,7 @@ fn the_edge_routes_requests_by_hostname_to_the_apps_vm() {
 /// comes from the same woken guest, which carries on counting.
 #[test]
 fn requests_for_a_parked_app_wake_it_once_and_are_all_answered() {
-    let Some(mut agent) = Agent::start(215) else {
+    let Some(agent) = Agent::start(215) else {
         return;
     };
     run_app(&agent, "tally", "parked.test", &["/app/counter"]).success();
@@ -2525,7 +2527,6 @@ fn requests_for_a_parked_app_wake_it_once_and_are_all_answered() {
         .success();
     agent.cirro().args(["rm", "tally"]).assert().success();
     agent.assert_no_cirro_state();
-    agent.assert_no_snapshots();
 }
 
 /// The edge's clients are anyone on the internet, so a 503 for a wake that
@@ -2575,7 +2576,6 @@ fn a_503_for_a_failed_wake_keeps_the_nodes_error_from_the_client() {
     agent.spawn().expect("start the agent again");
     agent.cirro().args(["rm", "broken"]).assert().success();
     agent.assert_no_cirro_state();
-    agent.assert_no_snapshots();
 }
 
 /// The agent holds a request's whole body in memory before reading it as
@@ -2644,7 +2644,6 @@ fn requests_for_an_app_that_cant_wake_get_a_503_saying_why() {
     std::fs::rename(&hidden, &parked).expect("put the parked dir back");
     agent.spawn().expect("start the agent again");
     agent.assert_no_cirro_state();
-    agent.assert_no_snapshots();
 }
 
 /// M7: an App run with `--idle-park` is parked once no request has come
@@ -2653,7 +2652,7 @@ fn requests_for_an_app_that_cant_wake_get_a_503_saying_why() {
 /// snapshot never share random numbers.
 #[test]
 fn an_idle_app_is_parked_and_the_next_request_wakes_it_reseeded() {
-    let Some(mut agent) = Agent::start(213) else {
+    let Some(agent) = Agent::start(213) else {
         return;
     };
     let printed = stdout(
@@ -2715,7 +2714,6 @@ fn an_idle_app_is_parked_and_the_next_request_wakes_it_reseeded() {
         .success();
     agent.cirro().args(["rm", "tally"]).assert().success();
     agent.assert_no_cirro_state();
-    agent.assert_no_snapshots();
 }
 
 /// `curl` over HTTPS to the agent's TLS edge for `host`, trusting only the
