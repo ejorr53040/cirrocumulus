@@ -14,9 +14,7 @@ pub struct Config {
     /// `KEY=VALUE` entries; see `launch::app_env` for the defaults added.
     #[serde(default)]
     pub env: Vec<String>,
-    #[serde(default)]
     pub workdir: Option<String>,
-    #[serde(default)]
     pub user: Option<User>,
 }
 
