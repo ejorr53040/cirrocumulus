@@ -114,18 +114,25 @@ fn policy_script(subnet: &str, egress_iface: Option<&str>, ipv6: bool) -> String
     script
 }
 
-/// Whether the policy's `ip cirro` table is in the kernel. The agent checks
-/// every second and reapplies the policy when it's gone, since a flushed
-/// ruleset would otherwise leave VMs unfiltered until the next restart.
+/// Whether both of the policy's tables are in the kernel (`ip6 cirro` only
+/// where the kernel has IPv6). The agent checks every second and reapplies
+/// the policy when either is gone, since a flushed ruleset would otherwise
+/// leave VMs unfiltered until the next restart. One `nft` run per check.
 pub(crate) fn policy_in_place() -> io::Result<bool> {
-    match cmd::run(
-        Command::new("nft").args(["list", "table", "ip", TABLE]),
-        None,
-    ) {
-        Ok(_) => Ok(true),
-        Err(e) if e.to_string().contains("No such file or directory") => Ok(false),
-        Err(e) => Err(e),
-    }
+    let tables = cmd::run(Command::new("nft").args(["list", "tables"]), None)?;
+    Ok(tables_in_place(
+        &String::from_utf8_lossy(&tables),
+        Path::new(IPV6_SYSCTLS).exists(),
+    ))
+}
+
+fn tables_in_place(listing: &str, ipv6: bool) -> bool {
+    let has = |family: &str| {
+        listing
+            .lines()
+            .any(|l| l.trim() == format!("table {family} {TABLE}"))
+    };
+    has("ip") && (!ipv6 || has("ip6"))
 }
 
 /// Removes the whole egress policy. For `cirro node uninstall`; the agent
@@ -221,6 +228,19 @@ fn nft(args: &[&str], stdin: Option<&str>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_policy_is_in_place_only_with_both_its_tables() {
+        let both = "table ip filter\ntable ip cirro\ntable ip6 cirro\n";
+        assert!(tables_in_place(both, true));
+        // A flush of only the IPv6 rules leaves VMs' IPv6 unfiltered.
+        assert!(!tables_in_place("table ip cirro\ntable ip6 filter\n", true));
+        assert!(tables_in_place("table ip cirro\n", false));
+        assert!(!tables_in_place(
+            "table ip cirrocumulus\ntable ip6 cirro\n",
+            true
+        ));
+    }
 
     #[test]
     fn node_subnets_are_read_from_a_listing_that_wraps() {

@@ -263,6 +263,8 @@ struct Agent {
     /// Console logs, one per start, kept with the Ended VM record.
     logs_dir: PathBuf,
     parked_dir: PathBuf,
+    /// Snapshots `rm` is still deleting; `shutdown` waits for them.
+    deleting: Mutex<tokio::task::JoinSet<()>>,
     vms: Mutex<BTreeMap<String, Entry>>,
     store: Arc<Mutex<Store>>,
     /// Numbers each VM start's console log file.
@@ -357,6 +359,7 @@ pub async fn run(config: Config) -> io::Result<()> {
         subnet: config.subnet,
         logs_dir: logs_dir.clone(),
         parked_dir,
+        deleting: Mutex::new(tokio::task::JoinSet::new()),
         vms: Mutex::new(BTreeMap::new()),
         store: store.clone(),
         next_log: AtomicU64::new(next_log_number(&logs_dir)),
@@ -1402,10 +1405,14 @@ impl Agent {
             Some(Entry::Ended { info, log }) => {
                 // The snapshot leaves `parked/` before its record does, so a
                 // wake never finds one half removed. It's deleted once the VM
-                // table is released.
+                // table is released, under a name of its own: an earlier
+                // snapshot of the same name may still be going.
                 let parked = is_parked(info);
                 let snapshot = self.parked_dir.join(name);
-                let trash = self.parked_dir.join(format!(".rm-{name}"));
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos());
+                let trash = self.parked_dir.join(format!(".rm-{name}-{stamp}"));
                 if parked {
                     match std::fs::rename(&snapshot, &trash) {
                         Err(e) if e.kind() != io::ErrorKind::NotFound => {
@@ -1424,11 +1431,19 @@ impl Agent {
                 let _ = std::fs::remove_file(log);
                 vms.remove(name);
                 drop(vms);
-                if parked
-                    && let Err(e) = std::fs::remove_dir_all(&trash)
-                    && e.kind() != io::ErrorKind::NotFound
-                {
-                    warn!(path = %trash.display(), "remove the snapshot: {e}");
+                // Up to a whole guest's memory: off the runtime, and not
+                // waited for here. `shutdown` waits; an agent that dies first
+                // leaves the `.rm-*` dir for the startup sweep.
+                if parked {
+                    let mut deleting = self.deleting.lock().unwrap();
+                    while deleting.try_join_next().is_some() {}
+                    deleting.spawn_blocking(move || {
+                        if let Err(e) = std::fs::remove_dir_all(&trash)
+                            && e.kind() != io::ErrorKind::NotFound
+                        {
+                            warn!(path = %trash.display(), "remove the snapshot: {e}");
+                        }
+                    });
                 }
                 Ok(())
             }
@@ -1459,6 +1474,8 @@ impl Agent {
             }
             settled.await;
         }
+        let mut deleting = std::mem::take(&mut *self.deleting.lock().unwrap());
+        while deleting.join_next().await.is_some() {}
         // Only succeed once empty, so a jail still in use is never removed.
         let _ = std::fs::remove_dir(self.node.jails());
         let _ = std::fs::remove_dir(&self.node.jail_base);
