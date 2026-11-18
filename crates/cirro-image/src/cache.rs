@@ -11,7 +11,7 @@ use crate::{Error, Flattened, err};
 use oci_client::client::{ClientConfig, ClientProtocol};
 use oci_client::config::ConfigFile;
 use oci_client::errors::{OciDistributionError, OciErrorCode};
-use oci_client::manifest::OciManifest;
+use oci_client::manifest::{OciImageManifest, OciManifest};
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 use serde::{Deserialize, Serialize};
@@ -174,59 +174,10 @@ impl ImageCache {
     /// image, unless it's cached already.
     async fn fetch(&self, reference: &Reference, init: &[u8]) -> Result<String, Error> {
         let client = self.client();
-        let auth = RegistryAuth::Anonymous;
-        let (manifest, digest) = client
-            .pull_manifest(reference, &auth)
-            .await
-            .map_err(|e| pull_error(reference, &reference.to_string(), e))?;
-        // An index costs a second request only when its image isn't cached.
-        let (manifest, digest) = match manifest {
-            OciManifest::Image(manifest) => (manifest, digest),
-            OciManifest::ImageIndex(index) => {
-                let entry = index.manifests.iter().find(|m| {
-                    m.platform
-                        .as_ref()
-                        .is_some_and(|p| platform(&p.os, &p.architecture) == PLATFORM)
-                });
-                let Some(digest) = entry.map(|m| m.digest.clone()) else {
-                    let found: Vec<String> = index
-                        .manifests
-                        .iter()
-                        .filter_map(|m| m.platform.as_ref())
-                        .map(|p| platform(&p.os, &p.architecture))
-                        // Attestation manifests, not images.
-                        .filter(|p| p != "unknown/unknown")
-                        .collect();
-                    return Err(Error(format!(
-                        "{reference} has no {PLATFORM} image, only {}",
-                        found.join(", ")
-                    )));
-                };
-                // The registry's own words, about to name a file in the cache.
-                let hex = digest.strip_prefix("sha256:").unwrap_or("");
-                if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    return Err(Error(format!(
-                        "{reference}'s {PLATFORM} entry {digest:?} isn't a digest (sha256:<64 hex>)"
-                    )));
-                }
-                if self.cached(&digest)?.is_some() {
-                    return Ok(digest);
-                }
-                let image = reference.clone_with_digest(digest.clone());
-                match client.pull_manifest(&image, &auth).await {
-                    Ok((OciManifest::Image(manifest), _)) => (manifest, digest),
-                    Ok((OciManifest::ImageIndex(_), _)) => {
-                        return Err(Error(format!(
-                            "{reference}'s {PLATFORM} entry is another index, not an image"
-                        )));
-                    }
-                    Err(e) => return Err(pull_error(reference, &image.to_string(), e)),
-                }
-            }
-        };
-        if self.cached(&digest)?.is_some() {
+        let (digest, manifest) = self.resolve(&client, reference).await?;
+        let Some(manifest) = manifest else {
             return Ok(digest);
-        }
+        };
         if manifest
             .layers
             .iter()
@@ -289,6 +240,66 @@ impl ImageCache {
         std::fs::rename(&built, &rootfs)
             .map_err(|e| err(&format!("move the rootfs to {}", rootfs.display()), e))?;
         Ok(digest)
+    }
+
+    /// `reference`'s `linux/amd64` image manifest digest and, unless that
+    /// image is cached, its manifest. A cached tag costs one manifest
+    /// request, or two for an index.
+    async fn resolve(
+        &self,
+        client: &Client,
+        reference: &Reference,
+    ) -> Result<(String, Option<OciImageManifest>), Error> {
+        let auth = RegistryAuth::Anonymous;
+        let (manifest, digest) = client
+            .pull_manifest(reference, &auth)
+            .await
+            .map_err(|e| pull_error(reference, &reference.to_string(), e))?;
+        let manifest = match manifest {
+            OciManifest::Image(manifest) => manifest,
+            OciManifest::ImageIndex(index) => {
+                let entry = index.manifests.iter().find(|m| {
+                    m.platform
+                        .as_ref()
+                        .is_some_and(|p| platform(&p.os, &p.architecture) == PLATFORM)
+                });
+                let Some(digest) = entry.map(|m| m.digest.clone()) else {
+                    let found: Vec<String> = index
+                        .manifests
+                        .iter()
+                        .filter_map(|m| m.platform.as_ref())
+                        .map(|p| platform(&p.os, &p.architecture))
+                        // Attestation manifests, not images.
+                        .filter(|p| p != "unknown/unknown")
+                        .collect();
+                    return Err(Error(format!(
+                        "{reference} has no {PLATFORM} image, only {}",
+                        found.join(", ")
+                    )));
+                };
+                // The registry's own words, about to name a file in the cache.
+                let hex = digest.strip_prefix("sha256:").unwrap_or("");
+                if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(Error(format!(
+                        "{reference}'s {PLATFORM} entry {digest:?} isn't a digest (sha256:<64 hex>)"
+                    )));
+                }
+                // An index costs a second request only when its image isn't cached.
+                if self.cached(&digest)?.is_some() {
+                    return Ok((digest, None));
+                }
+                let image = reference.clone_with_digest(digest.clone());
+                return match client.pull_manifest(&image, &auth).await {
+                    Ok((OciManifest::Image(manifest), _)) => Ok((digest, Some(manifest))),
+                    Ok((OciManifest::ImageIndex(_), _)) => Err(Error(format!(
+                        "{reference}'s {PLATFORM} entry is another index, not an image"
+                    ))),
+                    Err(e) => Err(pull_error(reference, &image.to_string(), e)),
+                };
+            }
+        };
+        let cached = self.cached(&digest)?.is_some();
+        Ok((digest, (!cached).then_some(manifest)))
     }
 
     /// The image built from manifest `digest`, if it's in the cache. The
