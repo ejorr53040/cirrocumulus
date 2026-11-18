@@ -325,8 +325,13 @@ impl ImageCache {
 
     /// How `reference`'s registry wants pulls authenticated. A registry that
     /// challenges for a bearer token gets one from the realm it names, if that
-    /// realm is on its own domain (see [`allowed_realm`]). Anything else is
-    /// anonymous, as it always was.
+    /// realm is its own (see [`allowed_realm`]).
+    ///
+    /// It is always a bearer token, empty when the probe got no challenge:
+    /// with anything else oci-client probes again and fetches a token from
+    /// whatever realm that second answer names, unchecked, so a registry
+    /// that challenged only oci-client's probe would pick the realm itself.
+    /// A registry that wants no token ignores the empty one.
     async fn registry_auth(&self, reference: &Reference) -> Result<RegistryAuth, Error> {
         let registry = reference.resolve_registry();
         let scheme = if self.plain_http.iter().any(|r| r == registry) {
@@ -348,7 +353,7 @@ impl ImageCache {
             .iter()
             .find_map(bearer_challenge);
         let Some((realm, service)) = challenge else {
-            return Ok(RegistryAuth::Anonymous);
+            return Ok(RegistryAuth::Bearer(String::new()));
         };
         let Some(realm) = allowed_realm(&probe, &realm) else {
             return Err(Error(format!(

@@ -33,6 +33,9 @@ struct Content {
     failure: Option<(String, u16, String)>,
     /// The realm a bearer challenge names; set by `challenge`.
     challenge: Option<String>,
+    /// The realm a bearer challenge names from the second request on, so
+    /// cirro's own probe gets none; set by `challenge_after_the_probe`.
+    late_challenge: Option<String>,
 }
 
 pub(super) struct Registry {
@@ -158,6 +161,13 @@ impl Registry {
         self.content.lock().unwrap().challenge = Some(realm.to_string());
     }
 
+    /// Like `challenge`, but lets the first request (cirro's own `/v2/`
+    /// probe) through unchallenged, as a registry that tells one client from
+    /// another could.
+    pub(super) fn challenge_after_the_probe(&self, realm: &str) {
+        self.content.lock().unwrap().late_challenge = Some(realm.to_string());
+    }
+
     /// Replaces the bytes served for blob `digest`, keeping its digest.
     pub(super) fn corrupt_blob(&self, digest: &str) {
         let mut content = self.content.lock().unwrap();
@@ -214,7 +224,12 @@ fn serve(stream: TcpStream, content: &Mutex<Content>) {
         .to_string();
     let mut content = content.lock().unwrap();
     content.requests.push(path.clone());
-    let challenge = content.challenge.clone();
+    let challenge = content.challenge.clone().or_else(|| {
+        content
+            .late_challenge
+            .clone()
+            .filter(|_| content.requests.len() > 1)
+    });
     if let Some((status, headers, body)) =
         challenge.and_then(|realm| challenged(&path, authorization.as_deref(), &realm))
     {

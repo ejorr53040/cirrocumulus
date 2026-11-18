@@ -382,6 +382,24 @@ fn a_realm_on_another_host_is_refused_without_a_request() {
     );
 }
 
+/// A registry that lets cirro's own probe through unchallenged and then
+/// challenges the pull itself still gets no token fetched from its realm:
+/// cirro alone decides where a token comes from.
+#[test]
+fn a_challenge_held_back_from_the_probe_fetches_no_token() {
+    let (registry, _) = registry_with_app();
+    let port = registry.host.rsplit(':').next().unwrap();
+    registry.challenge_after_the_probe(&format!("http://localhost:{port}/token"));
+
+    assert!(pull(&cache(&registry), &format!("{}/app:v1", registry.host)).is_err());
+
+    assert!(
+        !registry.requests().iter().any(|p| p.starts_with("/token")),
+        "a token was fetched from the held-back realm: {:?}",
+        registry.requests()
+    );
+}
+
 /// A redirect from the realm is not followed to wherever it points.
 #[test]
 fn a_realm_that_redirects_is_not_followed() {
