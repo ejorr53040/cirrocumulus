@@ -117,10 +117,10 @@ any host path as a rootfs; it now opens the rootfs as the caller, #14), three
 Mediums (resource bounds checked only in the CLI, an unverified guest kernel
 download, an unsigned demo package install), all fixed, though the demo's
 `apk.static`, the tool that checks those packages' signatures, is itself
-still fetched over TLS with no checksum. Two Lows are still open
-(the development sudoers rule's breadth, and `jailer::Jail`, which only
-the step 0 tests use, with its own `sudo` call; the other unused module is
-gone). The OCI layer parser and guest-init's config parser have
+still fetched over TLS with no checksum. The two Lows, the development
+sudoers rule's breadth and an unused privileged `jailer` module with its own
+`sudo` call, are closed: the rule and the jailed step 0 boot that needed it
+are gone, and so are both unused modules. The OCI layer parser and guest-init's config parser have
 been fuzzed for minutes, not days ([fuzz/README.md](https://github.com/ejorr53040/cirrocumulus/blob/main/fuzz/README.md)),
 with nothing found.
 

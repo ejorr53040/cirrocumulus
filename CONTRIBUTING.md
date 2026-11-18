@@ -25,8 +25,8 @@ scripts/ci/install-hooks.sh   # once: commit-msg and pre-push hooks
 scripts/ci/local.sh           # the gates CI runs
 ```
 
-The tests that boot real Firecracker VMs (`crates/cirro/tests/node_agent.rs`
-and `crates/cirro-node/tests/`) need `/dev/kvm`, the kernel from `scripts/step0/fetch_kernel.sh`, and one
+The tests that boot real Firecracker VMs (`crates/cirro/tests/node_agent.rs`)
+need `/dev/kvm`, the kernel from `scripts/step0/fetch_kernel.sh`, and one
 sudoers rule described at the top of that file. They skip, rather than fail,
 without them, and CI only compiles them, so run them before sending a change
 that touches VMs. New behaviour gets a test there, written first.

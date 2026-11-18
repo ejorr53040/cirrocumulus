@@ -18,7 +18,7 @@ use std::time::Duration;
 /// A non-2xx response from the Firecracker API, or a transport failure
 /// talking to it at all.
 #[derive(Debug)]
-pub enum Error {
+pub(crate) enum Error {
     /// Couldn't even reach the API socket (e.g. Firecracker isn't up yet,
     /// or the path is wrong).
     Connect(String),
@@ -53,25 +53,25 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// What `boot` needs to bring a VM up, matching the fields
 /// `run_plain.sh` passes to `/machine-config`, `/boot-source` and
 /// `/drives/rootfs`.
-pub struct BootConfig {
-    pub kernel_image_path: PathBuf,
-    pub boot_args: String,
-    pub rootfs_path: PathBuf,
-    pub vcpu_count: u8,
-    pub mem_size_mib: u32,
+pub(crate) struct BootConfig {
+    pub(crate) kernel_image_path: PathBuf,
+    pub(crate) boot_args: String,
+    pub(crate) rootfs_path: PathBuf,
+    pub(crate) vcpu_count: u8,
+    pub(crate) mem_size_mib: u32,
 }
 
 /// A connection to one Firecracker instance's API socket. Cheap to clone
 /// (the underlying `hyper_util` client is itself a cheap handle), but
 /// there's only ever one Firecracker process per socket path, so callers
 /// typically just make one and use it for that VM's whole lifetime.
-pub struct Client {
+pub(crate) struct Client {
     inner: HyperClient<hyperlocal::UnixConnector, Full<Bytes>>,
     socket_path: PathBuf,
 }
 
 impl Client {
-    pub fn new(socket_path: impl Into<PathBuf>) -> Self {
+    pub(crate) fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             inner: HyperClient::unix(),
             socket_path: socket_path.into(),
@@ -145,7 +145,11 @@ impl Client {
     /// VM as a network interface, per RESEARCH.md M3 slice 2. Must be called before `boot`
     /// -- like `/drives/rootfs`, `/network-interfaces/{iface_id}` is static
     /// device config the API only accepts pre-boot.
-    pub async fn attach_tap(&self, iface_id: &str, host_dev_name: &str) -> Result<(), Error> {
+    pub(crate) async fn attach_tap(
+        &self,
+        iface_id: &str,
+        host_dev_name: &str,
+    ) -> Result<(), Error> {
         self.put(
             &format!("/network-interfaces/{iface_id}"),
             serde_json::json!({
@@ -158,7 +162,7 @@ impl Client {
 
     /// Adds a vsock device whose host end is a Unix socket at `uds_path`
     /// (inside the jail, when jailed). Pre-boot only, like `attach_tap`.
-    pub async fn attach_vsock(&self, guest_cid: u32, uds_path: &str) -> Result<(), Error> {
+    pub(crate) async fn attach_vsock(&self, guest_cid: u32, uds_path: &str) -> Result<(), Error> {
         self.put(
             "/vsock",
             serde_json::json!({
@@ -171,7 +175,7 @@ impl Client {
 
     /// Presses Ctrl-Alt-Del in the guest (`SendCtrlAltDel`), which
     /// guest-init turns into SIGTERM for its command. Post-boot only.
-    pub async fn send_ctrl_alt_del(&self) -> Result<(), Error> {
+    pub(crate) async fn send_ctrl_alt_del(&self) -> Result<(), Error> {
         self.put(
             "/actions",
             serde_json::json!({"action_type": "SendCtrlAltDel"}),
@@ -180,13 +184,13 @@ impl Client {
     }
 
     /// Pauses the guest's vCPUs, as a snapshot needs. Post-boot only.
-    pub async fn pause(&self) -> Result<(), Error> {
+    pub(crate) async fn pause(&self) -> Result<(), Error> {
         self.set_vm_state("Paused").await
     }
 
     /// Lets a paused guest's vCPUs run again (Firecracker's `Resumed`
     /// state; nothing to do with waking a parked VM).
-    pub async fn resume(&self) -> Result<(), Error> {
+    pub(crate) async fn resume(&self) -> Result<(), Error> {
         self.set_vm_state("Resumed").await
     }
 
@@ -198,7 +202,7 @@ impl Client {
     /// Writes a full snapshot of a paused VM: its device state to `vmstate`
     /// and its guest memory to `mem` (paths as Firecracker sees them, so
     /// inside the jail).
-    pub async fn create_snapshot(&self, vmstate: &str, mem: &str) -> Result<(), Error> {
+    pub(crate) async fn create_snapshot(&self, vmstate: &str, mem: &str) -> Result<(), Error> {
         self.put(
             "/snapshot/create",
             serde_json::json!({
@@ -215,7 +219,7 @@ impl Client {
     /// it. The memory file is mapped private, so the guest's writes never
     /// reach it. Every device the snapshot names must be where it was: the
     /// drive's file, the tap, the vsock socket's directory.
-    pub async fn load_snapshot(&self, vmstate: &str, mem: &str) -> Result<(), Error> {
+    pub(crate) async fn load_snapshot(&self, vmstate: &str, mem: &str) -> Result<(), Error> {
         self.put(
             "/snapshot/load",
             serde_json::json!({
@@ -231,7 +235,7 @@ impl Client {
     /// then `InstanceStart`. Other static device config (network, vsock)
     /// is pre-boot only too, so callers attach it ([`Client::attach_tap`],
     /// [`Client::attach_vsock`]) before calling this.
-    pub async fn boot(&self, config: &BootConfig) -> Result<(), Error> {
+    pub(crate) async fn boot(&self, config: &BootConfig) -> Result<(), Error> {
         self.put(
             "/machine-config",
             serde_json::json!({

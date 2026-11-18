@@ -71,13 +71,6 @@ else
     check "jailer binary" 1 "not executable at $jailer_bin"
 fi
 
-# --- passwordless root for jailer (jailer needs root: chroot, cgroups, chown of /dev/kvm and /dev/net/tun) ---
-if sudo -n "$jailer_bin" --version >/dev/null 2>&1; then
-    check "passwordless sudo for jailer" 0 "sudo -n $jailer_bin works"
-else
-    check "passwordless sudo for jailer" 1 "sudo -n $jailer_bin failed; jailer needs root to chroot/chown devices/set up cgroups"
-fi
-
 # --- guest tools needed to build a bootable rootfs ---
 if command -v busybox >/dev/null 2>&1; then
     check "busybox" 0 "$(busybox | head -1)"
