@@ -29,7 +29,7 @@
 //! given the VM address and the VMM's [`ProcessId`], and removes the host
 //! state of one that is gone or was never recorded with [`clean_up`].
 
-use crate::firecracker::{BootConfig, Client};
+use crate::firecracker::{BootConfig, Client, connect_beneath};
 pub(crate) use crate::process::ProcessId;
 use crate::subnet::Subnet;
 use cirro_guest_init::config::{CONFIG_PORT, Config as GuestConfig};
@@ -42,7 +42,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
@@ -110,8 +109,7 @@ pub(crate) struct NodeConfig {
     pub(crate) firecracker: PathBuf,
     pub(crate) jailer: PathBuf,
     pub(crate) kernel: PathBuf,
-    /// jailer's `--chroot-base-dir`. Must not be on a `nodev` mount, and must
-    /// be short enough that jail socket paths fit in a `sockaddr_un`.
+    /// jailer's `--chroot-base-dir`. Must not be on a `nodev` mount.
     pub(crate) jail_base: PathBuf,
     /// The Node's own address in the Node subnet (`.1`).
     pub(crate) node_address: Ipv4Addr,
@@ -199,7 +197,6 @@ pub(crate) struct Vm {
     /// links, NAT) are pushed after it starts.
     vmm: Option<Vmm>,
     undo: Vec<Undo>,
-    api_socket: PathBuf,
     /// The jail's root, where Firecracker's own `/` is.
     jail_root: PathBuf,
     console_log: PathBuf,
@@ -348,7 +345,6 @@ impl Vm {
         Vm {
             vmm: None,
             undo: Vec::new(),
-            api_socket: PathBuf::new(),
             jail_root: PathBuf::new(),
             console_log,
             process: None,
@@ -371,7 +367,6 @@ impl Vm {
                 cgroup: parent_cgroup().join(&id),
             }),
             undo: undo_steps(&node.jails(), &id),
-            api_socket: jail_root.join(API_SOCKET_IN_JAIL),
             jail_root,
             console_log,
             process: Some(process),
@@ -381,7 +376,7 @@ impl Vm {
     /// Lets the guest's vCPUs run again, for a VM taken back with `adopt`: an
     /// agent that died part-way through a park can leave its VM paused.
     pub(crate) async fn resume(&self) -> Result<(), Error> {
-        Client::new(&self.api_socket)
+        Client::new(&self.jail_root, API_SOCKET_IN_JAIL)
             .resume()
             .await
             .map_err(|e| err("resume the VM", e))
@@ -408,7 +403,7 @@ impl Vm {
     }
 
     async fn run_until_ended(&mut self, stops: &mut mpsc::Receiver<Stop>) -> EndReason {
-        let client = Client::new(&self.api_socket);
+        let client = Client::new(&self.jail_root, API_SOCKET_IN_JAIL);
         let console_log = self.console_log.clone();
         let jail_root = self.jail_root.clone();
         let vmm = self.vmm.as_mut().expect("a started VM has a VMM");
@@ -467,7 +462,6 @@ impl Vm {
             .host_steps(node, spec.vm_address, spec.mem_mib, spec.vcpus, false)
             .await?;
         let root = self.jail_root.clone();
-        let api_socket = self.api_socket.clone();
 
         // 5. Kernel and rootfs into the jail, then the devices.
         let kernel_in_jail = root.join("vmlinux");
@@ -498,7 +492,7 @@ impl Vm {
         std::os::unix::fs::chown(&rootfs_in_jail, Some(uid), Some(uid))
             .map_err(|e| err("chown rootfs in jail", e))?;
 
-        let client = Client::new(&api_socket);
+        let client = Client::new(&root, API_SOCKET_IN_JAIL);
         client
             .attach_tap("eth0", "tap0")
             .await
@@ -522,8 +516,7 @@ impl Vm {
             .map_err(|e| err("boot", e))?;
 
         // 6. guest-init's config over vsock, then the grace period.
-        self.deliver_config(&root.join(VSOCK_SOCKET_IN_JAIL), &spec.guest)
-            .await?;
+        self.deliver_config(&spec.guest).await?;
         let vmm = self.vmm.as_mut().expect("the VMM was just spawned");
         match tokio::time::timeout(START_GRACE, vmm.wait()).await {
             Err(_) => Ok(()),
@@ -548,7 +541,7 @@ impl Vm {
         // 6. Load and resume. The snapshot names the tap, the drive and the
         //    vsock socket by the same paths the first VM had.
         let [vmstate, mem, _] = WAKE_FILES;
-        Client::new(&self.api_socket)
+        Client::new(&self.jail_root, API_SOCKET_IN_JAIL)
             .load_snapshot(&format!("/{vmstate}"), &format!("/{mem}"))
             .await
             .map_err(|e| {
@@ -697,9 +690,9 @@ impl Vm {
         in_netns(&id, &["sysctl", "-qw", "net.ipv4.ip_forward=1"]).await?;
         nft_in(&id, &namespace_ruleset(vm_address)).await?;
 
-        // 4. Firecracker's API socket.
+        // 4. Firecracker's API socket. Only waited for here: every connect
+        //    to it goes through `connect_beneath`.
         let api_socket = root.join(API_SOCKET_IN_JAIL);
-        self.api_socket = api_socket.clone();
         let deadline = Instant::now() + API_SOCKET_TIMEOUT;
         while !api_socket.exists() {
             if let Some(status) = self.vmm_exit_status() {
@@ -726,7 +719,7 @@ impl Vm {
     /// listening, Firecracker drops the connection instead of answering
     /// `OK`, so this retries from scratch until [`CONFIG_TIMEOUT`], giving up
     /// early if the VM ends first.
-    async fn deliver_config(&mut self, vsock: &Path, guest: &GuestConfig) -> Result<(), Error> {
+    async fn deliver_config(&mut self, guest: &GuestConfig) -> Result<(), Error> {
         let config = serde_json::to_string(guest).expect("serialize guest-init's config");
         let deadline = Instant::now() + CONFIG_TIMEOUT;
         let mut last_error = String::from("never tried");
@@ -734,7 +727,7 @@ impl Vm {
             if let Some(status) = self.vmm_exit_status() {
                 return Err(self.ended_during_start(Some(status)));
             }
-            match try_deliver_config(vsock, &config).await {
+            match try_deliver_config(&self.jail_root, &config).await {
                 Ok(()) => return Ok(()),
                 Err(e) => last_error = e,
             }
@@ -1114,19 +1107,10 @@ fn namespace_ruleset(vm_address: Ipv4Addr) -> String {
     )
 }
 
-async fn try_deliver_config(vsock: &Path, config: &str) -> Result<(), String> {
-    use std::os::unix::fs::FileTypeExt;
-    // The socket is in the jail, which the VMM owns, and connect follows a
-    // symlink: one put in its place would send guest-init's config, as root,
-    // to whatever socket it names. A swap between this check and the
-    // connect is still possible.
-    let found = std::fs::symlink_metadata(vsock).map_err(|e| e.to_string())?;
-    if !found.file_type().is_socket() {
-        return Err(format!("{} isn't a socket", vsock.display()));
-    }
-    let stream = UnixStream::connect(vsock)
+async fn try_deliver_config(jail_root: &Path, config: &str) -> Result<(), String> {
+    let stream = connect_beneath(jail_root, VSOCK_SOCKET_IN_JAIL)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{VSOCK_SOCKET_IN_JAIL}: {e}"))?;
     let mut stream = BufReader::new(stream);
     stream
         .get_mut()

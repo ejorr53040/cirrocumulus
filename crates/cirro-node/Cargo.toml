@@ -15,7 +15,6 @@ bytes.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
-hyperlocal.workspace = true
 nix = { workspace = true, features = ["fs", "process", "signal", "socket", "uio", "user"] }
 rusqlite.workspace = true
 serde_json.workspace = true
