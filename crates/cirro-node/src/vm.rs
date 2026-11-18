@@ -30,7 +30,7 @@
 //! state of one that is gone or was never recorded with [`clean_up`].
 
 use crate::firecracker::{BootConfig, Client, connect_beneath};
-pub(crate) use crate::process::ProcessId;
+use crate::process::ProcessId;
 use crate::subnet::Subnet;
 use cirro_guest_init::config::{CONFIG_PORT, Config as GuestConfig};
 use cirro_proto::{CONSOLE_LOG_CAP, EndReason};
@@ -296,6 +296,25 @@ pub(crate) fn parent_cgroup_under(root: &Path) -> PathBuf {
     root.join("sys/fs/cgroup").join(PARENT_CGROUP)
 }
 
+/// The most threads a VM's Firecracker may run: its API thread, its VMM
+/// thread and one per vCPU (at most 32, see cirro-proto). Caps what an
+/// escaped VMM can fork inside its own cgroup.
+const PIDS_MAX: u32 = 64;
+
+/// The `--cgroup` settings for a VM's own cgroup: jailer's memory and cpu
+/// limits, a cap on its threads, and no swap. Without `memory.swap.max=0`,
+/// the guest memory that doesn't fit in RAM would spill to host swap with no
+/// bound.
+fn cgroup_settings(mem_mib: u32, vcpus: u8) -> Vec<String> {
+    let memory_max = (u64::from(mem_mib) + VMM_OVERHEAD_MIB) * 1024 * 1024;
+    vec![
+        format!("memory.max={memory_max}"),
+        "memory.swap.max=0".to_string(),
+        format!("cpu.max={} 100000", u32::from(vcpus) * 100_000),
+        format!("pids.max={PIDS_MAX}"),
+    ]
+}
+
 impl Vm {
     /// Brings up the VM described by `spec`, returning once guest-init has
     /// its config and the VM has stayed up for a 2 s grace period. On failure,
@@ -463,32 +482,43 @@ impl Vm {
             .await?;
         let root = self.jail_root.clone();
 
-        // 5. Kernel and rootfs into the jail, then the devices.
+        // 5. Kernel and rootfs into the jail, then the devices. The copies
+        //    move real bytes, so they run off the runtime's workers.
+        let kernel = node.kernel.clone();
+        // Copies from a dup of the fd the agent already opened as the caller
+        // (#14), never the path again. The dup shares its offset, still 0.
+        let rootfs = spec
+            .rootfs_file
+            .try_clone()
+            .map_err(|e| err("copy rootfs into jail", e))?;
+        let rootfs_path = spec.rootfs.clone();
         let kernel_in_jail = root.join("vmlinux");
-        if std::fs::hard_link(&node.kernel, &kernel_in_jail).is_err() {
-            std::fs::copy(&node.kernel, &kernel_in_jail)
-                .map_err(|e| err("copy kernel into jail", e))?;
-        }
         let rootfs_in_jail = root.join("rootfs.ext4");
-        // 0600 from the moment it exists: it's the guest's disk, and the
-        // chown below gives it only an owner, not a mode.
-        let mut rootfs_dest = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&rootfs_in_jail)
-            .map_err(|e| err("create rootfs in jail", e))?;
-        // Copies from the fd the agent already opened as the caller (#14),
-        // never the path again: `&File` reads from its current offset (0,
-        // since nothing has read it yet), and `io::copy` specializes
-        // File-to-File on Linux via `copy_file_range`.
-        std::io::copy(&mut &spec.rootfs_file, &mut rootfs_dest).map_err(|e| {
-            err(
-                &format!("copy rootfs {} into jail", spec.rootfs.display()),
-                e,
-            )
-        })?;
+        let (kernel_dest, rootfs_dest) = (kernel_in_jail.clone(), rootfs_in_jail.clone());
+        tokio::task::spawn_blocking(move || -> Result<(), Error> {
+            if std::fs::hard_link(&kernel, &kernel_dest).is_err() {
+                std::fs::copy(&kernel, &kernel_dest)
+                    .map_err(|e| err("copy kernel into jail", e))?;
+            }
+            // 0600 from the moment it exists: it's the guest's disk, and the
+            // chown below gives it only an owner, not a mode.
+            let mut dest = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&rootfs_dest)
+                .map_err(|e| err("create rootfs in jail", e))?;
+            std::io::copy(&mut &rootfs, &mut dest).map_err(|e| {
+                err(
+                    &format!("copy rootfs {} into jail", rootfs_path.display()),
+                    e,
+                )
+            })?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| err("copy into jail", e))??;
         std::os::unix::fs::chown(&rootfs_in_jail, Some(uid), Some(uid))
             .map_err(|e| err("chown rootfs in jail", e))?;
 
@@ -609,8 +639,7 @@ impl Vm {
             .map_err(|e| err("create console log", e))?;
         std::os::unix::fs::chown(&self.console_log, Some(0), Some(node.cirro_gid))
             .map_err(|e| err("chown console log", e))?;
-        let memory_max = (u64::from(mem_mib) + VMM_OVERHEAD_MIB) * 1024 * 1024;
-        let cpu_max = format!("cpu.max={} 100000", u32::from(vcpus) * 100_000);
+        let cgroup = cgroup_settings(mem_mib, vcpus);
         let child = Command::new(&node.jailer)
             .arg("--id")
             .arg(&id)
@@ -622,10 +651,11 @@ impl Vm {
             .arg("--netns")
             .arg(Path::new(NETNS_DIR).join(&id))
             .args(["--cgroup-version", "2", "--parent-cgroup", PARENT_CGROUP])
-            .arg("--cgroup")
-            .arg(format!("memory.max={memory_max}"))
-            .arg("--cgroup")
-            .arg(cpu_max)
+            .args(
+                cgroup
+                    .iter()
+                    .flat_map(|setting| ["--cgroup", setting.as_str()]),
+            )
             // No `kill_on_drop`: the VMM outlives the agent (ADR 0002).
             .stdin(Stdio::null())
             .stdout(
@@ -1258,6 +1288,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_vms_cgroup_caps_its_threads_and_swap() {
+        let settings = cgroup_settings(512, 2);
+        assert!(
+            settings.contains(&format!("pids.max={PIDS_MAX}")),
+            "{settings:?}"
+        );
+        assert!(
+            settings.contains(&"memory.swap.max=0".to_string()),
+            "{settings:?}"
+        );
+    }
+
+    #[test]
     fn a_failed_ip_batch_names_the_command_that_failed() {
         let commands = ["link set lo up".to_string(), "link set tap0 up".to_string()];
         let failed = Error(
@@ -1304,5 +1347,29 @@ mod tests {
         assert_eq!(trimmed.len(), contents.len() as u64, "offsets moved");
         assert!(console_tail_bytes(&log).ends_with("newest\n"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_host_id_maps_back_only_to_a_vm_address_in_its_own_subnet() {
+        let subnet: Subnet = "10.77.180.0/24".parse().unwrap();
+        let low16 = |a: &str| {
+            let [_, _, c, d] = a.parse::<Ipv4Addr>().unwrap().octets();
+            u16::from_be_bytes([c, d])
+        };
+        // The first and last VM addresses round-trip through their host ids.
+        for vm in ["10.77.180.2", "10.77.180.254"] {
+            let address: Ipv4Addr = vm.parse().unwrap();
+            assert_eq!(parse_host_id(&host_id(address)), Some(low16(vm)));
+            assert_eq!(subnet.vm_address_with_low16(low16(vm)), Some(address));
+        }
+        // `.0`, `.1` and the broadcast address are no VM's.
+        for not_a_vm in ["10.77.180.0", "10.77.180.1", "10.77.180.255"] {
+            assert_eq!(subnet.vm_address_with_low16(low16(not_a_vm)), None);
+        }
+        // The same low 16 bits under another third octet are another subnet's VM.
+        let other = parse_host_id(&host_id("10.77.181.2".parse().unwrap())).unwrap();
+        assert_eq!(subnet.vm_address_with_low16(other), None);
+        assert_eq!(parse_host_id("cirro-12345"), None);
+        assert_eq!(parse_host_id("cirro-zz00"), None);
     }
 }

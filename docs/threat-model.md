@@ -28,9 +28,10 @@ it validates every request itself instead of trusting the CLI.
 | Firecracker | A minimal VMM: virtio block, net, vsock and a serial console | Most VMM-escape paths that affect QEMU-class VMMs |
 | Firecracker seccomp filters | Restrict the VMM process's syscalls | A VMM escape getting a useful host syscall surface |
 | jailer | chroot, a mount namespace, a per-VM unprivileged uid. No PID namespace: the agent tracks the VMM by the pid it spawned, which jailer's `--new-pid-ns` fork would hide | An escaped VMM seeing the host filesystem or other VMs' files. It shares the Node's pids, but has no `/proc` to list them and may signal only its own uid |
+| Root's copies of firecracker, jailer, kernel and `cirro` (under the state dir's `release/` and `bin/`, both 0700) | The unit and the agent run copies install made, so whoever owns the source binary can't change what root runs | A local user swapping a binary that root runs at boot or agent restart |
 | Per-VM network namespace (ADR 0001) | The tap lives in the VM's own namespace, joined to the Node by a veth | An escaped VMM sniffing or spoofing another VM's raw traffic |
-| cgroup v2 | CPU and memory limits per VM; I/O is counted, not limited | One VM's CPU or memory use crowding out the others. Nothing yet caps the total memory or snapshot disk of all VMs on a Node (M11) |
-| nftables egress policy (`ip cirro`) | Masquerade out; drop SMTP, VM-to-VM and LAN destinations | Spam, lateral movement to the LAN, the host, or other VMs |
+| cgroup v2 | CPU and memory limits per VM, a cap of 64 threads, and no swap; I/O is counted, not limited | One VM's CPU, memory, threads or swap use crowding out the others. Nothing yet caps the total memory or snapshot disk of all VMs on a Node (M11) |
+| nftables egress policy (`ip cirro`) | Masquerade out; drop SMTP, VM-to-VM and LAN or reserved destinations; reapplied within a second if flushed | Spam, lateral movement to the LAN, the host, or other VMs |
 | No IPv6 from VMs (`ip6 cirro`, and IPv6 off on each VM's veth) | The Node drops every IPv6 packet a VM's namespace sends it | Reaching the Node's own services around the IPv4-only egress policy |
 | VMGenID | The guest kernel reseeds its RNG when a snapshot is restored | Two wakes of one snapshot sharing RNG output |
 

@@ -299,6 +299,7 @@ impl Drop for Settled {
 /// parked dir and the parent cgroup go only if nothing is left in them. The
 /// Node's egress policy is ensured first, and outlives the agent.
 pub async fn run(config: Config) -> io::Result<()> {
+    exit_on_panic();
     // The refusals below run before the agent changes anything on the
     // Node: a live socket is checked first (the fastest way to tell this
     // start is a mistake), then the other Node subnets on this host, then
@@ -418,6 +419,9 @@ pub async fn run(config: Config) -> io::Result<()> {
             every_second.tick().await;
             sampling.sample(&sampler);
             sampling.cap_console_logs();
+            if let Err(e) = ensure_policy_in_place(&sampling) {
+                warn!(%e, "check the Node's egress policy");
+            }
         }
     });
 
@@ -497,6 +501,32 @@ pub async fn run(config: Config) -> io::Result<()> {
     Ok(())
 }
 
+/// Reapplies the egress policy when it's gone from the kernel, checked
+/// every second: a flushed ruleset would otherwise leave VMs unfiltered
+/// until the next restart.
+fn ensure_policy_in_place(agent: &Agent) -> io::Result<()> {
+    if egress::policy_in_place()? {
+        return Ok(());
+    }
+    warn!("the Node's egress policy was gone, so reapplying it");
+    let iface = egress::default_route_iface();
+    egress::ensure_node_policy(&agent.subnet.to_string(), iface.as_deref())
+}
+
+/// Makes any panic end the agent's process, after the default hook has
+/// logged it. A panic can leave shared state half-updated (a VM's map entry
+/// without its store row, say), and a poisoned lock would then fail every
+/// later request until restart. systemd restarts the agent
+/// (`Restart=on-failure`); the VMs keep running (ADR 0002). `abort` would
+/// also dump the root process's memory, which holds the agent's SSH private key.
+fn exit_on_panic() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default(info);
+        std::process::exit(1);
+    }));
+}
+
 /// Refuses to start if `socket` already has a live listener, telling that
 /// apart from a socket file merely left behind by a crash (connecting to it
 /// finds no one home). Any other error connecting -- wrong file type at
@@ -547,13 +577,16 @@ impl Agent {
     /// Samples the Node and every running VM, for [`Agent::stats`].
     fn sample(&self, sampler: &Sampler) {
         let running: Vec<RunningVm> = self
-            .list(false)
-            .into_iter()
-            .filter_map(|info| {
-                Some(RunningVm {
+            .vms
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|entry| match entry {
+                Entry::Running { info, .. } => Some(RunningVm {
                     id: vm::host_id(info.vm_address?),
-                    name: info.name,
-                })
+                    name: info.name.clone(),
+                }),
+                _ => None,
             })
             .collect();
         // The kernel's files are read under neither the VM table's lock
@@ -739,9 +772,8 @@ impl Agent {
         Ok(())
     }
 
-    /// Reserves `name` and the lowest VM address no entry in `vms` holds as
-    /// [`Entry::Starting`], for a start or a wake, and gives back the entry
-    /// it replaced.
+    /// Reserves `name` and the lowest VM address no entry in `vms` holds,
+    /// for a start or a wake, and gives back the entry it replaced.
     fn reserve(
         &self,
         vms: &mut BTreeMap<String, Entry>,
@@ -1028,8 +1060,8 @@ impl Agent {
         Ok(info)
     }
 
-    /// Records `vm` as running and spawns its supervisor task, which records
-    /// it as ended once its host state is gone.
+    /// Puts `vm` in the VM table as running and spawns its supervisor task,
+    /// which records it as ended once its host state is gone.
     fn start_supervising(self: &Arc<Self>, info: VmInfo, log: PathBuf, vm: Vm) {
         let name = info.name.clone();
         let (stops_tx, stops_rx) = mpsc::channel(4);
@@ -1368,22 +1400,36 @@ impl Agent {
         match vms.get(name) {
             None => Err(no_such_vm(name)),
             Some(Entry::Ended { info, log }) => {
-                if is_parked(info) {
-                    let snapshot = self.parked_dir.join(name);
-                    match std::fs::remove_dir_all(&snapshot) {
+                // The snapshot leaves `parked/` before its record does, so a
+                // wake never finds one half removed. It's deleted once the VM
+                // table is released.
+                let parked = is_parked(info);
+                let snapshot = self.parked_dir.join(name);
+                let trash = self.parked_dir.join(format!(".rm-{name}"));
+                if parked {
+                    match std::fs::rename(&snapshot, &trash) {
                         Err(e) if e.kind() != io::ErrorKind::NotFound => {
                             return Err(internal(format!("remove the snapshot of {name:?}: {e}")));
                         }
                         _ => {}
                     }
                 }
-                self.store
-                    .lock()
-                    .unwrap()
-                    .delete(name)
-                    .map_err(|e| internal(format!("remove the record of {name:?}: {e}")))?;
+                let deleted = self.store.lock().unwrap().delete(name);
+                if let Err(e) = deleted {
+                    if parked {
+                        let _ = std::fs::rename(&trash, &snapshot);
+                    }
+                    return Err(internal(format!("remove the record of {name:?}: {e}")));
+                }
                 let _ = std::fs::remove_file(log);
                 vms.remove(name);
+                drop(vms);
+                if parked
+                    && let Err(e) = std::fs::remove_dir_all(&trash)
+                    && e.kind() != io::ErrorKind::NotFound
+                {
+                    warn!(path = %trash.display(), "remove the snapshot: {e}");
+                }
                 Ok(())
             }
             Some(_) => Err(ApiError(
@@ -1433,14 +1479,14 @@ fn app_with_host<'a>(
 /// The App a hostname belongs to. VMs and Machine-backed Apps share one
 /// namespace of names and hostnames.
 enum Owner {
-    Vm(String),
+    Vm { name: String, running: bool },
     Machine(String),
 }
 
 impl Owner {
     fn name(&self) -> &str {
         match self {
-            Owner::Vm(name) | Owner::Machine(name) => name,
+            Owner::Vm { name, .. } | Owner::Machine(name) => name,
         }
     }
 
@@ -1448,7 +1494,7 @@ impl Owner {
     /// it's VM-backed.
     fn taken(&self, host: &str) -> ApiError {
         let (owner, stop) = match self {
-            Owner::Vm(name) => (name, "stop and "),
+            Owner::Vm { name, running } => (name, if *running { "stop and " } else { "" }),
             Owner::Machine(name) => (name, ""),
         };
         ApiError(
@@ -1464,8 +1510,12 @@ impl Agent {
     /// The App whose Route has `host`, of either kind. `vms` is the VM
     /// table, held by the caller so no VM takes the hostname meanwhile.
     fn host_owner(&self, vms: &BTreeMap<String, Entry>, host: &str) -> Option<Owner> {
-        if let Some((name, _)) = app_with_host(vms, host) {
-            return Some(Owner::Vm(name.clone()));
+        if let Some((name, entry)) = app_with_host(vms, host) {
+            let running = matches!(entry, Entry::Starting { .. } | Entry::Running { .. });
+            return Some(Owner::Vm {
+                name: name.clone(),
+                running,
+            });
         }
         self.machines.app_with_host(host).map(Owner::Machine)
     }
@@ -1476,7 +1526,7 @@ impl Agent {
 fn validate_route(route: &Route) -> Result<(), ApiError> {
     let host = &route.host;
     if !cirro_edge::is_hostname(host) {
-        return Err(bad_request(&format!(
+        return Err(bad_request(format!(
             "{host:?} isn't a hostname: use lowercase letters, digits, hyphens and dots, \
              like web.example.com"
         )));
@@ -1580,7 +1630,7 @@ fn in_bounds<T: PartialOrd + std::fmt::Display>(
     if value >= min && value <= max {
         Ok(())
     } else {
-        Err(bad_request(&format!(
+        Err(bad_request(format!(
             "{field} must be between {min} and {max}, got {value}"
         )))
     }
@@ -1604,7 +1654,7 @@ fn guest_config(run: &RunRequest) -> Result<GuestConfig, ApiError> {
             .is_some_and(|(key, _)| !key.is_empty())
             && !entry.contains('\0');
         if !valid {
-            return Err(bad_request(&format!(
+            return Err(bad_request(format!(
                 "env entry {entry:?} must be KEY=VALUE with a non-empty KEY and no NUL bytes"
             )));
         }
@@ -1612,7 +1662,7 @@ fn guest_config(run: &RunRequest) -> Result<GuestConfig, ApiError> {
     if let Some(dir) = &run.workdir
         && (!dir.starts_with('/') || dir.contains('\0'))
     {
-        return Err(bad_request(&format!(
+        return Err(bad_request(format!(
             "workdir {dir:?} must be an absolute path with no NUL bytes"
         )));
     }
@@ -1696,6 +1746,26 @@ fn no_such_vm(name: &str) -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panic_ends_the_agent_process() {
+        // The hook exits the process, so the panic runs in a child: the test
+        // re-runs itself with the variable set.
+        if std::env::var_os("CIRRO_PANIC_CHILD").is_some() {
+            exit_on_panic();
+            panic!("boom");
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "agent::tests::a_panic_ends_the_agent_process",
+                "--nocapture",
+            ])
+            .env("CIRRO_PANIC_CHILD", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(1));
+    }
 
     #[test]
     fn a_log_is_read_a_chunk_at_a_time_from_the_offset() {

@@ -9,7 +9,7 @@
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
-use hyper::{Method, Request, StatusCode};
+use hyper::{Method, Request};
 use hyper_util::rt::TokioIo;
 use nix::fcntl::{OFlag, OpenHow, ResolveFlag};
 use nix::sys::stat::Mode;
@@ -18,27 +18,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::net::UnixStream;
 
-/// A non-2xx response from the Firecracker API, or a transport failure
-/// talking to it at all.
+/// A failed call to the Firecracker API: the request it was making and what
+/// went wrong, whether the socket was unreachable or the API refused it.
 #[derive(Debug)]
-pub(crate) enum Error {
-    /// Couldn't even reach the API socket (e.g. Firecracker isn't up yet,
-    /// or a link stands where the socket or a directory above it should).
-    Connect(String),
-    /// The API accepted the connection but rejected the request.
-    Request {
-        path: String,
-        status: StatusCode,
-        body: String,
-    },
-}
+pub(crate) struct Error(String);
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Connect(e) => write!(f, "connect to firecracker API socket: {e}"),
-            Error::Request { path, status, body } => write!(f, "{path} -> {status}: {body}"),
-        }
+        f.write_str(&self.0)
     }
 }
 
@@ -97,8 +84,8 @@ impl Client {
         tokio::time::timeout(limit, self.send_unbounded(method, path, body))
             .await
             .unwrap_or_else(|_| {
-                Err(Error::Connect(format!(
-                    "{path} went unanswered for {limit:?}"
+                Err(Error(format!(
+                    "firecracker API: {path} went unanswered for {limit:?}"
                 )))
             })
     }
@@ -121,10 +108,10 @@ impl Client {
 
         let stream = connect_beneath(&self.dir, self.socket)
             .await
-            .map_err(|e| Error::Connect(e.to_string()))?;
+            .map_err(|e| Error(format!("firecracker API socket: {e}")))?;
         let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
-            .map_err(|e| Error::Connect(format!("{e:?}")))?;
+            .map_err(|e| Error(format!("firecracker API: {e}")))?;
         // Dropping the set aborts the connection, so one whose request timed
         // out doesn't live on holding the VMM's socket.
         let mut connection_task = tokio::task::JoinSet::new();
@@ -132,7 +119,7 @@ impl Client {
         let response = sender
             .send_request(request)
             .await
-            .map_err(|e| Error::Connect(format!("{e:?}")))?;
+            .map_err(|e| Error(format!("firecracker API: {e}")))?;
 
         let status = response.status();
         if status.is_success() {
@@ -144,11 +131,10 @@ impl Client {
             .await
             .map(|c| c.to_bytes())
             .unwrap_or_default();
-        Err(Error::Request {
-            path: format!("{method} {path}"),
-            status,
-            body: String::from_utf8_lossy(&body_bytes).into_owned(),
-        })
+        Err(Error(format!(
+            "firecracker API: {method} {path} -> {status}: {}",
+            String::from_utf8_lossy(&body_bytes)
+        )))
     }
 
     /// Attaches a host tap device (already created and configured) to the
@@ -334,7 +320,7 @@ mod tests {
         let answer = tokio::time::timeout(Duration::from_secs(3600), asked).await;
 
         assert!(
-            matches!(answer, Ok(Err(Error::Connect(_)))),
+            matches!(answer, Ok(Err(_))),
             "a request Firecracker never answers should fail on its own: {answer:?}"
         );
         silent.abort();
@@ -378,7 +364,7 @@ mod tests {
             .send_ctrl_alt_del()
             .await;
         assert!(
-            matches!(api, Err(Error::Connect(_))),
+            api.is_err(),
             "a link in place of `run` should be refused: {api:?}"
         );
         for socket in ["v.sock", "../neighbour/run/firecracker.socket"] {

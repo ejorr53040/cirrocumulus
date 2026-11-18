@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 
 /// How many rates a [`Series`] keeps: a minute, sampled every second.
-pub(crate) const HISTORY: usize = 60;
+const HISTORY: usize = 60;
 
 /// A running VM to sample: its name, and the host id its cgroup and veth
 /// are named by.
@@ -24,7 +24,7 @@ pub(crate) struct RunningVm {
 
 /// A VM's counters at one moment. Each only grows, except `memory_bytes`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct VmSample {
+struct VmSample {
     /// CPU time the VMM has used, in microseconds.
     pub(crate) cpu_usec: u64,
     pub(crate) memory_bytes: u64,
@@ -37,7 +37,7 @@ pub(crate) struct VmSample {
 
 /// The Node's counters at one moment.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct NodeSample {
+struct NodeSample {
     /// Clock ticks every CPU spent busy, and in all, since boot.
     pub(crate) cpu_busy_ticks: u64,
     pub(crate) cpu_total_ticks: u64,
@@ -49,7 +49,7 @@ pub(crate) struct NodeSample {
 }
 
 /// Counters that turn into rates between two samples.
-pub(crate) trait Sample {
+trait Sample {
     type Rates;
     /// What was used per second since `earlier`, `elapsed` ago. A counter
     /// that went backwards reads as no activity.
@@ -99,7 +99,7 @@ impl Sample for NodeSample {
 }
 
 /// The last [`HISTORY`] rates of one Node or VM, oldest first.
-pub(crate) struct Series<S: Sample> {
+struct Series<S: Sample> {
     last: Option<(Instant, S)>,
     rates: VecDeque<S::Rates>,
 }
@@ -168,7 +168,7 @@ impl Sampler {
         Readings { node, vms }
     }
 
-    pub(crate) fn node(&self) -> io::Result<NodeSample> {
+    fn node(&self) -> io::Result<NodeSample> {
         let stat = read(&self.root.join("proc/stat"))?;
         // cpu user nice system idle iowait irq softirq steal guest guest_nice;
         // guest time is already counted in user, so it stops at steal.
@@ -222,7 +222,7 @@ impl Sampler {
     }
 
     /// The counters of the VM with host id `id`.
-    pub(crate) fn vm(&self, id: &str) -> io::Result<VmSample> {
+    fn vm(&self, id: &str) -> io::Result<VmSample> {
         let cgroup = vm::parent_cgroup_under(&self.root).join(id);
         let cpu_usec = field(&read(&cgroup.join("cpu.stat"))?, "usage_usec")?;
         let memory_bytes = number(&read(&cgroup.join("memory.current"))?)?;

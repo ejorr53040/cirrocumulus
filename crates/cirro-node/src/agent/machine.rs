@@ -292,7 +292,7 @@ impl Machines {
     /// The fingerprint of the host key the Machine at `ssh` presents, for
     /// `cirro machine add` to show before pinning it.
     pub(super) async fn scan(&self, ssh: &str) -> Result<String, ApiError> {
-        let target = Target::parse(ssh).map_err(|e| bad_request(&e))?;
+        let target = Target::parse(ssh).map_err(bad_request)?;
         fingerprint(&host_keys(&target).await?[0]).await
     }
 
@@ -300,7 +300,7 @@ impl Machines {
     /// with it, then records the Machine and connects to it.
     pub(super) async fn add(&self, add: AddMachine) -> Result<MachineInfo, ApiError> {
         super::validate_name("Machine", &add.name)?;
-        let target = Target::parse(&add.ssh).map_err(|e| bad_request(&e))?;
+        let target = Target::parse(&add.ssh).map_err(bad_request)?;
         let _adding = self.adding.lock().await;
         if self.entries.lock().unwrap().contains_key(&add.name) {
             return Err(ApiError(

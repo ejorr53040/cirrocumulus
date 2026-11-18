@@ -45,14 +45,14 @@ use std::process::Command;
 /// Where the kernel keeps its IPv6 settings, when it has IPv6 at all.
 pub(crate) const IPV6_SYSCTLS: &str = "/proc/sys/net/ipv6";
 
-/// The table's name, in the `ip` family, and in `ip6` for the one rule
+/// The table's name, in the `ip` family, and in `ip6` for its two drop rules
 /// there.
 const TABLE: &str = "cirro";
 
 /// Destinations VMs may not open connections to: private, carrier-grade
-/// NAT and link-local ranges, which covers the Node's LAN, other VMs and
-/// cloud metadata endpoints.
-const LAN_RANGES: &str = "10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16";
+/// NAT, link-local and reserved ranges, which covers the Node's LAN, other
+/// VMs, cloud metadata endpoints and the Azure host agent's address.
+const LAN_RANGES: &str = "0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 168.63.129.16/32, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/3";
 
 /// Makes the Node's egress policy cover `subnet` (a CIDR), masquerading it
 /// out of `egress_iface` when there is one. Safe to call again, from any
@@ -61,6 +61,15 @@ const LAN_RANGES: &str = "10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/
 /// scratch and adds to its sets, so it never duplicates a rule and never
 /// drops another agent's subnet.
 pub(crate) fn ensure_node_policy(subnet: &str, egress_iface: Option<&str>) -> io::Result<()> {
+    let ipv6 = Path::new(IPV6_SYSCTLS).exists();
+    nft(
+        &["-f", "-"],
+        Some(&policy_script(subnet, egress_iface, ipv6)),
+    )
+}
+
+/// The script [`ensure_node_policy`] applies. `ipv6` adds the `ip6` table.
+fn policy_script(subnet: &str, egress_iface: Option<&str>, ipv6: bool) -> String {
     let mut script = format!(
         "table ip {TABLE} {{\n\
          \tset node_subnets {{ type ipv4_addr; flags interval; }}\n\
@@ -90,7 +99,7 @@ pub(crate) fn ensure_node_policy(subnet: &str, egress_iface: Option<&str>) -> io
     // The policy above is IPv4's, and guests are given no IPv6, so the Node
     // takes none from a VM's veth. `vm` also turns IPv6 off on each veth,
     // which a later write to `net.ipv6.conf.all.disable_ipv6` would undo.
-    if Path::new(IPV6_SYSCTLS).exists() {
+    if ipv6 {
         script.push_str(&format!(
             "table ip6 {TABLE} {{\n\
              \tchain forward {{ type filter hook forward priority filter; policy accept; }}\n\
@@ -102,7 +111,21 @@ pub(crate) fn ensure_node_policy(subnet: &str, egress_iface: Option<&str>) -> io
              add rule ip6 {TABLE} input iifname \"{HOST_ID_PREFIX}*\" drop\n"
         ));
     }
-    nft(&["-f", "-"], Some(&script))
+    script
+}
+
+/// Whether the policy's `ip cirro` table is in the kernel. The agent checks
+/// every second and reapplies the policy when it's gone, since a flushed
+/// ruleset would otherwise leave VMs unfiltered until the next restart.
+pub(crate) fn policy_in_place() -> io::Result<bool> {
+    match cmd::run(
+        Command::new("nft").args(["list", "table", "ip", TABLE]),
+        None,
+    ) {
+        Ok(_) => Ok(true),
+        Err(e) if e.to_string().contains("No such file or directory") => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Removes the whole egress policy. For `cirro node uninstall`; the agent
@@ -228,5 +251,19 @@ mod tests {
         let listing = "\t\telements = { 10.77.0.0/24, 192.168.1.7 }\n";
         let err = parse_node_subnets(listing).unwrap_err().to_string();
         assert!(err.contains("192.168.1.7"), "{err}");
+    }
+
+    #[test]
+    fn the_policy_drops_reserved_ranges_too() {
+        let script = policy_script("10.77.0.0/24", Some("eth0"), false);
+        for range in [
+            "0.0.0.0/8",
+            "192.0.0.0/24",
+            "198.18.0.0/15",
+            "168.63.129.16/32",
+            "224.0.0.0/3",
+        ] {
+            assert!(script.contains(range), "{range} is not in the policy");
+        }
     }
 }

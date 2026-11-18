@@ -36,8 +36,8 @@ ARP timeout ([ADR 0005](adr/0005-fixed-tap-mac.md)).
 
 ## The egress policy
 
-One Node-wide nftables table, `ip cirro`, applies to every VM. It
-masquerades VMs' traffic out of the Node's default route, and drops:
+Two Node-wide nftables tables, `ip cirro` and `ip6 cirro`, apply to every VM.
+The `ip cirro` one masquerades VMs' traffic out of the Node's default route, and drops:
 
 - SMTP (TCP port 25), so a VM can't send mail straight to other mail
   servers from the Node's address. The submission ports (465, 587) stay
@@ -45,15 +45,19 @@ masquerades VMs' traffic out of the Node's default route, and drops:
   with;
 - traffic between VMs, which go through the edge or the internet like any
   other client;
-- traffic to private and link-local ranges (`10/8`, `100.64/10`,
-  `169.254/16`, `172.16/12`, `192.168/16`), so a VM can't reach a LAN on
-  those ranges, the `169.254.169.254` cloud metadata address, or the Node
-  itself. Other addresses aren't blocked: a Node whose LAN uses public
-  addresses, Azure's `168.63.129.16`, and the rarer reserved ranges are all
-  reachable. Per-VM allowlists come in M11;
+- traffic to private, link-local and reserved ranges (`0/8`, `10/8`,
+  `100.64/10`, `169.254/16`, `172.16/12`, `192.0.0.0/24`, `192.168/16`,
+  `198.18/15`, `224/3`) and Azure's `168.63.129.16`, so a VM can't reach a
+  LAN on those ranges, the `169.254.169.254` cloud metadata address, or the
+  Node itself. Other addresses aren't blocked: a Node whose LAN uses public
+  addresses is reachable. Per-VM allowlists come in M11;
 - new connections from VMs to the Node.
 - anything a VM sends from an address that isn't its own, since a guest can
   forge its source address and every rule above matches on it.
+
+The agent checks once a second that the `ip cirro` table is still in the
+kernel and reapplies the policy when it isn't, so a flushed ruleset is back
+within about a second.
 
 The table is IPv4's. Guests are given no IPv6 address and their namespaces
 don't forward IPv6. A second table, `ip6 cirro`, drops whatever IPv6 still

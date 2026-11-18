@@ -151,8 +151,8 @@ pub(super) fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
 
 pub(super) struct ApiError(pub(super) StatusCode, pub(super) String);
 
-pub(super) fn bad_request(message: &str) -> ApiError {
-    ApiError(StatusCode::BAD_REQUEST, message.to_string())
+pub(super) fn bad_request(message: impl Into<String>) -> ApiError {
+    ApiError(StatusCode::BAD_REQUEST, message.into())
 }
 
 pub(super) fn internal(message: String) -> ApiError {
@@ -174,10 +174,10 @@ pub(super) async fn read_json<T: serde::de::DeserializeOwned>(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!("the request body is over {MAX_BODY} bytes"),
             ),
-            None => bad_request(&format!("read request body: {e}")),
+            None => bad_request(format!("read request body: {e}")),
         })?
         .to_bytes();
-    serde_json::from_slice(&body).map_err(|e| bad_request(&format!("invalid request body: {e}")))
+    serde_json::from_slice(&body).map_err(|e| bad_request(format!("invalid request body: {e}")))
 }
 
 pub(super) fn no_content() -> ApiResponse {
