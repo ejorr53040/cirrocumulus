@@ -60,7 +60,9 @@ HTTP(S) to Apps by hostname.
 - **Docs.** [Threat model](docs/threat-model.md), [security
   policy](SECURITY.md), ADRs 0001–0009, and a docs site (mdBook, `docs/`).
 - **Releases.** Tagging `vX.Y.Z` builds `cirro` and publishes it with its
-  SHA-256; every crate is ready for `cargo publish --workspace`.
+  SHA-256 and a build-provenance attestation (`gh attestation verify`). The
+  tag's commit has to be on `main` and have passed CI, or the release is
+  refused; every crate is ready for `cargo publish --workspace`.
 - **Fuzzing.** cargo-fuzz targets for the OCI layer parser and guest-init's
   config ([fuzz/README.md](fuzz/README.md)).
 
