@@ -85,6 +85,14 @@ reference names it, until you remove it.
   checked as the bytes come in or as the tree is built, so a blob the manifest declares
   too big is refused before it's downloaded, and one that turns out bigger is cut off at
   its cap.
+- **A registry chooses where blobs come from.** Registries answer blob requests with a
+  redirect to their CDN (Docker Hub's goes to `production.cloudfront.docker.com`), so
+  `cirro` follows redirects to any host, as `docker pull` does, without the registry's
+  token. A hostile registry can therefore make a pull send a GET to a URL of its choice
+  from your machine; it never sees the answer, which fails its digest check. A token
+  realm or a layer's `urls` can't do the same: `cirro` fetches the token itself, only
+  from the registry's own host or its known token host, and never fetches a layer's
+  `urls`.
 - **Docker Hub's anonymous limit** is about 100 pulls per 6 hours per IP address. Cached
   images keep you well under it; past it, `cirro` says so and suggests `cirro image ls`.
 - **Each VM gets a copy of the rootfs.** That's fine at nginx's size. A shared read-only
