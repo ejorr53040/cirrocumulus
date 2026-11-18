@@ -133,9 +133,9 @@ it runs Cirrocumulus code.
 A manual source review on 2026-09-28 found one High (the agent would boot
 any host path as a rootfs; it now opens the rootfs as the caller, #14), three
 Mediums (resource bounds checked only in the CLI, an unverified guest kernel
-download, an unsigned demo package install), all fixed, though the demo's
-`apk.static`, the tool that checks those packages' signatures, is itself
-still fetched over TLS with no checksum. The two Lows, the development
+download, an unsigned demo package install), all fixed. The demo's `apk.static`,
+the tool that checks those packages' signatures, is pinned by SHA-256 and
+checked before it runs. The two Lows, the development
 sudoers rule's breadth and an unused privileged `jailer` module with its own
 `sudo` call, are closed: the rule and the jailed step 0 boot that needed it
 are gone, and so are both unused modules. The OCI layer parser and guest-init's config parser have
