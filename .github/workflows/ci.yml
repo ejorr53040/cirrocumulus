@@ -227,8 +227,17 @@ jobs:
         with:
           persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
+        # Not the runner's rustup: this job runs in a Debian container without one.
+        # rustup-init is fetched at a fixed version and checked against its published SHA-256.
+        env:
+          RUSTUP_VERSION: 1.29.3
+          SHA256: b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55
         run: |
-          curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain none --profile minimal
+          curl -fsSLo "$RUNNER_TEMP/rustup-init" \
+            "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init"
+          echo "$SHA256  $RUNNER_TEMP/rustup-init" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/rustup-init"
+          "$RUNNER_TEMP/rustup-init" -y --default-toolchain none --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           "$HOME/.cargo/bin/rustup" toolchain install
       - name: cirro-image tests
