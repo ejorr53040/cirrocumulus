@@ -276,28 +276,23 @@ impl Flattened {
     /// The tree to write: the image's own, the files every guest gets
     /// (replacing the image's), and a directory entry for every parent the
     /// layers didn't list.
-    fn with_guest_files(&self, init: &[u8]) -> BTreeMap<String, Entry<'_>> {
+    fn with_guest_files<'a>(&'a self, init: &'a [u8]) -> BTreeMap<String, Entry<'a>> {
         let mut tree: BTreeMap<String, Entry<'_>> = self
             .tree
             .iter()
             .map(|(path, source)| (path.clone(), Entry::Layer(source)))
             .collect();
-        tree.insert("init".into(), Entry::Guest(init.to_vec(), 0o755));
-        tree.insert(
-            "etc/resolv.conf".into(),
-            Entry::Guest(RESOLV_CONF.to_vec(), 0o644),
-        );
-        tree.insert("etc/hosts".into(), Entry::Guest(HOSTS.to_vec(), 0o644));
+        tree.insert("init".into(), Entry::Guest(init, 0o755));
+        tree.insert("etc/resolv.conf".into(), Entry::Guest(RESOLV_CONF, 0o644));
+        tree.insert("etc/hosts".into(), Entry::Guest(HOSTS, 0o644));
         for dir in ["proc", "sys", "dev"] {
             tree.entry(dir.into()).or_insert(Entry::Dir);
         }
         let parents: Vec<String> = tree
             .keys()
-            .flat_map(|path| {
-                path.match_indices('/')
-                    .map(|(i, _)| path[..i].to_string())
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(|path| path.match_indices('/').map(|(i, _)| &path[..i]))
+            .filter(|parent| !tree.contains_key(*parent))
+            .map(str::to_owned)
             .collect();
         for parent in parents {
             tree.entry(parent).or_insert(Entry::Dir);
@@ -328,7 +323,7 @@ impl Flattened {
                     header.set_mode(*mode);
                     header.set_size(contents.len() as u64);
                     bytes += contents.len() as u64;
-                    builder.append_data(&mut header, path, contents.as_slice())?;
+                    builder.append_data(&mut header, path, *contents)?;
                 }
                 Entry::Layer(source) => {
                     let mut header = source.header.clone();
@@ -405,7 +400,7 @@ impl Flattened {
 enum Entry<'a> {
     Layer(&'a Source),
     /// A file every guest gets, owned by root, with this mode.
-    Guest(Vec<u8>, u32),
+    Guest(&'a [u8], u32),
     /// A directory the image doesn't list: root-owned, `0755`.
     Dir,
 }
