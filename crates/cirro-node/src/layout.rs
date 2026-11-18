@@ -40,9 +40,9 @@ pub(crate) fn known_hosts(state_dir: &Path) -> PathBuf {
     state_dir.join("known_hosts")
 }
 
-/// Each running Machine `ssh`'s config file, which holds its forwards.
-/// Root-only: knowing a forward's port, a local user could take it first.
-pub(crate) fn ssh_configs(state_dir: &Path) -> PathBuf {
+/// A directory for each running Machine `ssh`: its config file and its
+/// forward sockets. Root-only, so no other local user can reach a forward.
+pub(crate) fn ssh_runs(state_dir: &Path) -> PathBuf {
     state_dir.join("ssh")
 }
 

@@ -6,7 +6,7 @@
 use super::{ApiError, bad_request, internal};
 use crate::layout;
 use crate::state::{MachineAppRecord, MachineRecord, Store};
-use cirro_edge::{Lease, Resolution};
+use cirro_edge::{Lease, Resolution, Upstream};
 use cirro_proto::{
     AddMachine, MachineAppInfo, MachineAppRequest, MachineInfo, MachineStatus, Route,
 };
@@ -15,7 +15,6 @@ use nix::sys::signal::Signal;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -33,8 +32,8 @@ pub(super) struct Machines {
     key: PathBuf,
     /// Every Machine's pinned host key, each under the Machine's name.
     known_hosts: PathBuf,
-    /// Where each `ssh`'s config file goes: see `write_forwards`.
-    ssh_configs: PathBuf,
+    /// Where each `ssh` gets a directory of its own: see `write_config`.
+    ssh_runs: PathBuf,
     /// Held while the agent's key is made, so two first uses make one key.
     keygen: Mutex<()>,
     /// Held for a whole add, so two adds can't take one name or pin each
@@ -72,11 +71,9 @@ struct Link {
     /// The Machine presented a host key other than the pinned one, so no
     /// `ssh` runs to it again until it's removed and added.
     host_key_changed: bool,
-    /// The port on the Node's 127.0.0.1 that this `ssh` forwards to each
-    /// App's route port on the Machine's localhost, by App name. Chosen
-    /// afresh for every `ssh`, so a port something else took after one
-    /// `ssh` ended doesn't keep the next from starting.
-    ports: BTreeMap<String, u16>,
+    /// The directory of the forward sockets this `ssh` has bound, one per
+    /// App ([`socket`]); set when it's up.
+    forwards: PathBuf,
 }
 
 impl Link {
@@ -86,7 +83,7 @@ impl Link {
             status: MachineStatus::Unreachable,
             last_error: None,
             host_key_changed: false,
-            ports: BTreeMap::new(),
+            forwards: PathBuf::new(),
         }
     }
 }
@@ -96,7 +93,7 @@ impl Machines {
         Machines {
             key: layout::ssh_key(state_dir),
             known_hosts: layout::known_hosts(state_dir),
-            ssh_configs: layout::ssh_configs(state_dir),
+            ssh_runs: layout::ssh_runs(state_dir),
             keygen: Mutex::new(()),
             adding: tokio::sync::Mutex::new(()),
             entries: Mutex::new(BTreeMap::new()),
@@ -108,7 +105,7 @@ impl Machines {
     /// in the background so an unreachable one holds nothing up.
     pub(super) fn restore(&self) -> io::Result<()> {
         // What a crashed agent's `ssh`s left; none of them runs any more.
-        match std::fs::remove_dir_all(&self.ssh_configs) {
+        match std::fs::remove_dir_all(&self.ssh_runs) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
             _ => {}
         }
@@ -184,7 +181,7 @@ impl Machines {
             let link = machine.link.lock().unwrap();
             Some(match link.status {
                 MachineStatus::Up => Resolution::Upstream(
-                    SocketAddr::from((Ipv4Addr::LOCALHOST, *link.ports.get(name)?)),
+                    Upstream::Unix(socket(&link.forwards, name)),
                     Lease::new(()),
                 ),
                 // Without `last_error`: what `ssh` said names the Machine's
@@ -339,19 +336,20 @@ impl Machines {
             fingerprint: add.host_key,
         };
         let public_key = self.public_key()?;
-        self.write_known_hosts(&self.entries.lock().unwrap(), Some(&record))
-            .map_err(|e| internal(format!("pin the host key of {}: {e}", record.name)))?;
-        let refused = match ssh_command(
+        let run = write_config(
+            &self.ssh_runs,
             &self.key,
             &self.known_hosts,
-            Path::new("/dev/null"),
             &record.name,
             &target,
             &[],
-            &["true"],
         )
-        .output()
-        .await
+        .map_err(|e| internal(format!("configure ssh for {}: {e}", record.name)))?;
+        self.write_known_hosts(&self.entries.lock().unwrap(), Some(&record))
+            .map_err(|e| internal(format!("pin the host key of {}: {e}", record.name)))?;
+        let refused = match ssh_command(&run.dir.join(CONFIG), &record.name, &[], &["true"])
+            .output()
+            .await
         {
             Ok(out) if out.status.success() => None,
             Ok(out) => Some(last_line(&String::from_utf8_lossy(&out.stderr))),
@@ -450,27 +448,14 @@ impl Machines {
             .collect();
         let link = Arc::new(Mutex::new(Link::down()));
         let (key, known_hosts) = (self.key.clone(), self.known_hosts.clone());
-        let (configs, name) = (self.ssh_configs.clone(), machine.record.name.clone());
-        let attempt_link = link.clone();
+        let (runs, name) = (self.ssh_runs.clone(), machine.record.name.clone());
         let attempt = move || -> io::Result<Attempt> {
-            let (config, ports) = write_forwards(&configs, &apps)?;
-            attempt_link.lock().unwrap().ports = ports;
-            let ssh = ssh_command(
-                &key,
-                &known_hosts,
-                &config.0,
-                &name,
-                &target,
-                &["-N", "-o", "ExitOnForwardFailure=yes"],
-                &[],
-            );
-            Ok(Attempt {
-                ssh,
-                _config: config,
-            })
+            let run = write_config(&runs, &key, &known_hosts, &name, &target, &apps)?;
+            let ssh = ssh_command(&run.dir.join(CONFIG), &name, &["-N"], &[]);
+            Ok(Attempt { ssh, run })
         };
         // Before anything changes, so a failure leaves the running `ssh` and
-        // the ports the edge uses as they were.
+        // the forwards the edge uses as they were.
         let first = attempt()?;
         machine.tunnel.abort();
         machine.link = link.clone();
@@ -501,39 +486,17 @@ impl Machines {
     }
 }
 
-/// `ssh` to the Machine `name` with the agent's key (`key`), trusting only
-/// its pinned host key in `known_hosts`, and reading `config` instead of
-/// root's own SSH config.
-fn ssh_command(
-    key: &Path,
-    known_hosts: &Path,
-    config: &Path,
-    name: &str,
-    target: &Target,
-    options: &[&str],
-    command: &[&str],
-) -> Command {
+/// `ssh` to the Machine `name` as `config`, its root-only config file,
+/// says: which host, as whom, with which key, trusting which host key and
+/// forwarding what. Its arguments, which every local user can read, name
+/// no more than that file and the Machine.
+fn ssh_command(config: &Path, name: &str, options: &[&str], command: &[&str]) -> Command {
     let mut cmd = Command::new("ssh");
     cmd.arg("-F")
         .arg(config)
-        .arg("-T")
-        .args(["-o", "BatchMode=yes"])
-        .args(["-o", "StrictHostKeyChecking=yes"])
-        .args(["-o", "GlobalKnownHostsFile=/dev/null"])
-        .arg("-o")
-        .arg(format!("UserKnownHostsFile={}", known_hosts.display()))
-        .arg("-o")
-        .arg(format!("HostKeyAlias={name}"))
-        .args(["-o", "IdentitiesOnly=yes"])
-        .arg("-i")
-        .arg(key)
-        .args(["-o", "ConnectTimeout=10"])
-        .args(["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=3"])
-        // VERBOSE, for the "Authenticated to" line that says it's up.
-        .args(["-o", "LogLevel=VERBOSE"])
         .args(options)
-        .args(["-p", &target.port.to_string(), "-l", &target.user, "--"])
-        .arg(&target.host)
+        .arg("--")
+        .arg(name)
         .args(command)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -573,17 +536,17 @@ const RETRY_MAX: Duration = Duration::from_secs(30);
 /// changed key is retried like any failure, still never trusted.
 const HOST_KEY_FAILED: &str = "Host key verification failed.";
 
-/// One run of a Machine's `ssh`, with the config file that holds its
-/// forwards, which goes when the run does.
+/// One run of a Machine's `ssh`, with the directory that holds its config
+/// and forward sockets, which goes when the run does.
 struct Attempt {
     ssh: Command,
-    _config: ConfigFile,
+    run: Run,
 }
 
 /// Keeps the Machine `name`'s `ssh` running, marking the Machine up while
 /// it's logged in. A host key that doesn't match the pinned one ends it for
 /// good: the Machine is never trusted again until it's removed and added.
-/// Each run after `first` is a fresh `attempt`, with ports of its own.
+/// Each run after `first` is a fresh `attempt`, with a directory of its own.
 async fn run_tunnel(
     name: String,
     first: Attempt,
@@ -593,13 +556,18 @@ async fn run_tunnel(
     let mut next = Ok(first);
     let mut wait = RETRY_FIRST;
     loop {
-        let ended = match next {
-            Ok(attempt) => run_ssh(attempt.ssh, &link).await,
-            Err(e) => Ended {
-                logged_in: false,
-                host_key_changed: false,
-                last: format!("set up the forwards: {e}"),
-            },
+        // The run's sockets outlast the marking down below, so the edge is
+        // never sent to one that's gone.
+        let (ended, _run) = match next {
+            Ok(Attempt { ssh, run }) => (run_ssh(ssh, &run, &link).await, Some(run)),
+            Err(e) => (
+                Ended {
+                    logged_in: false,
+                    host_key_changed: false,
+                    last: format!("set up the forwards: {e}"),
+                },
+                None,
+            ),
         };
         let why = if ended.host_key_changed {
             "host key changed: it isn't the one pinned when the Machine was added; if \
@@ -635,8 +603,12 @@ struct Ended {
     last: String,
 }
 
-/// Runs `ssh` until it exits, marking the Machine up once it has logged in.
-async fn run_ssh(mut ssh: Command, link: &Mutex<Link>) -> Ended {
+/// How often a logged-in `ssh`'s forward sockets are looked for.
+const BIND_POLL: Duration = Duration::from_millis(20);
+
+/// Runs `ssh` until it exits, marking the Machine up once it has logged in
+/// and bound every forward socket of `run`.
+async fn run_ssh(mut ssh: Command, run: &Run, link: &Mutex<Link>) -> Ended {
     let mut ended = Ended {
         logged_in: false,
         host_key_changed: false,
@@ -651,17 +623,32 @@ async fn run_ssh(mut ssh: Command, link: &Mutex<Link>) -> Ended {
     };
     if let Some(stderr) = child.stderr.take() {
         let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            if line.starts_with("Authenticated to ") {
-                ended.logged_in = true;
-                let mut link = link.lock().unwrap();
-                link.status = MachineStatus::Up;
-                link.last_error = None;
-                link.host_key_changed = false;
-            } else if line == HOST_KEY_FAILED {
-                ended.host_key_changed = true;
-            } else if !is_chatter(&line) {
-                ended.last = without_controls(line);
+        let mut up = false;
+        loop {
+            tokio::select! {
+                line = lines.next_line() => {
+                    let Ok(Some(line)) = line else { break };
+                    if line.starts_with("Authenticated to ") {
+                        ended.logged_in = true;
+                    } else if line == HOST_KEY_FAILED {
+                        ended.host_key_changed = true;
+                    } else if !is_chatter(&line) {
+                        ended.last = without_controls(line);
+                    }
+                }
+                // `ssh` binds its forwards after logging in and says nothing
+                // when it has: until each socket is there, the edge would
+                // find none to connect to.
+                () = tokio::time::sleep(BIND_POLL), if ended.logged_in && !up => {
+                    if run.sockets.iter().all(|s| s.exists()) {
+                        up = true;
+                        let mut link = link.lock().unwrap();
+                        link.status = MachineStatus::Up;
+                        link.last_error = None;
+                        link.host_key_changed = false;
+                        link.forwards.clone_from(&run.dir);
+                    }
+                }
             }
         }
     }
@@ -685,8 +672,9 @@ struct Target {
 }
 
 impl Target {
-    /// Each part becomes an `ssh` argument, so none may start with `-` or
-    /// hold anything but the characters user and host names use.
+    /// Each part goes into `ssh`'s config and `ssh-keyscan`'s arguments,
+    /// so none may start with `-` or hold anything but the characters user
+    /// and host names use: no space, quote or newline.
     fn parse(ssh: &str) -> Result<Target, String> {
         let invalid =
             || format!("invalid SSH target {ssh:?}: expected user@host or user@host:port");
@@ -784,59 +772,88 @@ async fn fingerprint(key: &str) -> Result<String, ApiError> {
         .ok_or_else(|| internal(format!("ssh-keygen couldn't read the host key {key:?}")))
 }
 
-/// `n` different ports free on the Node's 127.0.0.1 a moment ago: all
-/// held at once while they're chosen, so none is handed out twice.
-// Something else can take one before `ssh` binds it; `ssh` then exits
-// (ExitOnForwardFailure), and its next run picks fresh ones (see
-// run_tunnel).
-fn free_local_ports(n: usize) -> io::Result<Vec<u16>> {
-    let held = (0..n)
-        .map(|_| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)))
-        .collect::<io::Result<Vec<_>>>()?;
-    held.iter().map(|l| Ok(l.local_addr()?.port())).collect()
+/// The file in a [`Run`]'s directory that `ssh` reads instead of root's
+/// own config.
+const CONFIG: &str = "config";
+
+/// Numbers the `ssh` runs' directories, so no two runs share one.
+static RUN_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// One `ssh`'s root-only directory: its config, and a socket for each App
+/// it forwards. Removed, with all of that, when it's dropped.
+struct Run {
+    dir: PathBuf,
+    /// Each App's forward socket, which `ssh` binds once it has logged in.
+    sockets: Vec<PathBuf>,
 }
 
-/// Numbers the `ssh` config files, so no two runs share one.
-static CONFIG_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// An `ssh` config file, removed when it's dropped.
-struct ConfigFile(PathBuf);
-
-impl Drop for ConfigFile {
+impl Drop for Run {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
-/// Writes a root-only config file in `dir` that has `ssh` forward each of
-/// `apps` (its name and route port) from a fresh port on the Node's
-/// 127.0.0.1, and returns the file and those ports by App name. In a file,
-/// not `ssh`'s arguments, which every local user can read: knowing the
-/// ports, one could take them first.
-fn write_forwards(
-    dir: &Path,
+/// The forward socket in `dir` for the App `app`.
+fn socket(dir: &Path, app: &str) -> PathBuf {
+    dir.join(format!("{app}.sock"))
+}
+
+/// Writes, in a fresh root-only directory under `runs`, the config for one
+/// `ssh` to the Machine `name` at `target`: log in with the agent's `key`,
+/// trust only the host key pinned in `known_hosts`, and forward a socket in
+/// that directory to each of `apps` (its name and route port) on the
+/// Machine's localhost. In a file, not `ssh`'s arguments, which every local
+/// user can read.
+// Sockets, not ports on the Node's 127.0.0.1: any local user can take a
+// port, or every free one, before `ssh` binds it, and with
+// ExitOnForwardFailure that keeps all the Machine's Apps down; and any
+// local user can connect to a port past the edge. Only root can reach the
+// directory. It's new for each run, so a socket in it is this run's.
+fn write_config(
+    runs: &Path,
+    key: &Path,
+    known_hosts: &Path,
+    name: &str,
+    target: &Target,
     apps: &[(String, u16)],
-) -> io::Result<(ConfigFile, BTreeMap<String, u16>)> {
-    let local = free_local_ports(apps.len())?;
-    let mut forwards = String::new();
-    let mut ports = BTreeMap::new();
-    for ((app, remote), port) in apps.iter().zip(local) {
-        forwards += &format!("LocalForward 127.0.0.1:{port} localhost:{remote}\n");
-        ports.insert(app.clone(), port);
-    }
+) -> io::Result<Run> {
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
-        .create(dir)?;
-    let seq = CONFIG_SEQ.fetch_add(1, Ordering::Relaxed);
-    let config = ConfigFile(dir.join(format!("{seq}.conf")));
+        .create(runs)?;
+    let seq = RUN_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = runs.join(seq.to_string());
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    let mut run = Run {
+        dir,
+        sockets: Vec::with_capacity(apps.len()),
+    };
+    // VERBOSE, for the "Authenticated to" line that says it has logged in.
+    let mut config = format!(
+        "HostName {host}\nPort {port}\nUser {user}\nHostKeyAlias {name}\n\
+         IdentityFile \"{key}\"\nIdentitiesOnly yes\n\
+         UserKnownHostsFile \"{known_hosts}\"\nGlobalKnownHostsFile /dev/null\n\
+         StrictHostKeyChecking yes\nBatchMode yes\nRequestTTY no\nConnectTimeout 10\n\
+         ServerAliveInterval 5\nServerAliveCountMax 3\nExitOnForwardFailure yes\n\
+         LogLevel VERBOSE\n",
+        host = target.host,
+        port = target.port,
+        user = target.user,
+        key = key.display(),
+        known_hosts = known_hosts.display(),
+    );
+    for (app, port) in apps {
+        let path = socket(&run.dir, app);
+        config += &format!("LocalForward \"{}\" localhost:{port}\n", path.display());
+        run.sockets.push(path);
+    }
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(&config.0)?
-        .write_all(forwards.as_bytes())?;
-    Ok((config, ports))
+        .open(run.dir.join(CONFIG))?
+        .write_all(config.as_bytes())?;
+    Ok(run)
 }
 
 /// The last thing `ssh` said, which is why it failed when it did.
@@ -861,7 +878,108 @@ fn without_controls(mut line: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::last_line;
+    use super::*;
+    use std::ffi::OsStr;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A directory of the test's own for `ssh` runs, empty.
+    fn runs(test: &str) -> PathBuf {
+        let runs =
+            std::env::temp_dir().join(format!("cirro-machine-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&runs);
+        runs
+    }
+
+    /// A run for the Machine `pi` with one App, `web`, on port 8000.
+    fn pi_run(runs: &Path) -> Run {
+        let target = Target::parse("pi@192.0.2.7:2222").unwrap();
+        let (key, known_hosts) = (Path::new("/state/ssh_key"), Path::new("/state/known_hosts"));
+        write_config(
+            runs,
+            key,
+            known_hosts,
+            "pi",
+            &target,
+            &[("web".into(), 8000)],
+        )
+        .unwrap()
+    }
+
+    /// Every local user can read `ssh`'s arguments, so they say neither
+    /// where the Machine is nor who logs in with which key: the root-only
+    /// config file does.
+    #[test]
+    fn ssh_is_told_only_its_config_file_and_the_machines_name() {
+        let ssh = ssh_command(Path::new("/state/ssh/0/config"), "pi", &["-N"], &[]);
+        let args: Vec<&OsStr> = ssh.as_std().get_args().collect();
+        assert_eq!(
+            args,
+            ["-F", "/state/ssh/0/config", "-N", "--", "pi"].map(OsStr::new)
+        );
+    }
+
+    /// A run's config and its forward sockets sit in a directory only its
+    /// owner, root, can enter, not on ports any local user can take or
+    /// reach; and they go with the run.
+    #[test]
+    fn a_runs_config_and_forward_sockets_are_its_owners_alone_and_go_with_it() {
+        let runs = runs("perms");
+        let run = pi_run(&runs);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&runs), 0o700);
+        assert_eq!(mode(&run.dir), 0o700);
+        assert_eq!(mode(&run.dir.join(CONFIG)), 0o600);
+        let web = run.dir.join("web.sock");
+        assert_eq!(run.sockets, std::slice::from_ref(&web));
+        let config = std::fs::read_to_string(run.dir.join(CONFIG)).unwrap();
+        for line in [
+            "HostName 192.0.2.7\n",
+            "Port 2222\n",
+            "User pi\n",
+            "IdentityFile \"/state/ssh_key\"\n",
+            "HostKeyAlias pi\n",
+            format!("LocalForward \"{}\" localhost:8000\n", web.display()).as_str(),
+        ] {
+            assert!(config.contains(line), "no {line:?} in:\n{config}");
+        }
+        assert!(!config.contains("127.0.0.1"), "a TCP forward:\n{config}");
+        let dir = run.dir.clone();
+        drop(run);
+        assert!(!dir.exists(), "the run's directory outlived it");
+        let _ = std::fs::remove_dir_all(&runs);
+    }
+
+    /// The Machine is up only once `ssh` has bound every forward socket,
+    /// not as soon as it has logged in: in between, the edge would find no
+    /// socket for the App.
+    #[tokio::test]
+    async fn a_machine_is_up_once_its_forwards_are_bound_not_once_logged_in() {
+        let runs = runs("bind");
+        let run = pi_run(&runs);
+        // Stands in for `ssh`: logs in, then binds nothing; the test does.
+        let mut ssh = Command::new("sh");
+        ssh.args(["-c", "echo 'Authenticated to pi' >&2; sleep 2"])
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let link = Mutex::new(Link::down());
+        let status = || link.lock().unwrap().status;
+        let watch = async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(
+                status(),
+                MachineStatus::Unreachable,
+                "up before its forward was bound"
+            );
+            let _bound = std::os::unix::net::UnixListener::bind(&run.sockets[0]).unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(status(), MachineStatus::Up, "not up once it was bound");
+            assert_eq!(link.lock().unwrap().forwards, run.dir);
+        };
+        let (ended, ()) = tokio::join!(run_ssh(ssh, &run, &link), watch);
+        assert!(ended.logged_in);
+        drop(run);
+        let _ = std::fs::remove_dir_all(&runs);
+    }
 
     #[test]
     fn what_ssh_said_keeps_no_control_characters() {

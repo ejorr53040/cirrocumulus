@@ -18,11 +18,12 @@ use hyper::{Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tls::NodeCa;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, warn};
 
@@ -33,19 +34,29 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// and each one after on a kept-alive connection.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long the edge waits to connect to an App's VM before answering 502.
+/// How long the edge waits to connect to an App before answering 502.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where requests for a hostname go.
 #[derive(Debug)]
 pub enum Resolution {
-    /// Proxy to the App's VM at this address, holding the lease until the
+    /// Proxy to the App at this upstream, holding the lease until the
     /// response has been sent.
-    Upstream(SocketAddr, Lease),
+    Upstream(Upstream, Lease),
     /// No App has this hostname: 404.
     NotFound,
     /// The App exists but can't take requests now: 503, saying why.
     Unavailable(String),
+}
+
+/// Where an App takes the requests the edge proxies to it.
+#[derive(Debug)]
+pub enum Upstream {
+    /// A VM's address.
+    Tcp(SocketAddr),
+    /// A Unix socket, such as a Machine-backed App's forward, which only
+    /// the agent can reach.
+    Unix(PathBuf),
 }
 
 /// Whatever a [`Router`] wants held while a request it routed is in flight:
@@ -249,10 +260,10 @@ async fn handle<R: Router>(
         ),
         Resolution::Unavailable(why) => text(StatusCode::SERVICE_UNAVAILABLE, format!("{why}\n")),
         Resolution::Upstream(upstream, lease) => {
-            match proxy(req, &host, upstream, peer, scheme.proto(), lease).await {
+            match proxy(req, &host, &upstream, peer, scheme.proto(), lease).await {
                 Ok(response) => response,
                 Err(e) => {
-                    warn!(host, %upstream, "proxy: {e}");
+                    warn!(host, ?upstream, "proxy: {e}");
                     text(
                         StatusCode::BAD_GATEWAY,
                         format!("the App at {host} didn't answer: {e}\n"),
@@ -282,20 +293,34 @@ fn host_of(req: &Request<Incoming>) -> Option<String> {
 async fn proxy(
     req: Request<Incoming>,
     host: &str,
-    upstream: SocketAddr,
+    upstream: &Upstream,
     peer: SocketAddr,
     proto: &'static str,
     lease: Lease,
 ) -> Result<Response<Body>, String> {
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, connect(upstream))
-        .await
-        .map_err(|_| {
-            format!(
-                "nothing accepted a connection on port {} within {CONNECT_TIMEOUT:?}",
-                upstream.port()
-            )
-        })?
-        .map_err(|e| format!("connect: {e}"))?;
+    match upstream {
+        Upstream::Tcp(addr) => {
+            let stream = connect(upstream, || TcpStream::connect(*addr)).await?;
+            forward(stream, req, host, peer, proto, lease).await
+        }
+        Upstream::Unix(path) => {
+            let stream = connect(upstream, || UnixStream::connect(path)).await?;
+            forward(stream, req, host, peer, proto, lease).await
+        }
+    }
+}
+
+async fn forward<S>(
+    stream: S,
+    req: Request<Incoming>,
+    host: &str,
+    peer: SocketAddr,
+    proto: &'static str,
+    lease: Lease,
+) -> Result<Response<Body>, String>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .map_err(|e| format!("handshake: {e}"))?;
@@ -345,17 +370,36 @@ async fn proxy(
     Ok(Response::from_parts(parts, body.boxed()))
 }
 
-/// Connects to `upstream`, trying again while it refuses: an App that has
-/// just started or woken may be a moment from accepting.
-async fn connect(upstream: SocketAddr) -> std::io::Result<TcpStream> {
-    loop {
-        match TcpStream::connect(upstream).await {
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+/// Connects to `upstream` with `open`, trying again while it refuses: an
+/// App that has just started or woken may be a moment from accepting.
+async fn connect<S, F>(upstream: &Upstream, open: impl Fn() -> F) -> Result<S, String>
+where
+    F: Future<Output = std::io::Result<S>>,
+{
+    let refused_meanwhile = async {
+        loop {
+            match open().await {
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                result => return result,
             }
-            result => return result,
         }
-    }
+    };
+    tokio::time::timeout(CONNECT_TIMEOUT, refused_meanwhile)
+        .await
+        .map_err(|_| match upstream {
+            Upstream::Tcp(addr) => format!(
+                "nothing accepted a connection on port {} within {CONNECT_TIMEOUT:?}",
+                addr.port()
+            ),
+            // The socket's path is the Node's own business, not the edge's
+            // clients'.
+            Upstream::Unix(_) => {
+                format!("nothing accepted a connection within {CONNECT_TIMEOUT:?}")
+            }
+        })?
+        .map_err(|e| format!("connect: {e}"))
 }
 
 /// Headers that describe one connection, not the message, so never pass a

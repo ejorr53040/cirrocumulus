@@ -53,7 +53,8 @@ HTTP(S) to Apps by hostname.
   same certificates as a VM-backed App, and a 503 while the Machine is
   unreachable. The agent reconnects a Machine that comes back, never one
   whose host key changed. `cirro ps` and `cirro top` show Machine-backed
-  Apps.
+  Apps. Each App is forwarded from a root-only Unix socket on the Node, so
+  no other local user can reach it past the edge or keep it down.
 - **Docs.** [Threat model](docs/threat-model.md), [security
   policy](SECURITY.md), ADRs 0001–0009, and a docs site (mdBook, `docs/`).
 - **Releases.** Tagging `vX.Y.Z` builds `cirro` and publishes it with its

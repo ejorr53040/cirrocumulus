@@ -83,16 +83,20 @@ it runs Cirrocumulus code.
   the network says at that moment, so check the fingerprint on the Machine.
 - **A `cirro` group member** can make the root agent open SSH connections to
   any host and port, as any user name, with its key, and learn whether the
-  key was accepted. Targets are checked so none becomes an `ssh` option, and
-  `ssh` runs with no config file of root's.
+  key was accepted. Targets are checked so none becomes an `ssh` option or
+  another line of its config, and `ssh` reads a root-only config file of
+  the agent's, none of root's own. Its arguments, which every local user can
+  read, name only that file and the Machine.
 - **Traffic to a Machine** crosses the network inside the agent's SSH
   connection: the edge's TLS ends at the Node, so the Machine sees plain
   HTTP from `ssh` on its own localhost, and only its localhost ports are
   reachable that way.
-- **Each Machine-backed App's forward** listens on the Node's 127.0.0.1, so
-  any local user or process on the Node can reach the App past the edge, as
-  it can a VM's address. VMs can't: nothing routes their traffic to the
-  Node's loopback (`route_localnet` stays off).
+- **Each Machine-backed App's forward** is a Unix socket in a root-only
+  directory under the state dir, new for each `ssh`, which only the agent
+  connects to. No other local user can reach the App past the edge, or
+  take or use up a port the forward needs and so keep the Machine's Apps
+  down. Its Machine shows as up only once `ssh` has bound every one. (A
+  VM's address, by contrast, is reachable from the Node's processes.)
 - **Adding or removing an App** restarts its Machine's `ssh` with the new set
   of forwards, so the Machine's other Apps answer 503 for the moment it takes
   to log in again.

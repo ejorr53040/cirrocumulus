@@ -3115,15 +3115,38 @@ fn a_machine_that_cant_be_trusted_or_reached_is_not_added() {
 }
 
 /// The agent's `ssh` processes for this test's state dir: their command
-/// lines name its known_hosts file.
+/// lines name a config file under it.
 fn machine_ssh_processes(agent: &Agent) -> String {
-    let known_hosts = agent.state_dir.join("known_hosts");
+    let runs = agent.state_dir.join("ssh");
     let out = std::process::Command::new("pgrep")
         .arg("-af")
-        .arg(format!("UserKnownHostsFile={}", known_hosts.display()))
+        .arg(format!("ssh -F {}/", runs.display()))
         .output()
         .expect("run pgrep");
     String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The socket the agent's one `ssh` to `machine` forwards `app` from, next
+/// to its config file. Every local user can read `ssh`'s arguments, so
+/// they must name only that file and the Machine: not where the Machine
+/// is, who logs in, with which key, or what's forwarded.
+fn machine_forward(agent: &Agent, machine: &str, app: &str) -> PathBuf {
+    let ssh = machine_ssh_processes(agent);
+    let mut configs =
+        ssh.lines().map(
+            |line| match line.split_whitespace().skip(1).collect::<Vec<_>>()[..] {
+                ["ssh", "-F", config, "-N", "--", name] if name == machine => PathBuf::from(config),
+                _ => panic!("ssh's arguments say more than its config file and Machine: {line}"),
+            },
+        );
+    let config = configs
+        .next()
+        .unwrap_or_else(|| panic!("no ssh to {machine} running"));
+    assert!(
+        configs.next().is_none(),
+        "more than one ssh to {machine}:\n{ssh}"
+    );
+    config.with_file_name(format!("{app}.sock"))
 }
 
 fn wait_for_no_machine_ssh(agent: &Agent) {
@@ -3239,8 +3262,9 @@ fn run_on_machine(
 
 /// M8: a Machine-backed App is served through the edge, over HTTP and
 /// HTTPS, from a port on its Machine's localhost, and `ps` lists it with
-/// its Machine. Its forward isn't in `ssh`'s arguments, which any local
-/// user can read: knowing the port, one could take it first.
+/// its Machine. It shows up only once its forward is listening, and the
+/// forward is a socket of root's that no other local user can reach or
+/// take first; `ssh`'s arguments, which they can read, say nothing of it.
 #[test]
 fn a_machine_backed_app_is_served_through_the_edge() {
     let Some(sshd) = Sshd::start(184) else {
@@ -3254,17 +3278,31 @@ fn a_machine_backed_app_is_served_through_the_edge() {
     serve_http(port, "hello from pi");
 
     run_on_machine(&agent, "web", "pi", "pi.test", port).success();
+    wait_for_top_text(&agent, "web", " up", TIMEOUT);
+    let socket = machine_forward(&agent, "pi", "web");
+    let unix = std::fs::read_to_string("/proc/net/unix").expect("read /proc/net/unix");
+    assert!(
+        unix.lines()
+            .any(|l| l.ends_with(&format!(" {}", socket.display()))),
+        "up, but nothing listens on {}",
+        socket.display()
+    );
+    let runs = agent.state_dir.join("ssh");
+    assert!(socket.starts_with(&runs), "{}", socket.display());
+    let meta = std::fs::metadata(&runs).unwrap();
+    assert_eq!(
+        (meta.uid(), meta.mode() & 0o777),
+        (0, 0o700),
+        "{} isn't root's alone",
+        runs.display()
+    );
+    let reached = UnixStream::connect(&socket);
+    assert!(
+        reached.is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied),
+        "a local user reached the forward past the edge"
+    );
     let answer = wait_for_edge(&agent, "pi.test");
     assert!(answer.ends_with("hello from pi"), "{answer:?}");
-    let ssh = machine_ssh_processes(&agent);
-    assert!(
-        ssh.contains("ExitOnForwardFailure=yes"),
-        "no forwarding ssh running: {ssh}"
-    );
-    assert!(
-        !ssh.contains(" -L ") && !ssh.contains(&format!(":{port}")),
-        "the forward is in ssh's arguments: {ssh}"
-    );
 
     let ca = agent.state_dir.join("test-ca.pem");
     std::fs::write(
