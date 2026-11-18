@@ -23,14 +23,13 @@ pub fn snapshot(stats: &Stats, machine_apps: &[MachineAppInfo]) -> String {
         &mut out,
         [
             "NAME", "CPU", "MEM", "NET IN", "NET OUT", "DISK R", "DISK W",
-        ]
-        .map(String::from),
+        ],
     );
     for vm in &stats.vms {
         let [cpu, mem, rx, tx, read, write] = rate_cells(vm.history.last());
         row(
             &mut out,
-            [vm.info.name.clone(), cpu, mem, rx, tx, read, write],
+            [&vm.info.name, &cpu, &mem, &rx, &tx, &read, &write],
         );
     }
     if !machine_apps.is_empty() {
@@ -50,7 +49,7 @@ pub fn snapshot(stats: &Stats, machine_apps: &[MachineAppInfo]) -> String {
 
 /// The Node's latest CPU, memory and network, with `between` separating
 /// the network from the rest: the dashboard puts it on a line of its own.
-pub(crate) fn node_summary(node: &NodeRates, between: &str) -> String {
+fn node_summary(node: &NodeRates, between: &str) -> String {
     format!(
         "CPU {:.1}%  MEM {}/{}{between}NET {} in, {} out",
         node.cpu_percent,
@@ -63,7 +62,7 @@ pub(crate) fn node_summary(node: &NodeRates, between: &str) -> String {
 
 /// A VM's latest rates as table cells: CPU, memory, network in and out,
 /// disk read and write. All `-` until the agent has two samples of it.
-pub(crate) fn rate_cells(rates: Option<&VmRates>) -> [String; 6] {
+fn rate_cells(rates: Option<&VmRates>) -> [String; 6] {
     match rates {
         Some(r) => [
             format!("{:.1}%", r.cpu_percent),
@@ -99,7 +98,7 @@ pub fn machine_port(app: &MachineAppInfo) -> String {
 }
 
 /// One line of the `--once` table: a name, then six right-aligned cells.
-fn row(out: &mut String, [name, cells @ ..]: [String; 7]) {
+fn row(out: &mut String, [name, cells @ ..]: [&str; 7]) {
     let _ = write!(out, "{name:<32}");
     for (cell, width) in cells.iter().zip([7, 7, 9, 9, 9, 9]) {
         let _ = write!(out, " {cell:>width$}");
@@ -113,7 +112,8 @@ pub fn bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
     let mut value = n as f64;
     let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
+    // 1023.5, not 1024: a value that rounds up to 1024 would show as "1024K".
+    while value >= 1023.5 && unit < UNITS.len() - 1 {
         value /= 1024.0;
         unit += 1;
     }
@@ -124,7 +124,7 @@ pub fn bytes(n: u64) -> String {
     }
 }
 
-pub(crate) fn per_sec(n: u64) -> String {
+fn per_sec(n: u64) -> String {
     format!("{}/s", bytes(n))
 }
 
@@ -167,6 +167,11 @@ pub fn escape_control_str(s: &str) -> String {
 mod tests {
     use super::*;
     use cirro_proto::{MachineStatus, Route, VmInfo, VmStats};
+
+    #[test]
+    fn bytes_roll_over_to_the_next_unit_just_below_1024() {
+        assert_eq!(bytes(1_048_575), "1.0M");
+    }
 
     fn vm(name: &str, history: Vec<VmRates>) -> VmStats {
         VmStats {

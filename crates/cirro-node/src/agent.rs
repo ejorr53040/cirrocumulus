@@ -1171,7 +1171,7 @@ impl Agent {
     fn record_end(&self, name: &str, reason: EndReason) {
         let mut vms = self.vms.lock().unwrap();
         if let Some(Entry::Running { info, log, .. }) = vms.remove(name) {
-            info!(vm = name, reason = reason.as_str(), "VM ended");
+            info!(vm = name, reason = reason.describe(), "VM ended");
             let ended = Ended { at: now(), reason };
             if let Err(e) = self.store.lock().unwrap().mark_ended(name, &ended) {
                 error!(vm = name, "record the end: {e}");
@@ -1628,22 +1628,9 @@ fn guest_config(run: &RunRequest) -> Result<GuestConfig, ApiError> {
     })
 }
 
-/// VM, Machine and App names are 1-32 characters of lowercase letters, digits and hyphens,
-/// so they're safe in file names, URLs and log lines.
 /// `kind` names what the name is for, in the error: VM, Machine or App.
 fn validate_name(kind: &str, name: &str) -> Result<(), ApiError> {
-    let valid = (1..=32).contains(&name.len())
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    if valid {
-        Ok(())
-    } else {
-        Err(bad_request(&format!(
-            "invalid {kind} name {name:?}: a name is 1-32 characters of lowercase letters, \
-             digits and hyphens"
-        )))
-    }
+    cirro_proto::check_name(kind, name).map_err(|e| bad_request(&e))
 }
 
 fn resolve_group(group: &str) -> io::Result<u32> {

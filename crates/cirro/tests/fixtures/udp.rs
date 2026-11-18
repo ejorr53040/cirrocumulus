@@ -1,4 +1,4 @@
-// M7 fixture (security audit SA-01): UDP from inside a VM, including from
+// Fixture (security audit SA-01): UDP from inside a VM, including from
 // a source address the guest doesn't own.
 //
 // `udp listen <port>` prints `UDP_LISTENING`, then `UDP_FROM <ip:port>` for

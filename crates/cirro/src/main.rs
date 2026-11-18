@@ -17,12 +17,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// The compiled `guest-init` binary (musl static, RESEARCH.md M2), embedded
+/// The compiled `guest-init` binary (musl static), embedded
 /// so `cirro` ships as one self-contained binary: building a rootfs from an
 /// image writes these bytes out as the guest's `/init`. `build.rs` builds
 /// guest-init as part of building `cirro` itself, so this path always
 /// exists by the time this file is compiled.
-pub(crate) static GUEST_INIT_BINARY: &[u8] = include_bytes!(env!("CIRRO_GUEST_INIT"));
+static GUEST_INIT_BINARY: &[u8] = include_bytes!(env!("CIRRO_GUEST_INIT"));
 
 /// Where the CLI finds the Node agent unless told otherwise.
 const DEFAULT_SOCKET: &str = "/run/cirro/agent.sock";
@@ -46,7 +46,7 @@ enum Command {
     /// Manage the control plane
     #[command(subcommand)]
     Server(ServerCommand),
-    /// Boot a VM from an OCI image or a rootfs and print its VM address
+    /// Boot a VM from an OCI image or a rootfs and print its VM address, or with --machine make a Machine-backed App
     Run(RunArgs),
     /// Pull, list and remove cached images
     #[command(subcommand)]
@@ -55,7 +55,7 @@ enum Command {
     /// SSH
     #[command(subcommand)]
     Machine(MachineCommand),
-    /// List VMs
+    /// List VMs and Machine-backed Apps
     Ps {
         /// Also list Ended VMs, with when and why they ended
         #[arg(short, long)]
@@ -66,10 +66,14 @@ enum Command {
         /// Keep printing new output until the VM ends
         #[arg(short, long)]
         follow: bool,
+        #[arg(value_parser = parse_vm_name)]
         name: String,
     },
     /// Open a shell in a VM
-    Ssh { name: String },
+    Ssh {
+        #[arg(value_parser = parse_vm_name)]
+        name: String,
+    },
     /// Stop a VM
     Stop {
         /// Kill the VM immediately
@@ -78,14 +82,24 @@ enum Command {
         /// Seconds to wait for the VM to end before killing it
         #[arg(long, default_value_t = cirro_proto::DEFAULT_STOP_TIMEOUT_SECS, conflicts_with = "force")]
         timeout: u64,
+        #[arg(value_parser = parse_vm_name)]
         name: String,
     },
-    /// Delete an Ended VM's record and console log, or a parked VM's snapshot
-    Rm { name: String },
+    /// Remove an Ended VM, a parked VM's snapshot, or an App and its Route
+    Rm {
+        #[arg(value_parser = parse_vm_name)]
+        name: String,
+    },
     /// Snapshot a VM to disk and free its RAM
-    Park { name: String },
+    Park {
+        #[arg(value_parser = parse_vm_name)]
+        name: String,
+    },
     /// Start a parked VM again from its snapshot and print its VM address
-    Wake { name: String },
+    Wake {
+        #[arg(value_parser = parse_vm_name)]
+        name: String,
+    },
     /// Live terminal dashboard
     Top {
         /// Print one snapshot as text and exit
@@ -104,11 +118,9 @@ enum Command {
     OpenRootfs { uid: u32, gid: u32, path: PathBuf },
 }
 
+/// Guest memory and vCPUs, shared by `run` and `bench`.
 #[derive(Args)]
-struct RunArgs {
-    /// The VM's name
-    #[arg(long)]
-    name: String,
+struct Sizing {
     /// Guest memory, e.g. 256M or 1G
     #[arg(long, default_value = "256M", value_parser = parse_mem_mib)]
     mem: u32,
@@ -116,6 +128,15 @@ struct RunArgs {
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8)
         .range(i64::from(cirro_proto::MIN_VCPUS)..=i64::from(cirro_proto::MAX_VCPUS)))]
     vcpus: u8,
+}
+
+#[derive(Args)]
+struct RunArgs {
+    /// The VM's name
+    #[arg(long, value_parser = parse_vm_name)]
+    name: String,
+    #[command(flatten)]
+    sizing: Sizing,
     /// Set an environment variable for the command (repeatable)
     #[arg(short, long = "env", value_name = "KEY=VALUE", value_parser = parse_env)]
     env: Vec<String>,
@@ -160,13 +181,8 @@ struct BenchArgs {
     /// How many times to boot, park and wake a VM
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..))]
     runs: u32,
-    /// Guest memory, e.g. 256M or 1G
-    #[arg(long, default_value = "256M", value_parser = parse_mem_mib)]
-    mem: u32,
-    /// Guest vCPUs
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8)
-        .range(i64::from(cirro_proto::MIN_VCPUS)..=i64::from(cirro_proto::MAX_VCPUS)))]
-    vcpus: u8,
+    #[command(flatten)]
+    sizing: Sizing,
     /// An image, or the path of an ext4 rootfs with guest-init as /init
     #[arg(value_name = "IMAGE|ROOTFS")]
     image: String,
@@ -293,6 +309,7 @@ enum MachineCommand {
     /// Add a computer the Node agent reaches over SSH, pinning its host key
     Add {
         /// The Machine's name
+        #[arg(value_parser = parse_machine_name)]
         name: String,
         /// Who the agent logs in as, and where
         #[arg(long, value_name = "USER@HOST[:PORT]")]
@@ -305,7 +322,10 @@ enum MachineCommand {
     /// List Machines and whether the agent's connection to each is up
     Ls,
     /// Remove a Machine and its pinned host key
-    Rm { name: String },
+    Rm {
+        #[arg(value_parser = parse_machine_name)]
+        name: String,
+    },
     /// Print the Node agent's SSH public key, for a Machine's
     /// authorized_keys
     Key,
@@ -391,46 +411,9 @@ fn main() -> ExitCode {
             Command::Rm { name } => rm(&cli.socket, &name).await,
             Command::Park { name } => park(&cli.socket, &name).await,
             Command::Wake { name } => wake(&cli.socket, &name).await,
-            Command::Node(NodeCommand::Install {
-                state_dir,
-                group,
-                subnet,
-                unit_name,
-                firecracker,
-                jailer,
-                kernel,
-                http,
-                https,
-                acme_email,
-            }) => cirro_image::check_mke2fs()
-                .map_err(|e| io::Error::other(e.to_string()))
-                .and_then(|()| {
-                    install::install(&install::InstallConfig {
-                        state_dir,
-                        socket: cli.socket,
-                        group,
-                        subnet,
-                        unit_name,
-                        edge: install::EdgeConfig {
-                            http,
-                            https,
-                            acme_email,
-                        },
-                        // `requires` on all three CLI args above guarantees this is
-                        // never a partial combination.
-                        release_override: match (firecracker, jailer, kernel) {
-                            (Some(firecracker), Some(jailer), Some(kernel)) => {
-                                Some(ReleaseBinaries {
-                                    firecracker,
-                                    jailer,
-                                    kernel,
-                                })
-                            }
-                            _ => None,
-                        },
-                    })
-                })
-                .map_err(|e| format!("node install: {e}")),
+            Command::Node(command @ NodeCommand::Install { .. }) => {
+                node_install(&cli.socket, command)
+            }
             Command::Node(NodeCommand::Ca) => node_ca(&cli.socket).await,
             Command::Node(NodeCommand::Uninstall { state_dir, force }) => {
                 install::uninstall(&state_dir, force)
@@ -447,6 +430,50 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Checks the host's tools, then installs the Node: `command` is the parsed
+/// `node install`.
+fn node_install(socket: &Path, command: NodeCommand) -> Result<(), String> {
+    let NodeCommand::Install {
+        state_dir,
+        group,
+        subnet,
+        unit_name,
+        firecracker,
+        jailer,
+        kernel,
+        http,
+        https,
+        acme_email,
+    } = command
+    else {
+        unreachable!("dispatched only for `node install`")
+    };
+    cirro_image::check_mke2fs().map_err(|e| format!("node install: {e}"))?;
+    install::install(&install::InstallConfig {
+        state_dir,
+        socket: socket.to_path_buf(),
+        group,
+        subnet,
+        unit_name,
+        edge: install::EdgeConfig {
+            http,
+            https,
+            acme_email,
+        },
+        // `requires` on all three CLI args above guarantees this is
+        // never a partial combination.
+        release_override: match (firecracker, jailer, kernel) {
+            (Some(firecracker), Some(jailer), Some(kernel)) => Some(ReleaseBinaries {
+                firecracker,
+                jailer,
+                kernel,
+            }),
+            _ => None,
+        },
+    })
+    .map_err(|e| format!("node install: {e}"))
 }
 
 /// The Node agent logs to stderr (the journal, under systemd). `CIRRO_LOG`
@@ -498,8 +525,8 @@ async fn run(socket: &Path, args: RunArgs) -> Result<(), String> {
     let image = args.image.ok_or("an image or rootfs is required")?;
     let request = run_request(
         args.name,
-        args.mem,
-        args.vcpus,
+        args.sizing.mem,
+        args.sizing.vcpus,
         &image,
         Guest {
             command: args.command,
@@ -582,8 +609,8 @@ async fn run_request(
 async fn bench(socket: &Path, args: BenchArgs) -> Result<(), String> {
     let template = run_request(
         String::new(),
-        args.mem,
-        args.vcpus,
+        args.sizing.mem,
+        args.sizing.vcpus,
         &args.image,
         Guest {
             command: args.command,
@@ -762,25 +789,20 @@ async fn top(socket: &Path) -> Result<(), String> {
 async fn top_loop(socket: &Path, terminal: &mut ratatui::DefaultTerminal) -> Result<(), String> {
     use ratatui::crossterm::event::{self, Event, KeyEventKind};
     let mut dashboard = cirro_tui::Dashboard::default();
-    let mut next_refresh = std::time::Instant::now();
+    let mut next_refresh = Instant::now();
     // Stops run in the background (a graceful one can take its whole
     // timeout) and report back here.
     let (stopped, mut stop_results) = tokio::sync::mpsc::unbounded_channel();
     loop {
-        if std::time::Instant::now() >= next_refresh {
-            let refreshed = async {
-                let stats = client::call::<Stats>(socket, Method::GET, "/stats", None::<&()>);
-                let apps = client::call(socket, Method::GET, "/machine-apps", None::<&()>);
-                Ok::<_, String>((stats.await?, apps.await?))
-            };
-            match refreshed.await {
+        if Instant::now() >= next_refresh {
+            match dashboard_data(socket).await {
                 Ok((stats, machine_apps)) => {
                     dashboard.set_stats(stats);
                     dashboard.set_machine_apps(machine_apps);
                 }
                 Err(e) => dashboard.set_refresh_error(e),
             }
-            next_refresh = std::time::Instant::now() + Duration::from_secs(1);
+            next_refresh = Instant::now() + Duration::from_secs(1);
         }
         while let Ok((name, result)) = stop_results.try_recv() {
             dashboard.set_status(match result {
@@ -791,7 +813,7 @@ async fn top_loop(socket: &Path, terminal: &mut ratatui::DefaultTerminal) -> Res
         terminal
             .draw(|frame| dashboard.draw(frame))
             .map_err(|e| format!("drawing the dashboard: {e}"))?;
-        let wait = next_refresh.saturating_duration_since(std::time::Instant::now());
+        let wait = next_refresh.saturating_duration_since(Instant::now());
         if !event::poll(wait).map_err(|e| format!("reading the terminal: {e}"))? {
             continue;
         }
@@ -806,7 +828,7 @@ async fn top_loop(socket: &Path, terminal: &mut ratatui::DefaultTerminal) -> Res
             cirro_tui::Action::None => {}
             cirro_tui::Action::Quit => return Ok(()),
             cirro_tui::Action::ShowLog(name) => match log_tail(socket, &name).await {
-                Ok(log) => dashboard.set_log(&name, &String::from_utf8_lossy(&log)),
+                Ok(log) => dashboard.set_log(&name, String::from_utf8_lossy(&log).into_owned()),
                 Err(e) => dashboard.set_status(e),
             },
             cirro_tui::Action::Stop(name) => {
@@ -828,10 +850,16 @@ async fn top_loop(socket: &Path, terminal: &mut ratatui::DefaultTerminal) -> Res
     }
 }
 
+/// The dashboard's two snapshots, fetched together.
+async fn dashboard_data(socket: &Path) -> Result<(Stats, Vec<MachineAppInfo>), String> {
+    tokio::try_join!(
+        client::call(socket, Method::GET, "/stats", None::<&()>),
+        client::call(socket, Method::GET, "/machine-apps", None::<&()>),
+    )
+}
+
 async fn top_once(socket: &Path) -> Result<(), String> {
-    let stats: Stats = client::call(socket, Method::GET, "/stats", None::<&()>).await?;
-    let machine_apps: Vec<MachineAppInfo> =
-        client::call(socket, Method::GET, "/machine-apps", None::<&()>).await?;
+    let (stats, machine_apps) = dashboard_data(socket).await?;
     print!("{}", cirro_tui::snapshot(&stats, &machine_apps));
     Ok(())
 }
@@ -845,12 +873,15 @@ async fn node_ca(socket: &Path) -> Result<(), String> {
 
 async fn ps(socket: &Path, all: bool) -> Result<(), String> {
     let path = if all { "/vms?all=true" } else { "/vms" };
-    let vms: Vec<VmInfo> = client::call(socket, Method::GET, path, None::<&()>).await?;
+    // `ps` skips `/stats` (Node-wide samples it doesn't show); the CLI and
+    // agent share one host, so the local clock serves for uptime.
+    let (vms, machine_apps) = tokio::try_join!(
+        client::call::<Vec<VmInfo>>(socket, Method::GET, path, None::<&()>),
+        client::call::<Vec<MachineAppInfo>>(socket, Method::GET, "/machine-apps", None::<&()>),
+    )?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let machine_apps: Vec<MachineAppInfo> =
-        client::call(socket, Method::GET, "/machine-apps", None::<&()>).await?;
     let mut header = ps_row([
         "NAME",
         "VM ADDRESS",
@@ -887,7 +918,7 @@ async fn ps(socket: &Path, all: bool) -> Result<(), String> {
                 None => row.push_str("  running"),
                 Some(ended) => row.push_str(&format!(
                     "  {} {} ago",
-                    ended.reason.as_str(),
+                    ended.reason.describe(),
                     cirro_tui::duration(now.saturating_sub(ended.at))
                 )),
             }
@@ -1135,10 +1166,13 @@ async fn rm(socket: &Path, name: &str) -> Result<(), String> {
 /// Parses `--mem`: a count of MiB with an optional `M`/`G` suffix.
 fn parse_mem_mib(s: &str) -> Result<u32, String> {
     let lower = s.to_ascii_lowercase();
-    let trimmed = lower.trim_end_matches("ib").trim_end_matches('b');
-    let (digits, scale) = match trimmed.strip_suffix('g') {
+    let unit = lower
+        .strip_suffix("ib")
+        .or_else(|| lower.strip_suffix('b'))
+        .unwrap_or(&lower);
+    let (digits, scale) = match unit.strip_suffix('g') {
         Some(d) => (d, 1024),
-        None => (trimmed.strip_suffix('m').unwrap_or(trimmed), 1),
+        None => (unit.strip_suffix('m').unwrap_or(unit), 1),
     };
     let n: u32 = digits
         .parse()
@@ -1153,6 +1187,16 @@ fn parse_mem_mib(s: &str) -> Result<u32, String> {
             cirro_proto::MAX_MEM_MIB
         )),
     }
+}
+
+/// Checks a VM name at the CLI, so a bad one fails in clap, not at the socket.
+fn parse_vm_name(s: &str) -> Result<String, String> {
+    cirro_proto::check_name("VM", s).map(|()| s.to_owned())
+}
+
+/// Checks a Machine name at the CLI, as `parse_vm_name` does for VMs.
+fn parse_machine_name(s: &str) -> Result<String, String> {
+    cirro_proto::check_name("Machine", s).map(|()| s.to_owned())
 }
 
 /// Parses `--env`: `KEY=VALUE` with a non-empty key.
@@ -1199,6 +1243,25 @@ mod tests {
             GUEST_INIT_BINARY.len()
         );
         assert_eq!(&GUEST_INIT_BINARY[..4], b"\x7fELF", "not an ELF binary");
+    }
+
+    #[test]
+    fn parses_memory_sizes() {
+        for (arg, mib) in [
+            ("256M", 256),
+            ("1G", 1024),
+            ("1GiB", 1024),
+            ("512MB", 512),
+            ("64G", 65536),
+        ] {
+            assert_eq!(super::parse_mem_mib(arg), Ok(mib), "{arg}");
+        }
+        for arg in ["256bbb", "1Gi", "65537M", "65G", "0"] {
+            assert!(
+                super::parse_mem_mib(arg).is_err(),
+                "{arg} should be refused"
+            );
+        }
     }
 
     #[test]

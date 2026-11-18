@@ -1,4 +1,4 @@
-// M3 fixture: tries a TCP connection to each `ip:port` argument from inside
+// Fixture: tries a TCP connection to each `ip:port` argument from inside
 // the VM and prints one line per target -- `PROBE <target> OPEN`,
 // `PROBE <target> REFUSED` (reachable, nothing listening) or
 // `PROBE <target> FAILED <error>` (e.g. dropped, so it timed out) -- then

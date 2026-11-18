@@ -1,4 +1,4 @@
-// M6 fixture: state that only memory holds. Answers each connection on port
+// Fixture: state that only memory holds. Answers each connection on port
 // 8080 with how many it has answered so far (`count 1`, `count 2`, ...), so
 // a guest restored from a snapshot carries on counting where a rebooted one
 // would start again at 1. `GET /slow` is answered after 4 s, for a request

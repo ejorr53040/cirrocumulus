@@ -138,7 +138,9 @@ impl Agent {
             Entry::Ended { info, .. } if is_parked(info) => Step::Wake(name),
             Entry::Ended { info, .. } => Step::Answer(Resolution::Unavailable(format!(
                 "App {name:?} has ended ({})",
-                info.ended.as_ref().map_or("unknown", |e| e.reason.as_str())
+                info.ended
+                    .as_ref()
+                    .map_or("unknown", |e| e.reason.describe())
             ))),
         }
     }

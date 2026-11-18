@@ -1,4 +1,4 @@
-// M6 fixture: traffic the guest starts itself. Opens a TCP connection to
+// Fixture: traffic the guest starts itself. Opens a TCP connection to
 // its `ip:port` argument every 100 ms and prints `DIAL <n> OPEN` or
 // `DIAL <n> FAILED <error>`, so a guest woken from a snapshot shows whether
 // it can reach out before anything has reached in to it.

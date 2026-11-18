@@ -22,7 +22,7 @@ use std::sync::{Mutex, MutexGuard};
 
 mod common;
 use common::{
-    AGENT_OCTETS_FROM, edge_port, home, latest_kernel, repo_root, rootfs, test_agent,
+    AGENT_OCTETS_FROM, edge_port, home, latest_kernel, repo_root, rootfs, sudo_cirro, test_agent,
     test_agent_path, tls_edge_port,
 };
 
@@ -72,12 +72,9 @@ impl Install {
     }
 
     fn install_cmd(&self) -> std::process::Command {
-        let agent_bin = test_agent().expect("checked at construction");
         let repo = repo_root();
-        let mut cmd = std::process::Command::new("sudo");
-        cmd.arg("-n")
-            .arg(agent_bin)
-            .args(["node", "install", "--state-dir"])
+        let mut cmd = sudo_cirro();
+        cmd.args(["node", "install", "--state-dir"])
             .arg(&self.state_dir)
             .arg("--socket")
             .arg(self.socket())
@@ -108,11 +105,8 @@ impl Install {
     }
 
     fn uninstall(&self, force: bool) -> Result<(), String> {
-        let agent_bin = test_agent().expect("checked at construction");
-        let mut cmd = std::process::Command::new("sudo");
-        cmd.arg("-n")
-            .arg(agent_bin)
-            .args(["node", "uninstall", "--state-dir"])
+        let mut cmd = sudo_cirro();
+        cmd.args(["node", "uninstall", "--state-dir"])
             .arg(&self.state_dir);
         if force {
             cmd.arg("--force");
@@ -212,6 +206,25 @@ fn install_creates_a_group_state_dir_and_enabled_unit_and_is_idempotent() {
         Some(install.state_dir.join("bin/cirro").to_str().unwrap()),
         "the unit doesn't run install's own copy of cirro"
     );
+    // Likewise firecracker, which the unit runs from install's copy under the
+    // state dir, not the repo's file a user could change.
+    let args: Vec<&str> = exec_start.split_whitespace().collect();
+    let firecracker = args
+        .iter()
+        .position(|arg| *arg == "--firecracker")
+        .and_then(|i| args.get(i + 1))
+        .copied();
+    assert_eq!(
+        firecracker,
+        Some(
+            install
+                .state_dir
+                .join("release/firecracker")
+                .to_str()
+                .unwrap()
+        ),
+        "the unit doesn't run install's own copy of firecracker"
+    );
     // The agent's flags parse: `--help` only answers once everything before
     // it has.
     let parsed = std::process::Command::new(env!("CARGO_BIN_EXE_cirro"))
@@ -266,17 +279,15 @@ fn install_creates_a_group_state_dir_and_enabled_unit_and_is_idempotent() {
 
 #[test]
 fn uninstall_of_a_state_dir_that_was_never_installed_fails_clearly() {
-    let Some(agent_bin) = test_agent() else {
+    if test_agent().is_none() {
         eprintln!("skipping: no test agent");
         return;
-    };
+    }
     let never_installed = home().join(format!(
         ".cache/cirro-install-test-missing-{}",
         std::process::id()
     ));
-    let output = std::process::Command::new("sudo")
-        .arg("-n")
-        .arg(agent_bin)
+    let output = sudo_cirro()
         .args(["node", "uninstall", "--state-dir"])
         .arg(&never_installed)
         .output()
@@ -309,9 +320,7 @@ fn uninstall_force_kills_the_nodes_running_vms() {
     install.install().expect("install");
 
     // As root: the test user isn't in the install's own group.
-    let run = std::process::Command::new("sudo")
-        .arg("-n")
-        .arg(test_agent().expect("checked at construction"))
+    let run = sudo_cirro()
         .arg("--socket")
         .arg(install.socket())
         .args(["run", "--name", "web"])

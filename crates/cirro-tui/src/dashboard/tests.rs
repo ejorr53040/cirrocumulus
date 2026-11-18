@@ -173,7 +173,7 @@ fn l_asks_for_the_selected_vms_log_and_shows_its_last_lines() {
         Action::ShowLog("web".into())
     );
     let log: String = (1..=50).map(|n| format!("line {n}\n")).collect();
-    dashboard.set_log("web", &log);
+    dashboard.set_log("web", log);
 
     let shown = detail(&screen(&dashboard));
     assert!(shown.contains("line 50"), "{shown}");

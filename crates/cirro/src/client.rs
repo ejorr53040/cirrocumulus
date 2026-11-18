@@ -57,10 +57,9 @@ pub(crate) async fn send(
         .request(request)
         .await
         .map_err(|e| connect_error(socket, &e))?;
-    let status = response.status();
-    let headers = response.headers().clone();
-    let body = response
-        .into_body()
+    let (parts, body) = response.into_parts();
+    let status = parts.status;
+    let body = body
         .collect()
         .await
         .map_err(|e| format!("reading the Node agent's response: {e}"))?
@@ -73,7 +72,7 @@ pub(crate) async fn send(
             Err(_) => format!("the Node agent answered {status}"),
         });
     }
-    Ok((headers, body))
+    Ok((parts.headers, body))
 }
 
 /// Explains a failure to reach the agent, calling out the common case of a

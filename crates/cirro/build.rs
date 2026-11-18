@@ -1,7 +1,6 @@
-//! Builds `guest-init` (musl static, see `crates/guest-init` and
-//! RESEARCH.md M2) as part of building `cirro`, so `main.rs` can
+//! Builds `guest-init` (musl static, see `crates/guest-init`) as part of building `cirro`, so `main.rs` can
 //! `include_bytes!` it -- the "single `cirro` binary, no daemon sprawl"
-//! pitch (RESEARCH.md §0) means guest-init has to ship inside `cirro`
+//! pitch means guest-init has to ship inside `cirro`
 //! itself, not as a separate artifact a user has to know to also install.
 //!
 //! The `cirro-guest-init` package says where its source is through `links`

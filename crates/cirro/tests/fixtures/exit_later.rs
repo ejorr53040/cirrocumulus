@@ -1,4 +1,4 @@
-// M3 fixture: a command that exits on its own, cleanly, a few seconds after
+// Fixture: a command that exits on its own, cleanly, a few seconds after
 // starting -- after `run`'s 2 s grace period, so `run` succeeds and the VM
 // later ends by itself. Built static for musl by `tests/node_agent.rs`, like
 // http_app.rs.
