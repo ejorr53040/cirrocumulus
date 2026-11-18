@@ -218,6 +218,44 @@ struct Replaced {
     log: PathBuf,
 }
 
+/// A name [`Agent::reserve`]d as [`Entry::Starting`] for a start or a wake.
+/// Dropped while the name is still Starting, after a failure or a panic
+/// alike, it puts back the Ended VM the new one would have replaced, or else
+/// frees the name, so no App is left Starting for good.
+struct Reservation {
+    agent: Arc<Agent>,
+    name: String,
+    replaced: Option<Replaced>,
+    /// A start's own console log, which goes with the reservation. A wake
+    /// writes to the parked VM's, which stays.
+    own_log: Option<PathBuf>,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        // A lock poisoned by the panic being unwound: panicking again here
+        // would abort the whole agent.
+        let Ok(mut vms) = self.agent.vms.lock() else {
+            return;
+        };
+        if !matches!(vms.get(&self.name), Some(Entry::Starting { .. })) {
+            return;
+        }
+        match self.replaced.take() {
+            Some(Replaced { info, log }) => {
+                vms.insert(std::mem::take(&mut self.name), Entry::Ended { info, log });
+            }
+            None => {
+                vms.remove(&self.name);
+            }
+        }
+        drop(vms);
+        if let Some(log) = &self.own_log {
+            let _ = std::fs::remove_file(log);
+        }
+    }
+}
+
 struct Agent {
     node: vm::NodeConfig,
     subnet: Subnet,
@@ -260,10 +298,12 @@ impl Drop for Settled {
 /// parked dir and the parent cgroup go only if nothing is left in them. The
 /// Node's egress policy is ensured first, and outlives the agent.
 pub async fn run(config: Config) -> io::Result<()> {
-    // Both refusals below run before the agent changes anything on the
+    // The refusals below run before the agent changes anything on the
     // Node: a live socket is checked first (the fastest way to tell this
-    // start is a mistake), then the state dir's subnet.
+    // start is a mistake), then the other Node subnets on this host, then
+    // the state dir's subnet.
     refuse_if_already_running(&config.socket)?;
+    refuse_if_host_ids_shared(config.subnet)?;
 
     let logs_dir = layout::logs(&config.state_dir);
     std::fs::create_dir_all(&logs_dir)?;
@@ -478,6 +518,29 @@ fn refuse_if_already_running(socket: &Path) -> io::Result<()> {
     }
 }
 
+/// Refuses a Node subnet whose VMs could share a host id with those of
+/// another Node subnet an agent has run on here: each agent's unwinds and
+/// startup sweep would tear down the other's VMs. Two agents that start at
+/// the same moment can both pass; this is for the operator who picks a
+/// second subnet, not for a race.
+fn refuse_if_host_ids_shared(subnet: Subnet) -> io::Result<()> {
+    let others = egress::node_subnets()
+        .map_err(|e| io::Error::other(format!("read the Node subnets on this host: {e}")))?;
+    match others
+        .into_iter()
+        .find(|&other| subnet.shares_host_ids_with(other))
+    {
+        Some(other) => Err(io::Error::other(format!(
+            "Node subnet {subnet} gives its VMs the same host ids as Node subnet {other}, \
+             which an agent has run on here; host objects are named by the low 16 bits of \
+             the VM address, so the two agents would tear down each other's VMs. Pick a \
+             subnet whose last two octets don't overlap {other}'s, or, if no agent uses \
+             {other} any more, `nft delete element ip cirro node_subnets {{ {other} }}`"
+        ))),
+        None => Ok(()),
+    }
+}
+
 impl Agent {
     /// Samples the Node and every running VM, for [`Agent::stats`].
     fn sample(&self, sampler: &Sampler) {
@@ -600,6 +663,12 @@ impl Agent {
             (vm_address, replaced)
         };
 
+        let reservation = Reservation {
+            agent: self.clone(),
+            name: run.name,
+            replaced,
+            own_log: Some(log.clone()),
+        };
         let spec = VmSpec {
             vm_address,
             rootfs: run.rootfs,
@@ -609,9 +678,8 @@ impl Agent {
             guest,
             console_log: log,
         };
-        let (name, route) = (run.name, run.route);
         let agent = self.clone();
-        self.detached("starting", agent.start_vm(name, spec, route, replaced))
+        self.detached("starting", agent.start_vm(reservation, spec, run.route))
             .await
     }
 
@@ -795,9 +863,15 @@ impl Agent {
             };
             (spec, parked)
         };
+        let reservation = Reservation {
+            agent: self.clone(),
+            name: name.clone(),
+            replaced: Some(parked),
+            own_log: None,
+        };
         let agent = self.clone();
         self.detached("waking", async move {
-            let woken = agent.clone().finish_wake(name.clone(), spec, parked).await;
+            let woken = agent.clone().finish_wake(reservation, spec).await;
             let mut failures = agent.wake_failures.lock().unwrap();
             match &woken {
                 Ok(_) => failures.remove(&name),
@@ -810,19 +884,10 @@ impl Agent {
 
     async fn finish_wake(
         self: Arc<Self>,
-        name: String,
+        mut reservation: Reservation,
         spec: WakeSpec,
-        parked: Replaced,
     ) -> Result<VmInfo, ApiError> {
-        let put_back = |agent: &Agent, parked: Replaced| {
-            agent.vms.lock().unwrap().insert(
-                name.clone(),
-                Entry::Ended {
-                    info: parked.info,
-                    log: parked.log,
-                },
-            );
-        };
+        let name = &reservation.name;
         let vm = match Vm::wake(&self.node, &spec)
             .instrument(info_span!("wake", vm = name, address = %spec.vm_address))
             .await
@@ -830,20 +895,17 @@ impl Agent {
             Ok(vm) => vm,
             Err(e) => {
                 warn!(vm = name, "failed to wake: {e}");
-                put_back(&self, parked);
                 return Err(ApiError(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     format!("VM {name:?} failed to wake, and is still parked: {e}"),
                 ));
             }
         };
-        let started = started_info(
-            &name,
-            spec.vm_address,
-            spec.mem_mib,
-            spec.vcpus,
-            parked.info.route.clone(),
-        );
+        let route = reservation
+            .replaced
+            .as_ref()
+            .and_then(|parked| parked.info.route.clone());
+        let started = started_info(name, spec.vm_address, spec.mem_mib, spec.vcpus, route);
         // Emptied by the wake, and gone before a park of the new VM can make
         // it again.
         let _ = std::fs::remove_dir(&spec.snapshot);
@@ -857,16 +919,19 @@ impl Agent {
                     at: now(),
                     reason: EndReason::Forced,
                 };
-                if let Err(e) = self.store.lock().unwrap().mark_ended(&name, &ended) {
+                if let Err(e) = self.store.lock().unwrap().mark_ended(name, &ended) {
                     error!(vm = name, "record the end: {e}");
                 }
-                self.vms.lock().unwrap().insert(
-                    name.clone(),
-                    Entry::Ended {
-                        info: ended_info(parked.info, ended),
-                        log: parked.log,
-                    },
-                );
+                // Taken from the reservation, which would put it back parked.
+                if let Some(parked) = reservation.replaced.take() {
+                    self.vms.lock().unwrap().insert(
+                        name.clone(),
+                        Entry::Ended {
+                            info: ended_info(parked.info, ended),
+                            log: parked.log,
+                        },
+                    );
+                }
                 return Err(internal(format!(
                     "VM {name:?} woke, but recording it failed, so it was stopped and its \
                      snapshot is lost: {e}"
@@ -883,11 +948,11 @@ impl Agent {
     /// puts back the Ended VM it would have replaced.
     async fn start_vm(
         self: Arc<Self>,
-        name: String,
+        mut reservation: Reservation,
         spec: VmSpec,
         route: Option<Route>,
-        replaced: Option<Replaced>,
     ) -> Result<VmInfo, ApiError> {
+        let name = &reservation.name;
         let vm = match Vm::start(&self.node, &spec)
             .instrument(info_span!("start", vm = name, address = %spec.vm_address))
             .await
@@ -895,24 +960,22 @@ impl Agent {
             Ok(vm) => vm,
             Err(e) => {
                 warn!(vm = name, "failed to start: {e}");
-                self.forget_start(&name, replaced, &spec.console_log);
                 return Err(ApiError(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     format!("VM {name:?} failed to start: {e}"),
                 ));
             }
         };
-        let started = started_info(&name, spec.vm_address, spec.mem_mib, spec.vcpus, route);
-        let info = match self.keep(started, &spec.console_log, vm).await {
-            Ok(info) => info,
-            Err(e) => {
-                self.forget_start(&name, replaced, &spec.console_log);
-                return Err(internal(format!(
+        let started = started_info(name, spec.vm_address, spec.mem_mib, spec.vcpus, route);
+        let info = self
+            .keep(started, &spec.console_log, vm)
+            .await
+            .map_err(|e| {
+                internal(format!(
                     "VM {name:?} started, but recording it failed, so it was stopped: {e}"
-                )));
-            }
-        };
-        if let Some(old) = replaced {
+                ))
+            })?;
+        if let Some(old) = reservation.replaced.take() {
             let _ = std::fs::remove_file(old.log);
         }
         info!(vm = name, address = %spec.vm_address, "VM started");
@@ -1076,19 +1139,6 @@ impl Agent {
                 vm::clean_up(&jails, vm_address).await;
             }
         }
-    }
-
-    /// Undoes the reservation of a start that failed: puts back the Ended VM
-    /// it would have replaced, and removes the log of its own.
-    fn forget_start(&self, name: &str, replaced: Option<Replaced>, log: &Path) {
-        {
-            let mut vms = self.vms.lock().unwrap();
-            vms.remove(name);
-            if let Some(Replaced { info, log }) = replaced {
-                vms.insert(name.to_string(), Entry::Ended { info, log });
-            }
-        }
-        let _ = std::fs::remove_file(log);
     }
 
     /// Turns a running VM's record into an Ended VM's, once its host state

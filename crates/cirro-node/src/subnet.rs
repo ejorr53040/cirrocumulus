@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 /// A Node subnet such as `10.77.0.0/24`. `.1` is the Node's own address;
 /// VM addresses are handed out from `.2` up.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Subnet {
     network: u32,
     prefix_len: u8,
@@ -54,5 +54,49 @@ impl Subnet {
     pub(crate) fn vm_addresses(self) -> impl Iterator<Item = Ipv4Addr> {
         let broadcast = self.network | (u32::MAX >> self.prefix_len);
         (self.network + 2..broadcast).map(Ipv4Addr::from)
+    }
+
+    /// Whether an agent on `other`, another Node subnet, would give one of
+    /// its VMs a host id this subnet's VMs can have. Host objects are named
+    /// by host id alone, so the two agents would tear down each other's VMs.
+    pub(crate) fn shares_host_ids_with(self, other: Subnet) -> bool {
+        let (ours, theirs) = (self.host_ids(), other.host_ids());
+        self != other && ours.start() <= theirs.end() && theirs.start() <= ours.end()
+    }
+
+    /// The low 16 bits of this subnet's VM addresses, which
+    /// [`crate::vm::host_id`] names host objects by. A prefix of at least 16
+    /// keeps them in order, with no wrap.
+    fn host_ids(self) -> std::ops::RangeInclusive<u16> {
+        let broadcast = self.network | (u32::MAX >> self.prefix_len);
+        (self.network + 2) as u16..=(broadcast - 1) as u16
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn subnet(s: &str) -> Subnet {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn subnets_whose_vm_addresses_share_low_16_bits_share_host_ids() {
+        let node = subnet("10.77.5.0/24");
+        assert!(node.shares_host_ids_with(subnet("10.78.5.0/24")));
+        assert!(node.shares_host_ids_with(subnet("10.78.5.128/25")));
+        assert!(node.shares_host_ids_with(subnet("10.78.4.0/23")));
+        assert!(node.shares_host_ids_with(subnet("10.77.0.0/16")));
+    }
+
+    #[test]
+    fn a_subnet_shares_no_host_ids_with_itself_or_with_other_low_16_bits() {
+        let node = subnet("10.77.5.0/24");
+        assert!(!node.shares_host_ids_with(node));
+        assert!(!node.shares_host_ids_with(subnet("10.77.6.0/24")));
+        assert!(!node.shares_host_ids_with(subnet("10.78.6.0/24")));
+        // `.0`, `.1` and the broadcast address are no VM's.
+        assert!(!subnet("10.77.5.0/30").shares_host_ids_with(subnet("10.78.5.4/30")));
     }
 }

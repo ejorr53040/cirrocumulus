@@ -550,6 +550,57 @@ fn an_agent_refuses_a_state_dir_that_belongs_to_another_node_subnet() {
 }
 
 #[test]
+fn an_agent_refuses_a_subnet_whose_vms_would_share_host_ids_with_another_nodes() {
+    let Some(agent) = Agent::start(204) else {
+        return;
+    };
+    agent
+        .run("web", &rootfs().guest_init, &["/app/http_app"])
+        .success();
+
+    // Another Node, with a state dir of its own, on 10.78.204.0/24: its
+    // first VM would be `cirro-cc02`, like web, and its startup sweep would
+    // take web's host objects for its own leftovers.
+    let state_dir = home().join(format!(".cache/cirro-t{}-204b", std::process::id()));
+    std::fs::create_dir_all(&state_dir).expect("create state dir");
+    let mut other = std::process::Command::new("sudo");
+    other
+        .arg("-n")
+        .arg(test_agent().expect("Agent::start checked for it"))
+        .args(["node", "agent", "--state-dir"])
+        .arg(&state_dir)
+        .arg("--socket")
+        .arg(state_dir.join("agent.sock"))
+        .args(["--socket-group", &agent.socket_group])
+        .args(["--subnet", "10.78.204.0/24"])
+        .arg("--firecracker")
+        .arg(repo_root().join("firecracker"))
+        .arg("--jailer")
+        .arg(repo_root().join("jailer"))
+        .arg("--kernel")
+        .arg(latest_kernel());
+    let output = run_until_it_exits(other)
+        .expect("an agent whose VMs would share host ids should refuse to start, not run");
+    // The refusal comes before the agent writes to its state dir.
+    std::fs::remove_dir(&state_dir).expect("the refused agent left its state dir empty");
+    assert!(!output.status.success(), "it should fail: {output:?}");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("10.78.204.0/24") && err.contains("10.77.204.0/24"),
+        "the refusal should name both subnets, got: {err}"
+    );
+
+    let ps = agent.ps(false);
+    assert!(row(&ps, "web").is_some(), "web was lost:\n{ps}");
+    agent
+        .cirro()
+        .args(["stop", "--force", "web"])
+        .assert()
+        .success();
+    agent.assert_no_cirro_state();
+}
+
+#[test]
 fn an_agent_refuses_to_start_on_a_running_record_it_cannot_make_sense_of() {
     let Some(mut agent) = Agent::start(236) else {
         return;

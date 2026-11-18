@@ -28,9 +28,11 @@ HTTP(S) to Apps by hostname.
   agent, which takes them back when it starts again.
 - **Images.** `cirro image pull | ls | rm`: public `linux/amd64` images,
   built into a rootfs as the calling user, not root (ADR 0004).
-- **Egress policy.** One Node-wide nftables table masquerades VMs' traffic
-  and drops SMTP port 25, VM-to-VM and private-range LAN destinations, and anything a VM sends
-  from an address that isn't its own.
+- **Egress policy.** Two Node-wide nftables tables: `ip cirro` masquerades
+  VMs' traffic and drops SMTP port 25, VM-to-VM and private-range LAN
+  destinations, and anything a VM sends from an address that isn't its own;
+  `ip6 cirro` drops all IPv6 from VMs. An agent refuses a Node subnet whose
+  VMs' host objects would be named like another Node's on the same host.
 - **Dashboard.** `cirro top`: live CPU, memory, disk and network use of the
   Node and each VM, at 1 s.
 - **Park and wake.** `cirro park` snapshots a VM and frees its RAM;

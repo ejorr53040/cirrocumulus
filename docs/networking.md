@@ -59,12 +59,28 @@ The table is IPv4's. Guests are given no IPv6 address and their namespaces
 don't forward IPv6. A second table, `ip6 cirro`, drops whatever IPv6 still
 arrives from a VM's veth, and the Node turns IPv6 off on its end of each one.
 
-The table only ever drops, so a host firewall such as ufw still applies on
+Both tables only ever drop, so a host firewall such as ufw still applies on
 top. `cirro node install` adds the rule that lets VMs' traffic through it:
 `ufw route allow in on cirro-+ from <subnet>` when ufw is installed, and the
 subnet as a source of the `trusted` zone when firewalld is running.
 `cirro node uninstall` removes it. Any other firewall that drops forwarded
 traffic needs the same allowance by hand.
+
+The agent turns on `net.ipv4.ip_forward`, which makes the Node forward
+between all its interfaces, not only VMs' veths. A Node with two other
+interfaces, a LAN and a VPN say, then routes between them unless its host
+firewall drops forwarded traffic. The `cirro` tables leave that alone: a
+drop there is final across tables, so it would also cut off Docker,
+libvirt or a VPN gateway on the same host. On such a Node, set the host
+firewall's forward policy to drop (ufw's default, and what Docker sets);
+the rule `cirro node install` adds still lets VMs' traffic through.
+
+A VM's host objects (namespace, veth, cgroup, uid) are named from the low
+16 bits of its VM address, so `cirro-0502` could be `10.77.5.2` or
+`10.78.5.2`. An agent therefore refuses to start on a Node subnet whose VM
+addresses share those bits with another Node subnet in the `ip cirro`
+table's `node_subnets` set, which keeps every Node subnet an agent has run
+on here. Give a second Node on one host a different third octet.
 
 ## Reaching a VM
 
