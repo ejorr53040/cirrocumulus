@@ -33,7 +33,7 @@ use crate::firecracker::{BootConfig, Client, connect_beneath};
 pub(crate) use crate::process::ProcessId;
 use crate::subnet::Subnet;
 use cirro_guest_init::config::{CONFIG_PORT, Config as GuestConfig};
-use cirro_proto::EndReason;
+use cirro_proto::{CONSOLE_LOG_CAP, EndReason};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::net::Ipv4Addr;
@@ -971,6 +971,40 @@ fn console_tail_bytes(path: &Path) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// Whether `log` takes more disk than [`CONSOLE_LOG_CAP`]: one `stat`, made
+/// for every running VM each second.
+pub(crate) fn console_log_over_cap(log: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(log).is_ok_and(|m| m.blocks() * 512 > CONSOLE_LOG_CAP)
+}
+
+/// Frees the disk under all of `log` but its newest half
+/// [`CONSOLE_LOG_CAP`], by punching a hole over its head. Firecracker holds
+/// the log as its stdout for as long as the VM runs, so it can't be
+/// rotated, and rewriting it would race the guest's writes. A hole keeps the
+/// length and every offset as they were, so Firecracker's writes, a
+/// following `cirro logs` and anything the guest writes meanwhile carry on
+/// untouched. It ends on a block boundary, so it frees whole blocks and
+/// zeroes nothing that is kept.
+pub(crate) fn trim_console_log(log: &Path) -> std::io::Result<()> {
+    use nix::fcntl::{FallocateFlags, fallocate};
+    use std::os::unix::fs::MetadataExt;
+    let file = std::fs::OpenOptions::new().write(true).open(log)?;
+    let on_disk = file.metadata()?;
+    let block = on_disk.blksize().max(1);
+    let hole = on_disk.len().saturating_sub(CONSOLE_LOG_CAP / 2) / block * block;
+    if hole == 0 {
+        return Ok(());
+    }
+    let hole = nix::libc::off_t::try_from(hole).map_err(std::io::Error::other)?;
+    Ok(fallocate(
+        &file,
+        FallocateFlags::FALLOC_FL_PUNCH_HOLE | FallocateFlags::FALLOC_FL_KEEP_SIZE,
+        0,
+        hole,
+    )?)
+}
+
 /// One step of teardown, registered as the matching start step succeeds.
 enum Undo {
     DeleteNetns(String),
@@ -1246,5 +1280,29 @@ mod tests {
             name_failed_batch_command(failed, &commands).to_string(),
             "spawn ip: No such file or directory"
         );
+    }
+
+    #[test]
+    fn trimming_a_console_log_frees_its_head_and_keeps_its_offsets_and_newest_bytes() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = crate::test_util::tempdir("cirro-vm-console-cap");
+        let log = dir.join("web.0.log");
+        let mut contents = vec![b'a'; CONSOLE_LOG_CAP as usize];
+        contents.extend_from_slice(b"newest\n");
+        std::fs::write(&log, &contents).unwrap();
+        assert!(console_log_over_cap(&log));
+
+        trim_console_log(&log).unwrap();
+
+        assert!(!console_log_over_cap(&log));
+        let trimmed = std::fs::metadata(&log).unwrap();
+        assert!(
+            trimmed.blocks() * 512 <= CONSOLE_LOG_CAP / 2 + trimmed.blksize(),
+            "{} bytes still on disk",
+            trimmed.blocks() * 512
+        );
+        assert_eq!(trimmed.len(), contents.len() as u64, "offsets moved");
+        assert!(console_tail_bytes(&log).ends_with("newest\n"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -34,7 +34,10 @@
 //! VM under its name from its snapshot. The logs
 //! response is the console log from byte `offset` on (default 0), at most
 //! [`LOG_CHUNK`] bytes of it, as `text/plain`, with a [`VM_STATE_HEADER`] saying whether the VM is still
-//! running, so a client can follow it by polling from its last offset.
+//! running and a [`LOG_OFFSET_HEADER`] saying where its bytes start, so a
+//! client can follow it by polling from that start plus what it got. The
+//! start is past `offset` when the agent has freed the log's head
+//! ([`CONSOLE_LOG_CAP`]).
 //!
 //! Every non-2xx response carries an [`ErrorBody`].
 
@@ -44,6 +47,17 @@ use std::path::PathBuf;
 
 /// Response header on the logs endpoint: `running` or `ended`.
 pub const VM_STATE_HEADER: &str = "cirro-vm-state";
+
+/// Response header on the logs endpoint: the log offset of the body's first
+/// byte. Offsets never move, but the agent frees a long log's head, and an
+/// answer for an offset inside it starts at the oldest byte still kept.
+pub const LOG_OFFSET_HEADER: &str = "cirro-log-offset";
+
+/// The most disk one running VM's console log takes, give or take a
+/// second's output: tens of thousands of an App's log lines, while a full
+/// Node's logs stay a small part of its disk. Past it the agent frees all
+/// but the newest half. While the agent is down nothing enforces it.
+pub const CONSOLE_LOG_CAP: u64 = 4 << 20;
 
 /// The most of a console log one logs response holds. A full one means
 /// more was already there; ask again from where it ended.

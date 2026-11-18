@@ -6,8 +6,8 @@ use cirro_node::release::ReleaseBinaries;
 use cirro_node::subnet::Subnet;
 use cirro_node::{agent, install};
 use cirro_proto::{
-    AddMachine, LOG_CHUNK, MachineAppInfo, MachineAppRequest, MachineHostKey, MachineInfo,
-    MachineScan, Route, RunRequest, Stats, StopRequest, User, VM_STATE_HEADER, VmInfo,
+    AddMachine, LOG_CHUNK, LOG_OFFSET_HEADER, MachineAppInfo, MachineAppRequest, MachineHostKey,
+    MachineInfo, MachineScan, Route, RunRequest, Stats, StopRequest, User, VM_STATE_HEADER, VmInfo,
 };
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use hyper::Method;
@@ -933,7 +933,7 @@ async fn logs(socket: &Path, name: &str, follow: bool) -> Result<(), String> {
             None::<&()>,
         )
         .await?;
-        offset += bytes.len() as u64;
+        offset = log_start(&headers)? + bytes.len() as u64;
         held.extend_from_slice(&bytes);
         // A full chunk means the log already held more. Anything short is
         // where it ended as it was read, so a plain `logs` stops there even
@@ -970,18 +970,27 @@ fn unfinished(log: &[u8]) -> usize {
     }
 }
 
+/// Where a logs answer's bytes start in the log: past the offset asked for
+/// when the agent has freed the log's head there.
+fn log_start(headers: &hyper::HeaderMap) -> Result<u64, String> {
+    headers
+        .get(LOG_OFFSET_HEADER)
+        .and_then(|start| start.to_str().ok()?.parse().ok())
+        .ok_or_else(|| format!("the Node agent's logs answer has no {LOG_OFFSET_HEADER}"))
+}
+
 /// The last [`LOG_CHUNK`] bytes of `name`'s console log, read through to
 /// its end: the agent hands out at most one chunk per request.
-// ponytail: reads the whole log to find its end; an offset-from-end query
-// on the agent would avoid that if `top` on huge logs gets slow.
+// Reads all the agent keeps of the log, at most `CONSOLE_LOG_CAP`, to find
+// its end.
 async fn log_tail(socket: &Path, name: &str) -> Result<Vec<u8>, String> {
     let mut tail = Vec::new();
     let mut offset = 0u64;
     loop {
         let path = format!("/vms/{name}/logs?offset={offset}");
-        let (_, bytes) = client::send(socket, Method::GET, &path, None::<&()>).await?;
+        let (headers, bytes) = client::send(socket, Method::GET, &path, None::<&()>).await?;
         let full = bytes.len() as u64 == LOG_CHUNK;
-        offset += bytes.len() as u64;
+        offset = log_start(&headers)? + bytes.len() as u64;
         tail.extend_from_slice(&bytes);
         let keep = LOG_CHUNK as usize;
         if tail.len() > keep {

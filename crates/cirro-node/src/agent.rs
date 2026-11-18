@@ -30,9 +30,10 @@ use cirro_edge::tls::NodeCa;
 use cirro_edge::{Lease, Resolution, Router};
 use cirro_guest_init::config::{self as guest, Config as GuestConfig};
 use cirro_proto::{
-    AddMachine, DEFAULT_STOP_TIMEOUT_SECS, EndReason, Ended, ErrorBody, LOG_CHUNK, MAX_MEM_MIB,
-    MAX_VCPUS, MIN_MEM_MIB, MIN_VCPUS, MachineAppInfo, MachineAppRequest, MachineHostKey,
-    MachineScan, Route, RunRequest, Stats, StopRequest, VM_STATE_HEADER, VmInfo, VmStats,
+    AddMachine, DEFAULT_STOP_TIMEOUT_SECS, EndReason, Ended, ErrorBody, LOG_CHUNK,
+    LOG_OFFSET_HEADER, MAX_MEM_MIB, MAX_VCPUS, MIN_MEM_MIB, MIN_VCPUS, MachineAppInfo,
+    MachineAppRequest, MachineHostKey, MachineScan, Route, RunRequest, Stats, StopRequest,
+    VM_STATE_HEADER, VmInfo, VmStats,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -42,7 +43,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use nix::sys::stat::{Mode, umask};
 use std::collections::BTreeMap;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -416,6 +417,7 @@ pub async fn run(config: Config) -> io::Result<()> {
         loop {
             every_second.tick().await;
             sampling.sample(&sampler);
+            sampling.cap_console_logs();
         }
     });
 
@@ -559,6 +561,29 @@ impl Agent {
         let at = Instant::now();
         let readings = sampler.read(&running);
         self.metrics.lock().unwrap().record(at, readings);
+    }
+
+    /// Trims every console log still being written that has outgrown
+    /// [`cirro_proto::CONSOLE_LOG_CAP`]. Firecracker writes it directly, so
+    /// this tick is the only cap there is, and none while the agent is down.
+    fn cap_console_logs(&self) {
+        // One `stat` per VM, under the lock to spare copying every path each
+        // second; only the rare trim runs outside it.
+        let over: Vec<PathBuf> = self
+            .vms
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|entry| !matches!(entry, Entry::Ended { .. }))
+            .map(Entry::log)
+            .filter(|log| vm::console_log_over_cap(log))
+            .cloned()
+            .collect();
+        for log in over {
+            if let Err(e) = vm::trim_console_log(&log) {
+                warn!(log = %log.display(), "trim the console log: {e}");
+            }
+        }
     }
 
     fn stats(&self) -> Stats {
@@ -1289,12 +1314,13 @@ impl Agent {
             Some(entry @ Entry::Ended { .. }) => ("ended", entry.log().clone()),
             Some(entry) => ("running", entry.log().clone()),
         };
-        let bytes =
+        let (start, bytes) =
             read_log(&log, offset).map_err(|e| internal(format!("read the console log: {e}")))?;
         Ok(Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/plain; charset=utf-8")
             .header(VM_STATE_HEADER, state)
+            .header(LOG_OFFSET_HEADER, start)
             .body(Full::new(Bytes::from(bytes)))
             .expect("build logs response"))
     }
@@ -1491,19 +1517,37 @@ fn next_log_number(logs_dir: &Path) -> u64 {
         .map_or(0, |highest| highest + 1)
 }
 
-/// Up to [`LOG_CHUNK`] bytes of a console log from `offset`: empty past its
-/// end, or when it doesn't exist yet. A long-running App's log has no
-/// bound, so it is never read whole.
-fn read_log(log: &Path, offset: u64) -> io::Result<Vec<u8>> {
+/// Up to [`LOG_CHUNK`] bytes of a console log from `offset`, and the offset
+/// they start at: past `offset` when a trim ([`vm::trim_console_log`]) has
+/// freed the log there. Empty past its end, or when it doesn't exist yet.
+fn read_log(log: &Path, offset: u64) -> io::Result<(u64, Vec<u8>)> {
     let mut file = match std::fs::File::open(log) {
         Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((offset, Vec::new())),
         Err(e) => return Err(e),
     };
+    let Some(start) = next_data(&file, offset)? else {
+        return Ok((offset, Vec::new()));
+    };
     let mut bytes = Vec::new();
-    file.seek(SeekFrom::Start(offset))?;
-    file.take(LOG_CHUNK).read_to_end(&mut bytes)?;
-    Ok(bytes)
+    (&mut file).take(LOG_CHUNK).read_to_end(&mut bytes)?;
+    // A trim during the read frees bytes it may have read as zeros; they
+    // are dropped as if the trim had come first.
+    let kept = next_data(&file, start)?.unwrap_or(start);
+    let freed = kept.saturating_sub(start).min(bytes.len() as u64);
+    bytes.drain(..freed as usize);
+    Ok((start + freed, bytes))
+}
+
+/// The first offset from `offset` on that holds data, skipping a trimmed
+/// log's freed head, or `None` at or past its end.
+fn next_data(file: &std::fs::File, offset: u64) -> io::Result<Option<u64>> {
+    let offset = nix::libc::off_t::try_from(offset).map_err(io::Error::other)?;
+    match nix::unistd::lseek(file, offset, nix::unistd::Whence::SeekData) {
+        Ok(at) => Ok(Some(at as u64)),
+        Err(nix::errno::Errno::ENXIO) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// A VM that has just started (or woken) at `vm_address`.
@@ -1674,10 +1718,47 @@ mod tests {
         contents.extend_from_slice(b"tail");
         std::fs::write(&log, &contents).unwrap();
 
-        assert_eq!(read_log(&log, 0).unwrap().len(), LOG_CHUNK as usize);
-        assert_eq!(read_log(&log, LOG_CHUNK).unwrap(), b"tail");
-        assert!(read_log(&log, LOG_CHUNK + 4).unwrap().is_empty());
-        assert!(read_log(&dir.join("missing.log"), 0).unwrap().is_empty());
+        assert_eq!(read_log(&log, 0).unwrap().1.len(), LOG_CHUNK as usize);
+        assert_eq!(
+            read_log(&log, LOG_CHUNK).unwrap(),
+            (LOG_CHUNK, b"tail".to_vec())
+        );
+        assert_eq!(
+            read_log(&log, LOG_CHUNK + 4).unwrap(),
+            (LOG_CHUNK + 4, Vec::new())
+        );
+        assert_eq!(
+            read_log(&dir.join("missing.log"), 0).unwrap(),
+            (0, Vec::new())
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_trimmed_log_is_read_from_its_oldest_kept_byte_at_its_own_offset() {
+        let dir = crate::test_util::tempdir("cirro-agent-trimmed-log");
+        let log = dir.join("web.0.log");
+        let mut contents = vec![b'a'; cirro_proto::CONSOLE_LOG_CAP as usize];
+        contents.extend_from_slice(b"newest\n");
+        std::fs::write(&log, &contents).unwrap();
+        vm::trim_console_log(&log).unwrap();
+
+        let (start, bytes) = read_log(&log, 0).unwrap();
+        assert_eq!(
+            start,
+            cirro_proto::CONSOLE_LOG_CAP / 2,
+            "not read from the oldest kept byte"
+        );
+        assert_eq!(bytes.len(), LOG_CHUNK as usize);
+        assert!(
+            bytes.iter().all(|&b| b == b'a'),
+            "read the freed head as zeros"
+        );
+        // An offset inside the kept part is served as it was.
+        assert_eq!(
+            read_log(&log, contents.len() as u64 - 7).unwrap(),
+            (contents.len() as u64 - 7, b"newest\n".to_vec())
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

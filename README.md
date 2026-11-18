@@ -160,7 +160,7 @@ cirro image ls                    # cached images
 cirro image rm <image|digest>
 cirro ps [--all]                  # list VMs (--all includes Ended VMs)
 cirro top [--once]                # live CPU, memory, disk and network use
-cirro logs [--follow] <name>      # a VM's console log
+cirro logs [--follow] <name>      # a VM's console log (its newest 2-4 MiB)
 cirro stop [--force] [--timeout <secs>] <name>
 cirro rm <name>                   # delete an Ended VM's record and log, or a parked VM's snapshot
 cirro park <name>                 # snapshot a VM to disk and free its RAM

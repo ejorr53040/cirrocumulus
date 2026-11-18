@@ -68,6 +68,20 @@ directory (`0700`) under the state dir. Snapshots are not encrypted at rest:
 anyone with root or the raw disk reads guests' memory. Snapshots and the state
 database aren't fsynced (ADR 0006), so a power cut can lose a parked VM.
 
+Firecracker writes each VM's serial console straight into its console log in
+the state dir, on the disk that also holds the state database, the
+snapshots and every other VM's log. While the agent runs, it checks every
+running VM's log once a second and, past 4 MiB on disk (`CONSOLE_LOG_CAP`),
+frees all but the newest 2 MiB by punching a hole over the log's head, so a
+guest that prints forever costs the Node 4 MiB plus a second's output. The
+state dir's filesystem has to support hole punching (ext4, XFS, btrfs and
+tmpfs do); where it doesn't, the agent warns every second and nothing trims.
+Offsets in the log never move, so `cirro logs -f` carries on across a trim,
+and `cirro logs` starts at the oldest byte still kept. While the agent is
+down nothing trims: a guest writes as fast as its serial console goes
+(~150 KB/s, about half a gigabyte an hour) until the agent is back. The cap
+is per VM, so a Node's logs together grow with the number of VMs it runs.
+
 ## Machines
 
 A Machine is a computer the agent logs in to over SSH (ADR 0010); nothing on
@@ -133,10 +147,11 @@ A second review on 2026-11-11, of sandbox escapes and networking
 a wake chowned whatever a taken-over VMM had left in place of its snapshot
 files, that the Node took IPv6 from VMs' veths past the egress policy, and
 that the edge's 503s showed internet clients the agent's own errors; all
-three are fixed, with four Lows. Four more are open: console logs have no
-size limit, a taken-over VMM can point the agent's Firecracker API calls at
-another VM, two agents on one computer can collide, and turning on forwarding
-makes the Node a router for its other interfaces.
+three are fixed, with four Lows. Console logs had no size limit; they are
+capped now (see [Snapshots and state](#snapshots-and-state)). Three more are
+open: a taken-over VMM can point the agent's Firecracker API calls at
+another VM, two agents on one computer can collide, and turning on
+forwarding makes the Node a router for its other interfaces.
 
 No third party has audited Cirrocumulus. `cargo deny` checks every
 dependency against the RustSec advisory database in CI.

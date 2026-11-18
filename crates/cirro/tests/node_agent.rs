@@ -1059,6 +1059,98 @@ fn logs_reads_a_long_console_log_whole_and_returns_while_it_still_grows() {
 }
 
 #[test]
+fn a_console_log_past_its_cap_is_trimmed_to_its_newest_lines_while_logs_follows_it() {
+    let Some(agent) = Agent::start(197) else {
+        return;
+    };
+    agent
+        .run("chatty", &rootfs().guest_init, &["/app/chatter"])
+        .success();
+    // Reading from the first byte on, so it is mid-log when the agent trims.
+    let mut follow = std::process::Command::new(env!("CARGO_BIN_EXE_cirro"))
+        .env("CIRRO_SOCKET", &agent.socket)
+        .args(["logs", "-f", "chatty"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start cirro logs -f");
+    let mut piped = follow.stdout.take().unwrap();
+    // Drained as it comes, so a full pipe never holds the follower back.
+    let followed = std::thread::spawn(move || {
+        let mut output = String::new();
+        piped.read_to_string(&mut output).map(|_| output)
+    });
+
+    // Past the cap by a chunk, and back under it on disk. The console
+    // writes ~100-170 KB/s, so that takes half a minute.
+    let cap = cirro_proto::CONSOLE_LOG_CAP;
+    let log = agent.state_dir.join("logs/chatty.0.log");
+    let deadline = Instant::now() + 15 * TIMEOUT;
+    loop {
+        let (len, on_disk) =
+            std::fs::metadata(&log).map_or((0, 0), |m| (m.len(), m.blocks() * 512));
+        if len > cap + LOG_CHUNK && on_disk <= cap {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the log is {len} bytes long and takes {on_disk} bytes on disk, over the {cap} cap"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    agent
+        .cirro()
+        .args(["stop", "--force", "chatty"])
+        .assert()
+        .success();
+
+    let deadline = Instant::now() + TIMEOUT;
+    while follow.try_wait().expect("poll cirro logs -f").is_none() {
+        if Instant::now() >= deadline {
+            let _ = follow.kill();
+            panic!("`cirro logs -f` kept running after the VM ended");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // It kept up with the guest, so the trims freed only what it had read:
+    // every line, in order, through the guest's last.
+    let followed = chatter_numbers(&followed.join().unwrap().expect("read cirro logs -f"));
+    for (n, number) in followed.iter().enumerate() {
+        assert_eq!(*number, n as u64, "logs -f lost or doubled a line");
+    }
+
+    let logs = stdout(
+        agent
+            .cirro()
+            .args(["logs", "chatty"])
+            .timeout(TIMEOUT)
+            .assert()
+            .success(),
+    );
+    let kept = chatter_numbers(&logs);
+    assert!(
+        kept.first().is_some_and(|&first| first > 0),
+        "the log's head is still there"
+    );
+    assert_eq!(kept.last(), followed.last(), "the newest lines are gone");
+    for pair in kept.windows(2) {
+        assert_eq!(pair[1], pair[0] + 1, "a kept line is missing");
+    }
+
+    agent.cirro().args(["rm", "chatty"]).assert().success();
+    agent.assert_no_cirro_state();
+}
+
+/// The numbers of the whole `CHATTER` lines in `cirro logs` output. A
+/// trimmed log can start, and a killed guest's end, mid-line.
+fn chatter_numbers(output: &str) -> Vec<u64> {
+    output
+        .split_inclusive('\n')
+        .filter(|line| line.ends_with('\n'))
+        .filter_map(|line| line.strip_prefix("CHATTER ")?.trim_end().parse().ok())
+        .collect()
+}
+
+#[test]
 fn graceful_stop_forces_a_vm_that_ignores_sigterm_after_its_timeout() {
     let Some(agent) = Agent::start(253) else {
         return;
