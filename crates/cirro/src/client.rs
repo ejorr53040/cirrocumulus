@@ -57,21 +57,22 @@ pub(crate) async fn send(
         .request(request)
         .await
         .map_err(|e| connect_error(socket, &e))?;
-    let status = response.status();
-    let headers = response.headers().clone();
-    let body = response
-        .into_body()
+    let (parts, body) = response.into_parts();
+    let status = parts.status;
+    let body = body
         .collect()
         .await
         .map_err(|e| format!("reading the Node agent's response: {e}"))?
         .to_bytes();
     if !status.is_success() {
         return Err(match serde_json::from_slice::<ErrorBody>(&body) {
-            Ok(e) => e.error,
+            // It can carry a guest's console or what a Machine's `ssh`
+            // said, and is shown in a terminal: the CLI's and `cirro top`'s.
+            Ok(e) => cirro_tui::escape_control_str(&e.error),
             Err(_) => format!("the Node agent answered {status}"),
         });
     }
-    Ok((headers, body))
+    Ok((parts.headers, body))
 }
 
 /// Explains a failure to reach the agent, calling out the common case of a

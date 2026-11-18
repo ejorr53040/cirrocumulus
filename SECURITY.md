@@ -10,6 +10,9 @@ Report privately through GitHub: the repository's **Security** tab, then
 **Report a vulnerability**. Please don't open a public issue, discussion or
 pull request for a vulnerability.
 
+If GitHub's reporting doesn't reach you, email ejorr@uvm.edu with the same
+details instead, and don't post them in a public issue.
+
 Include what an attacker needs (a `cirro` group member, code in a guest, a
 client of the edge, ...), what they get, and the steps or code to reproduce
 it, with the `cirro --version` and host kernel you saw it on.

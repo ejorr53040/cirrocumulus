@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # The hermetic test suite CI runs. Everything is *compiled* (so the
-# real-Firecracker tests in crates/cirro-node/tests and the Node agent test
-# in crates/cirro/tests/node_agent.rs can't bit-rot), but only tests that
-# need no VM assets are *run*.
+# real-Firecracker Node agent test in crates/cirro/tests/node_agent.rs can't
+# bit-rot), but only tests that need no VM assets are *run*.
 #
 # Why not just `cargo test --workspace`: GitHub's Linux runners expose
-# /dev/kvm and passwordless sudo, so the cirro-node VM tests would get past
-# their skip checks and then panic on the missing kernel/rootfs under
-# scripts/step0/.build/. Run those locally per scripts/step0/README.md.
+# /dev/kvm and passwordless sudo, so the VM tests would get past their skip
+# checks and then panic on the missing kernel under scripts/step0/.build/.
+# Run those locally per CONTRIBUTING.md.
 #
 # Given crate directories (as scripts/ci/changes.sh reports them), only
 # those crates and every workspace crate that depends on them are compiled

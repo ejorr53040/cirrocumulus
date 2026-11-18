@@ -31,6 +31,11 @@ struct Content {
     /// When set, every request whose path contains `.0` gets status `.1`
     /// and an error envelope with code `.2`.
     failure: Option<(String, u16, String)>,
+    /// The realm a bearer challenge names; set by `challenge`.
+    challenge: Option<String>,
+    /// The realm a bearer challenge names from the second request on, so
+    /// cirro's own probe gets none; set by `challenge_after_the_probe`.
+    late_challenge: Option<String>,
 }
 
 pub(super) struct Registry {
@@ -44,6 +49,9 @@ pub(super) struct Image {
     pub(super) config: serde_json::Value,
     /// The media type the manifest gives every layer.
     pub(super) layer_media_type: &'static str,
+    /// When set, every layer lists these `urls` and the registry doesn't
+    /// have the layer itself: a foreign layer.
+    pub(super) foreign_urls: Option<Vec<String>>,
 }
 
 impl Image {
@@ -58,6 +66,7 @@ impl Image {
                 "rootfs": {"type": "layers", "diff_ids": []},
             }),
             layer_media_type: LAYER_GZIP,
+            foreign_urls: None,
         }
     }
 
@@ -65,6 +74,14 @@ impl Image {
     pub(super) fn zstd(self) -> Self {
         Image {
             layer_media_type: "application/vnd.oci.image.layer.v1.tar+zstd",
+            ..self
+        }
+    }
+
+    /// The same image, with its layers to be fetched from `urls` instead.
+    pub(super) fn foreign(self, urls: Vec<String>) -> Self {
+        Image {
+            foreign_urls: Some(urls),
             ..self
         }
     }
@@ -95,8 +112,9 @@ impl Registry {
         let layers: Vec<serde_json::Value> = image
             .layers
             .iter()
-            .map(|l| {
-                serde_json::json!({"mediaType": image.layer_media_type, "digest": self.put_blob(l), "size": l.len()})
+            .map(|l| match &image.foreign_urls {
+                None => serde_json::json!({"mediaType": image.layer_media_type, "digest": self.put_blob(l), "size": l.len()}),
+                Some(urls) => serde_json::json!({"mediaType": image.layer_media_type, "digest": sha256(l), "size": l.len(), "urls": urls}),
             })
             .collect();
         let manifest = serde_json::json!({
@@ -150,6 +168,19 @@ impl Registry {
         self.content.lock().unwrap().failure = Some((part.to_string(), status, code.to_string()));
     }
 
+    /// Makes `/v2/`, manifests and blobs answer with a bearer challenge naming
+    /// `realm`, and serve them only with the token from the `/token` route.
+    pub(super) fn challenge(&self, realm: &str) {
+        self.content.lock().unwrap().challenge = Some(realm.to_string());
+    }
+
+    /// Like `challenge`, but lets the first request (cirro's own `/v2/`
+    /// probe) through unchallenged, as a registry that tells one client from
+    /// another could.
+    pub(super) fn challenge_after_the_probe(&self, realm: &str) {
+        self.content.lock().unwrap().late_challenge = Some(realm.to_string());
+    }
+
     /// Replaces the bytes served for blob `digest`, keeping its digest.
     pub(super) fn corrupt_blob(&self, digest: &str) {
         let mut content = self.content.lock().unwrap();
@@ -184,10 +215,18 @@ fn serve(stream: TcpStream, content: &Mutex<Content>) {
     if reader.read_line(&mut request_line).is_err() {
         return;
     }
+    let mut authorization = None;
     loop {
         let mut header = String::new();
         match reader.read_line(&mut header) {
-            Ok(n) if n > 0 && header != "\r\n" => {}
+            Ok(n) if n > 0 && header != "\r\n" => {
+                if let Some((_, value)) = header
+                    .split_once(':')
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                {
+                    authorization = Some(value.trim().to_string());
+                }
+            }
             _ => break,
         }
     }
@@ -198,6 +237,19 @@ fn serve(stream: TcpStream, content: &Mutex<Content>) {
         .to_string();
     let mut content = content.lock().unwrap();
     content.requests.push(path.clone());
+    let challenge = content.challenge.clone().or_else(|| {
+        content
+            .late_challenge
+            .clone()
+            .filter(|_| content.requests.len() > 1)
+    });
+    if let Some((status, headers, body)) =
+        challenge.and_then(|realm| challenged(&path, authorization.as_deref(), &realm))
+    {
+        drop(content);
+        respond(&stream, status, &headers, &body);
+        return;
+    }
     if let Some((_, status, code)) = content
         .failure
         .clone()
@@ -261,4 +313,47 @@ fn serve(stream: TcpStream, content: &Mutex<Content>) {
             .and_then(|()| stream.write_all(body))
         }
     };
+}
+
+/// What a registry with a bearer challenge answers `path` with, or `None` to
+/// serve it as usual. The token service's own routes need no token; the
+/// others are challenged until the request carries the token from `/token`.
+fn challenged(
+    path: &str,
+    authorization: Option<&str>,
+    realm: &str,
+) -> Option<(&'static str, String, Vec<u8>)> {
+    let json = "Content-Type: application/json\r\n".to_string();
+    let bearer =
+        format!("WWW-Authenticate: Bearer realm=\"{realm}\",service=\"registry.test\"\r\n");
+    match path.split('?').next().unwrap_or("") {
+        "/token" => Some(("200 OK", json, br#"{"token":"t0k3n"}"#.to_vec())),
+        "/huge" => Some((
+            "200 OK",
+            json,
+            format!(r#"{{"token":"{}"}}"#, "a".repeat(70 << 10)).into_bytes(),
+        )),
+        "/denied" => Some((
+            "403 Forbidden",
+            json,
+            br#"{"detail":"leaked-body-text"}"#.to_vec(),
+        )),
+        "/redirect" => Some(("302 Found", "Location: /token\r\n".to_string(), Vec::new())),
+        _ if authorization == Some("Bearer t0k3n") => None,
+        _ => Some((
+            "401 Unauthorized",
+            bearer,
+            br#"{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}"#.to_vec(),
+        )),
+    }
+}
+
+fn respond(stream: &TcpStream, status: &str, headers: &str, body: &[u8]) {
+    let mut stream = stream;
+    let _ = write!(
+        stream,
+        "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .and_then(|()| stream.write_all(body));
 }

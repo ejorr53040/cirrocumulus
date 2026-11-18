@@ -24,9 +24,11 @@ ROOTFS_IMG="$BUILD_DIR/uvm-career-quiz.ext4"
 APP_SRC="$BUILD_DIR/app-src"
 TARGET="x86_64-unknown-linux-musl"
 
-# Alpine 3.20.3 (the point release APK_TOOLS_STATIC_PKG below comes from).
+# Alpine v3.20's apk-tools-static. Its SHA-256 is of the .apk as dl-cdn serves
+# it, and is checked before anything is extracted or run.
 ALPINE_BRANCH="v3.20"
-APK_TOOLS_STATIC_PKG="apk-tools-static-2.14.4-r1.apk"
+APK_TOOLS_STATIC_PKG="apk-tools-static-2.14.13-r0.apk"
+APK_TOOLS_STATIC_SHA256="50f4967b2809c4eb4377b3717dc3c662d2137a530b94cebda91dfdc15f37b05a"
 
 mkdir -p "$BUILD_DIR"
 
@@ -39,8 +41,9 @@ fi
 APK_DIR="$BUILD_DIR/apk-tools-static"
 APK="$APK_DIR/sbin/apk.static"
 if [ ! -x "$APK" ]; then
-    curl -sSL -o "$BUILD_DIR/apk-tools-static.apk" \
+    curl -fsSL -o "$BUILD_DIR/apk-tools-static.apk" \
         "https://dl-cdn.alpinelinux.org/alpine/$ALPINE_BRANCH/main/x86_64/$APK_TOOLS_STATIC_PKG"
+    echo "$APK_TOOLS_STATIC_SHA256  $BUILD_DIR/apk-tools-static.apk" | sha256sum -c -
     mkdir -p "$APK_DIR"
     tar -xzf "$BUILD_DIR/apk-tools-static.apk" -C "$APK_DIR"
 fi

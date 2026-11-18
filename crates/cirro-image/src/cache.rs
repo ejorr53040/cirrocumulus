@@ -2,21 +2,28 @@
 //!
 //! The cache holds one `sha256-<hex>.ext4` and `sha256-<hex>.json` per
 //! image manifest digest: the rootfs, and a record of the run config and
-//! the references last pulled as that image. Pulls are anonymous,
+//! the references last pulled as that image. Pulls are anonymous, or carry
+//! a bearer token from the registry's own token service (`registry_auth`),
 //! `linux/amd64` only, gzip or plain layers (never zstd), and every blob is
 //! checked against its digest by `oci-client` before it's used.
 
 use crate::run_config::{self, RunConfig};
-use crate::{Error, Flattened, err};
+use crate::{Error, Flattened, LIMITS, Limits, err, human};
 use oci_client::client::{ClientConfig, ClientProtocol};
 use oci_client::config::ConfigFile;
 use oci_client::errors::{OciDistributionError, OciErrorCode};
-use oci_client::manifest::OciManifest;
+use oci_client::manifest::{OciDescriptor, OciImageManifest, OciManifest};
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
+use reqwest::Url;
+use reqwest::header::{HeaderValue, WWW_AUTHENTICATE};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::task::{Context, Poll, ready};
+use std::time::{Duration, Instant};
+use tokio::io::AsyncWrite;
 
 /// The only platform a Node runs.
 const PLATFORM: &str = "linux/amd64";
@@ -59,7 +66,8 @@ impl ImageCache {
     }
 
     /// Reach these registries (`host:port`) over plain HTTP instead of HTTPS.
-    pub fn with_plain_http(mut self, registries: Vec<String>) -> ImageCache {
+    #[cfg(test)]
+    pub(crate) fn with_plain_http(mut self, registries: Vec<String>) -> ImageCache {
         self.plain_http = registries;
         self
     }
@@ -67,10 +75,20 @@ impl ImageCache {
     /// Pulls `reference` (`nginx:alpine`, `ghcr.io/o/app@sha256:…`) and
     /// builds its rootfs with `init` as `/init`, unless it's cached.
     pub async fn pull(&self, reference: &str, init: &[u8]) -> Result<CachedImage, Error> {
+        self.pull_within(reference, init, LIMITS).await
+    }
+
+    /// [`ImageCache::pull`], with `limits` in place of [`LIMITS`].
+    pub(crate) async fn pull_within(
+        &self,
+        reference: &str,
+        init: &[u8],
+        limits: Limits,
+    ) -> Result<CachedImage, Error> {
         let reference: Reference = reference
             .parse()
             .map_err(|e| err(&format!("image reference {reference:?}"), e))?;
-        let digest = self.fetch(&reference, init).await?;
+        let digest = self.fetch(&reference, init, limits).await?;
         self.remember(&reference.whole(), &digest)
     }
 
@@ -171,16 +189,107 @@ impl ImageCache {
 
     /// Resolves `reference` to an image manifest digest and builds that
     /// image, unless it's cached already.
-    async fn fetch(&self, reference: &Reference, init: &[u8]) -> Result<String, Error> {
-        let client = self.client();
-        let auth = RegistryAuth::Anonymous;
+    async fn fetch(
+        &self,
+        reference: &Reference,
+        init: &[u8],
+        limits: Limits,
+    ) -> Result<String, Error> {
+        let mut client = self.client();
+        let auth = self.registry_auth(reference).await?;
+        let mut authed = Instant::now();
+        let (digest, manifest) = self.resolve(&client, reference, &auth).await?;
+        let Some(manifest) = manifest else {
+            return Ok(digest);
+        };
+        if manifest
+            .layers
+            .iter()
+            .any(|l| l.media_type.contains("zstd"))
+        {
+            return Err(Error(format!(
+                "can't pull {reference}: its layers are zstd-compressed, which isn't supported yet"
+            )));
+        }
+
+        std::fs::create_dir_all(&self.dir)
+            .map_err(|e| err(&format!("create {}", self.dir.display()), e))?;
+        let scratch = Scratch::new(&self.dir)?;
+
+        let mut config = Vec::new();
+        let what = format!("{reference}'s config");
+        download(
+            &client,
+            reference,
+            &manifest.config,
+            &mut config,
+            limits.config,
+            &what,
+        )
+        .await?;
+        let config: ConfigFile = serde_json::from_slice(&config)
+            .map_err(|e| err(&format!("{reference}'s config"), e))?;
+        let platform = platform(&config.os, &config.architecture);
+        if platform != PLATFORM {
+            return Err(Error(format!(
+                "{reference} is a {platform} image; only {PLATFORM} images run here"
+            )));
+        }
+
+        let mut layers = Vec::new();
+        for (i, layer) in manifest.layers.iter().enumerate() {
+            // oci-client keeps using a bearer token it was handed after the
+            // registry lets it lapse, so a long pull gets a new one between
+            // layers.
+            if authed.elapsed() > TOKEN_REFRESH {
+                client = self.client();
+                let auth = self.registry_auth(reference).await?;
+                client
+                    .store_auth_if_needed(reference.resolve_registry(), &auth)
+                    .await;
+                authed = Instant::now();
+            }
+            let path = scratch.0.join(format!("blob-{i}"));
+            let file = tokio::fs::File::create(&path)
+                .await
+                .map_err(|e| err(&format!("create {}", path.display()), e))?;
+            let what = format!("{reference}'s layer {}", layer.digest);
+            download(&client, reference, layer, file, limits.blob, &what).await?;
+            layers.push(path);
+        }
+
+        let flat = Flattened::open_within(&layers, &scratch.0.join("flat"), limits)?;
+        let config = run_config(&config, &flat)?;
+        let built = scratch.0.join("rootfs.ext4");
+        flat.build_ext4(init, &scratch.0, &built)?;
+
+        let rootfs = self.path(&digest, "ext4");
+        self.write_record(&CachedImage {
+            digest: digest.clone(),
+            rootfs: rootfs.clone(),
+            config,
+            references: Vec::new(),
+        })?;
+        std::fs::rename(&built, &rootfs)
+            .map_err(|e| err(&format!("move the rootfs to {}", rootfs.display()), e))?;
+        Ok(digest)
+    }
+
+    /// `reference`'s `linux/amd64` image manifest digest and, unless that
+    /// image is cached, its manifest. A cached tag costs one manifest
+    /// request, or two for an index, after `registry_auth`'s probe.
+    async fn resolve(
+        &self,
+        client: &Client,
+        reference: &Reference,
+        auth: &RegistryAuth,
+    ) -> Result<(String, Option<OciImageManifest>), Error> {
         let (manifest, digest) = client
-            .pull_manifest(reference, &auth)
+            .pull_manifest(reference, auth)
             .await
             .map_err(|e| pull_error(reference, &reference.to_string(), e))?;
-        // An index costs a second request only when its image isn't cached.
-        let (manifest, digest) = match manifest {
-            OciManifest::Image(manifest) => (manifest, digest),
+        let manifest = match manifest {
+            OciManifest::Image(manifest) => manifest,
             OciManifest::ImageIndex(index) => {
                 let entry = index.manifests.iter().find(|m| {
                     m.platform
@@ -208,86 +317,106 @@ impl ImageCache {
                         "{reference}'s {PLATFORM} entry {digest:?} isn't a digest (sha256:<64 hex>)"
                     )));
                 }
+                // An index costs a second request only when its image isn't cached.
                 if self.cached(&digest)?.is_some() {
-                    return Ok(digest);
+                    return Ok((digest, None));
                 }
                 let image = reference.clone_with_digest(digest.clone());
-                match client.pull_manifest(&image, &auth).await {
-                    Ok((OciManifest::Image(manifest), _)) => (manifest, digest),
-                    Ok((OciManifest::ImageIndex(_), _)) => {
-                        return Err(Error(format!(
-                            "{reference}'s {PLATFORM} entry is another index, not an image"
-                        )));
-                    }
-                    Err(e) => return Err(pull_error(reference, &image.to_string(), e)),
-                }
+                return match client.pull_manifest(&image, auth).await {
+                    Ok((OciManifest::Image(manifest), _)) => Ok((digest, Some(manifest))),
+                    Ok((OciManifest::ImageIndex(_), _)) => Err(Error(format!(
+                        "{reference}'s {PLATFORM} entry is another index, not an image"
+                    ))),
+                    Err(e) => Err(pull_error(reference, &image.to_string(), e)),
+                };
             }
         };
-        if self.cached(&digest)?.is_some() {
-            return Ok(digest);
-        }
-        if manifest
-            .layers
-            .iter()
-            .any(|l| l.media_type.contains("zstd"))
-        {
-            return Err(Error(format!(
-                "can't pull {reference}: its layers are zstd-compressed, which isn't supported yet"
-            )));
-        }
+        let cached = self.cached(&digest)?.is_some();
+        Ok((digest, (!cached).then_some(manifest)))
+    }
 
-        std::fs::create_dir_all(&self.dir)
-            .map_err(|e| err(&format!("create {}", self.dir.display()), e))?;
-        let scratch = Scratch::new(&self.dir)?;
-
-        let mut config = Vec::new();
-        client
-            .pull_blob(reference, &manifest.config, &mut config)
+    /// How `reference`'s registry wants pulls authenticated. A registry that
+    /// challenges for a bearer token gets one from the realm it names, if that
+    /// realm is its own (see [`allowed_realm`]).
+    ///
+    /// It is always a bearer token, empty when the probe got no challenge:
+    /// with anything else oci-client probes again and fetches a token from
+    /// whatever realm that second answer names, unchecked, so a registry
+    /// that challenged only oci-client's probe would pick the realm itself.
+    /// A registry that wants no token ignores the empty one.
+    async fn registry_auth(&self, reference: &Reference) -> Result<RegistryAuth, Error> {
+        let registry = reference.resolve_registry();
+        let scheme = if self.plain_http.iter().any(|r| r == registry) {
+            "http"
+        } else {
+            "https"
+        };
+        let probe = Url::parse(&format!("{scheme}://{registry}/v2/"))
+            .map_err(|e| err(&format!("{reference}'s registry {registry}"), e))?;
+        let http = http_client()?;
+        let res = http
+            .get(probe.clone())
+            .send()
             .await
-            .map_err(|e| pull_error(reference, &format!("{reference}'s config"), e))?;
-        let config: ConfigFile = serde_json::from_slice(&config)
-            .map_err(|e| err(&format!("{reference}'s config"), e))?;
-        let platform = platform(&config.os, &config.architecture);
-        if platform != PLATFORM {
+            .map_err(|e| err(&format!("ask {registry} for a token"), e))?;
+        let challenge = res
+            .headers()
+            .get_all(WWW_AUTHENTICATE)
+            .iter()
+            .find_map(bearer_challenge);
+        let Some((realm, service)) = challenge else {
+            return Ok(RegistryAuth::Bearer(String::new()));
+        };
+        let Some(realm) = allowed_realm(&probe, &realm) else {
             return Err(Error(format!(
-                "{reference} is a {platform} image; only {PLATFORM} images run here"
+                "{reference}: {registry} asks for a token from {realm}, which isn't on its domain"
+            )));
+        };
+        let mut query = vec![(
+            "scope",
+            format!("repository:{}:pull", reference.repository()),
+        )];
+        if let Some(service) = service {
+            query.push(("service", service));
+        }
+        let mut res = http
+            .get(realm.clone())
+            .query(&query)
+            .send()
+            .await
+            .map_err(|e| err(&format!("{reference}: token from {realm}"), e))?;
+        if res.status() != reqwest::StatusCode::OK {
+            return Err(Error(format!(
+                "{reference}: {registry}'s token service {realm} refused ({})",
+                res.status()
             )));
         }
-
-        let mut layers = Vec::new();
-        for (i, layer) in manifest.layers.iter().enumerate() {
-            let path = scratch.0.join(format!("blob-{i}"));
-            let file = tokio::fs::File::create(&path)
-                .await
-                .map_err(|e| err(&format!("create {}", path.display()), e))?;
-            client
-                .pull_blob(reference, layer, file)
-                .await
-                .map_err(|e| {
-                    pull_error(
-                        reference,
-                        &format!("{reference}'s layer {}", layer.digest),
-                        e,
-                    )
-                })?;
-            layers.push(path);
+        let mut body = Vec::new();
+        while let Some(chunk) = res
+            .chunk()
+            .await
+            .map_err(|e| err(&format!("{reference}: token from {realm}"), e))?
+        {
+            if body.len() + chunk.len() > TOKEN_LIMIT {
+                return Err(Error(format!(
+                    "{reference}: the token from {realm} is bigger than {TOKEN_LIMIT} bytes"
+                )));
+            }
+            body.extend_from_slice(&chunk);
         }
-
-        let flat = Flattened::open(&layers, &scratch.0.join("flat"))?;
-        let config = run_config(&config, &flat)?;
-        let built = scratch.0.join("rootfs.ext4");
-        flat.build_ext4(init, &scratch.0, &built)?;
-
-        let rootfs = self.path(&digest, "ext4");
-        self.write_record(&CachedImage {
-            digest: digest.clone(),
-            rootfs: rootfs.clone(),
-            config,
-            references: Vec::new(),
-        })?;
-        std::fs::rename(&built, &rootfs)
-            .map_err(|e| err(&format!("move the rootfs to {}", rootfs.display()), e))?;
-        Ok(digest)
+        let token: TokenResponse = serde_json::from_slice(&body)
+            .map_err(|e| err(&format!("{reference}: token from {realm}"), e))?;
+        let token = token
+            .token
+            .or(token.access_token)
+            .ok_or_else(|| Error(format!("{reference}: {realm} sent no token")))?;
+        // oci-client unwraps the header it builds from the token.
+        if HeaderValue::from_str(&token).is_err() {
+            return Err(Error(format!(
+                "{reference}: {realm} sent a token that can't go in a header"
+            )));
+        }
+        Ok(RegistryAuth::Bearer(token))
     }
 
     /// The image built from manifest `digest`, if it's in the cache. The
@@ -320,10 +449,7 @@ impl ImageCache {
     }
 
     fn client(&self) -> Client {
-        // reqwest is built without a default TLS provider, so `aws-lc-rs`
-        // (C and cmake) stays out of the build; use `ring`'s. Fails only if
-        // a provider is already installed, which is just as good.
-        let _ = rustls::crypto::ring::default_provider().install_default();
+        install_ring();
         Client::new(ClientConfig {
             protocol: ClientProtocol::HttpsExcept(self.plain_http.clone()),
             // `pull` resolves an index itself, to check the cache first.
@@ -337,6 +463,85 @@ impl ImageCache {
         self.dir
             .join(format!("{}.{extension}", digest.replace(':', "-")))
     }
+}
+
+/// Most a token service may answer with; a token is a few kilobytes.
+const TOKEN_LIMIT: usize = 64 << 10;
+
+/// How long a pull uses one registry token before asking for another. A
+/// token lasts 60 s unless its service says otherwise (distribution spec),
+/// and `TokenResponse` doesn't read `expires_in`, so this stays under that.
+const TOKEN_REFRESH: Duration = Duration::from_secs(50);
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    token: Option<String>,
+    access_token: Option<String>,
+}
+
+/// The client for the probe and the token request. It doesn't follow
+/// redirects: a redirect would send the request to a host the realm check
+/// never saw.
+fn http_client() -> Result<reqwest::Client, Error> {
+    install_ring();
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| err("start an HTTP client", e))
+}
+
+/// reqwest is built without a default TLS provider, so `aws-lc-rs` (C and
+/// cmake) stays out of the build; use `ring`'s. Fails only if a provider is
+/// already installed, which is just as good.
+fn install_ring() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+/// The realm and service of a `Bearer` challenge, if `value` is one.
+fn bearer_challenge(value: &HeaderValue) -> Option<(String, Option<String>)> {
+    let (scheme, params) = value.to_str().ok()?.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    let (mut realm, mut service) = (None, None);
+    for param in params.split(',') {
+        let Some((key, val)) = param.split_once('=') else {
+            continue;
+        };
+        let val = val.trim().trim_matches('"').to_string();
+        match key.trim() {
+            k if k.eq_ignore_ascii_case("realm") => realm = Some(val),
+            k if k.eq_ignore_ascii_case("service") => service = Some(val),
+            _ => {}
+        }
+    }
+    Some((realm?, service))
+}
+
+/// Registries whose token service is on another host of their own. Any
+/// other registry's realm must be on the registry's own origin.
+const TOKEN_HOSTS: &[(&str, &str)] = &[
+    ("index.docker.io", "auth.docker.io"),
+    ("registry-1.docker.io", "auth.docker.io"),
+    ("registry.gitlab.com", "gitlab.com"),
+];
+
+/// `realm` as a URL, if a token may be requested from it: the registry's
+/// own scheme, host and port, or the token host [`TOKEN_HOSTS`] names for it.
+/// Hosts that merely share a domain don't share an owner (tenants of one
+/// PaaS domain, names under `co.uk`), so a hostile registry could otherwise
+/// point the pull at one of them.
+fn allowed_realm(registry: &Url, realm: &str) -> Option<Url> {
+    let realm = Url::parse(realm).ok()?;
+    let (host, registry_host) = (realm.host_str()?, registry.host_str()?);
+    let same_origin =
+        host == registry_host && realm.port_or_known_default() == registry.port_or_known_default();
+    let token_host = realm.port().is_none()
+        && TOKEN_HOSTS
+            .iter()
+            .any(|&(r, t)| r == registry_host && t == host);
+    (realm.scheme() == registry.scheme() && (same_origin || token_host)).then_some(realm)
 }
 
 /// What went wrong pulling `what` (a manifest or blob of `reference`),
@@ -384,6 +589,71 @@ fn pull_error(reference: &Reference, what: &str, e: OciDistributionError) -> Err
         ));
     }
     err(&format!("pull {what}"), e)
+}
+
+/// Downloads `blob` into `out`, which takes at most `max` bytes. A blob the
+/// manifest says is too big isn't requested at all, and one that turns out
+/// to be is cut off at `max` rather than read to the end. Only the registry
+/// is asked: a descriptor's `urls` (a foreign layer's other homes) would
+/// let the registry point the pull at any URL.
+async fn download<W: AsyncWrite + Unpin>(
+    client: &Client,
+    reference: &Reference,
+    blob: &OciDescriptor,
+    out: W,
+    max: u64,
+    what: &str,
+) -> Result<(), Error> {
+    let too_big = || Error(format!("{what} is bigger than {}", human(max)));
+    if !u64::try_from(blob.size).is_ok_and(|size| size <= max) {
+        return Err(too_big());
+    }
+    let mut out = Capped {
+        inner: out,
+        left: max,
+        over: false,
+    };
+    let blob = OciDescriptor {
+        urls: None,
+        ..blob.clone()
+    };
+    let pulled = client.pull_blob(reference, &blob, &mut out).await;
+    if out.over {
+        return Err(too_big());
+    }
+    pulled.map_err(|e| pull_error(reference, what, e))
+}
+
+/// Passes writes on to `inner` until `left` bytes have gone through. The
+/// write that would pass that is refused, and `over` records why.
+struct Capped<W> {
+    inner: W,
+    left: u64,
+    over: bool,
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for Capped<W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if buf.len() as u64 > self.left {
+            self.over = true;
+            return Poll::Ready(Err(std::io::Error::other("over the size limit")));
+        }
+        let n = ready!(Pin::new(&mut self.inner).poll_write(cx, buf))?;
+        self.left -= n as u64;
+        Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 /// `<pid>-<n>`, different for every call in every process, so concurrent
@@ -441,5 +711,91 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod capped_tests {
+    use super::Capped;
+    use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn a_write_past_the_limit_is_refused_and_flagged() {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut out = Capped {
+                    inner: Vec::new(),
+                    left: 4,
+                    over: false,
+                };
+                out.write_all(b"abc").await.unwrap();
+                out.write_all(b"d").await.unwrap();
+                assert!(out.write_all(b"ef").await.is_err());
+                assert!(out.over);
+                assert_eq!(out.inner, b"abcd");
+            });
+    }
+}
+
+#[cfg(test)]
+mod realm_tests {
+    use super::{allowed_realm, bearer_challenge};
+    use reqwest::Url;
+    use reqwest::header::HeaderValue;
+
+    #[test]
+    fn a_realm_on_the_registry_or_its_token_host_is_allowed() {
+        let probe = Url::parse("https://registry-1.docker.io/v2/").unwrap();
+        assert!(allowed_realm(&probe, "https://auth.docker.io/token").is_some());
+        assert!(allowed_realm(&probe, "https://registry-1.docker.io/token").is_some());
+    }
+
+    #[test]
+    fn a_realm_elsewhere_or_on_another_scheme_is_refused() {
+        let probe = Url::parse("https://registry-1.docker.io/v2/").unwrap();
+        assert!(allowed_realm(&probe, "https://evil.example/token").is_none());
+        assert!(allowed_realm(&probe, "http://auth.docker.io/token").is_none());
+        assert!(allowed_realm(&probe, "not a url").is_none());
+    }
+
+    #[test]
+    fn addresses_match_only_themselves() {
+        let probe = Url::parse("https://10.0.0.1/v2/").unwrap();
+        assert!(allowed_realm(&probe, "https://10.0.0.1/token").is_some());
+        assert!(allowed_realm(&probe, "https://10.0.0.2/token").is_none());
+    }
+
+    #[test]
+    fn a_realm_on_a_neighbour_under_a_shared_domain_or_another_port_is_refused() {
+        // Tenants of one PaaS domain, or hosts under a multi-label public
+        // suffix, share their last two labels without sharing an owner.
+        let probe = Url::parse("https://evil.herokuapp.com/v2/").unwrap();
+        assert!(allowed_realm(&probe, "https://victim.herokuapp.com/token").is_none());
+        let probe = Url::parse("https://evil-reg.co.uk/v2/").unwrap();
+        assert!(allowed_realm(&probe, "https://intranet.acme.co.uk/token").is_none());
+        let probe = Url::parse("https://registry.example:5000/v2/").unwrap();
+        assert!(allowed_realm(&probe, "https://registry.example:6000/token").is_none());
+    }
+
+    #[test]
+    fn a_bearer_challenge_gives_its_realm_and_service() {
+        let value = HeaderValue::from_static(
+            r#"Bearer realm="https://auth.example/token",service="registry.example""#,
+        );
+        assert_eq!(
+            bearer_challenge(&value),
+            Some((
+                "https://auth.example/token".to_string(),
+                Some("registry.example".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn a_basic_challenge_gives_nothing() {
+        let value = HeaderValue::from_static(r#"Basic realm="registry""#);
+        assert_eq!(bearer_challenge(&value), None);
     }
 }

@@ -9,33 +9,23 @@
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
-use hyper::{Method, Request, StatusCode};
-use hyper_util::client::legacy::Client as HyperClient;
-use hyperlocal::{UnixClientExt, Uri as UnixUri};
+use hyper::{Method, Request};
+use hyper_util::rt::TokioIo;
+use nix::fcntl::{OFlag, OpenHow, ResolveFlag};
+use nix::sys::stat::Mode;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::net::UnixStream;
 
-/// A non-2xx response from the Firecracker API, or a transport failure
-/// talking to it at all.
+/// A failed call to the Firecracker API: the request it was making and what
+/// went wrong, whether the socket was unreachable or the API refused it.
 #[derive(Debug)]
-pub enum Error {
-    /// Couldn't even reach the API socket (e.g. Firecracker isn't up yet,
-    /// or the path is wrong).
-    Connect(String),
-    /// The API accepted the connection but rejected the request.
-    Request {
-        path: String,
-        status: StatusCode,
-        body: String,
-    },
-}
+pub(crate) struct Error(String);
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::Connect(e) => write!(f, "connect to firecracker API socket: {e}"),
-            Error::Request { path, status, body } => write!(f, "{path} -> {status}: {body}"),
-        }
+        f.write_str(&self.0)
     }
 }
 
@@ -53,28 +43,26 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// What `boot` needs to bring a VM up, matching the fields
 /// `run_plain.sh` passes to `/machine-config`, `/boot-source` and
 /// `/drives/rootfs`.
-pub struct BootConfig {
-    pub kernel_image_path: PathBuf,
-    pub boot_args: String,
-    pub rootfs_path: PathBuf,
-    pub vcpu_count: u8,
-    pub mem_size_mib: u32,
+pub(crate) struct BootConfig {
+    pub(crate) kernel_image_path: PathBuf,
+    pub(crate) boot_args: String,
+    pub(crate) rootfs_path: PathBuf,
+    pub(crate) vcpu_count: u8,
+    pub(crate) mem_size_mib: u32,
 }
 
-/// A connection to one Firecracker instance's API socket. Cheap to clone
-/// (the underlying `hyper_util` client is itself a cheap handle), but
-/// there's only ever one Firecracker process per socket path, so callers
-/// typically just make one and use it for that VM's whole lifetime.
-pub struct Client {
-    inner: HyperClient<hyperlocal::UnixConnector, Full<Bytes>>,
-    socket_path: PathBuf,
+/// One Firecracker instance's API socket, at `socket` beneath `dir`. Every
+/// request gets a connection of its own, made with [`connect_beneath`].
+pub(crate) struct Client {
+    dir: PathBuf,
+    socket: &'static str,
 }
 
 impl Client {
-    pub fn new(socket_path: impl Into<PathBuf>) -> Self {
+    pub(crate) fn new(dir: impl Into<PathBuf>, socket: &'static str) -> Self {
         Self {
-            inner: HyperClient::unix(),
-            socket_path: socket_path.into(),
+            dir: dir.into(),
+            socket,
         }
     }
 
@@ -96,8 +84,8 @@ impl Client {
         tokio::time::timeout(limit, self.send_unbounded(method, path, body))
             .await
             .unwrap_or_else(|_| {
-                Err(Error::Connect(format!(
-                    "{path} went unanswered for {limit:?}"
+                Err(Error(format!(
+                    "firecracker API: {path} went unanswered for {limit:?}"
                 )))
             })
     }
@@ -108,21 +96,30 @@ impl Client {
         path: &str,
         body: serde_json::Value,
     ) -> Result<(), Error> {
-        let uri: hyper::Uri = UnixUri::new(&self.socket_path, path).into();
         let body_bytes = serde_json::to_vec(&body).expect("serialize request body");
 
         let request = Request::builder()
             .method(method.clone())
-            .uri(uri)
+            .uri(path)
+            .header("host", "localhost")
             .header("content-type", "application/json")
             .body(Full::new(Bytes::from(body_bytes)))
             .expect("build request");
 
-        let response = self
-            .inner
-            .request(request)
+        let stream = connect_beneath(&self.dir, self.socket)
             .await
-            .map_err(|e| Error::Connect(format!("{e:?}")))?;
+            .map_err(|e| Error(format!("firecracker API socket: {e}")))?;
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .map_err(|e| Error(format!("firecracker API: {e}")))?;
+        // Dropping the set aborts the connection, so one whose request timed
+        // out doesn't live on holding the VMM's socket.
+        let mut connection_task = tokio::task::JoinSet::new();
+        connection_task.spawn(connection);
+        let response = sender
+            .send_request(request)
+            .await
+            .map_err(|e| Error(format!("firecracker API: {e}")))?;
 
         let status = response.status();
         if status.is_success() {
@@ -134,18 +131,21 @@ impl Client {
             .await
             .map(|c| c.to_bytes())
             .unwrap_or_default();
-        Err(Error::Request {
-            path: format!("{method} {path}"),
-            status,
-            body: String::from_utf8_lossy(&body_bytes).into_owned(),
-        })
+        Err(Error(format!(
+            "firecracker API: {method} {path} -> {status}: {}",
+            String::from_utf8_lossy(&body_bytes)
+        )))
     }
 
     /// Attaches a host tap device (already created and configured) to the
     /// VM as a network interface, per RESEARCH.md M3 slice 2. Must be called before `boot`
     /// -- like `/drives/rootfs`, `/network-interfaces/{iface_id}` is static
     /// device config the API only accepts pre-boot.
-    pub async fn attach_tap(&self, iface_id: &str, host_dev_name: &str) -> Result<(), Error> {
+    pub(crate) async fn attach_tap(
+        &self,
+        iface_id: &str,
+        host_dev_name: &str,
+    ) -> Result<(), Error> {
         self.put(
             &format!("/network-interfaces/{iface_id}"),
             serde_json::json!({
@@ -158,7 +158,7 @@ impl Client {
 
     /// Adds a vsock device whose host end is a Unix socket at `uds_path`
     /// (inside the jail, when jailed). Pre-boot only, like `attach_tap`.
-    pub async fn attach_vsock(&self, guest_cid: u32, uds_path: &str) -> Result<(), Error> {
+    pub(crate) async fn attach_vsock(&self, guest_cid: u32, uds_path: &str) -> Result<(), Error> {
         self.put(
             "/vsock",
             serde_json::json!({
@@ -171,7 +171,7 @@ impl Client {
 
     /// Presses Ctrl-Alt-Del in the guest (`SendCtrlAltDel`), which
     /// guest-init turns into SIGTERM for its command. Post-boot only.
-    pub async fn send_ctrl_alt_del(&self) -> Result<(), Error> {
+    pub(crate) async fn send_ctrl_alt_del(&self) -> Result<(), Error> {
         self.put(
             "/actions",
             serde_json::json!({"action_type": "SendCtrlAltDel"}),
@@ -180,13 +180,13 @@ impl Client {
     }
 
     /// Pauses the guest's vCPUs, as a snapshot needs. Post-boot only.
-    pub async fn pause(&self) -> Result<(), Error> {
+    pub(crate) async fn pause(&self) -> Result<(), Error> {
         self.set_vm_state("Paused").await
     }
 
     /// Lets a paused guest's vCPUs run again (Firecracker's `Resumed`
     /// state; nothing to do with waking a parked VM).
-    pub async fn resume(&self) -> Result<(), Error> {
+    pub(crate) async fn resume(&self) -> Result<(), Error> {
         self.set_vm_state("Resumed").await
     }
 
@@ -198,7 +198,7 @@ impl Client {
     /// Writes a full snapshot of a paused VM: its device state to `vmstate`
     /// and its guest memory to `mem` (paths as Firecracker sees them, so
     /// inside the jail).
-    pub async fn create_snapshot(&self, vmstate: &str, mem: &str) -> Result<(), Error> {
+    pub(crate) async fn create_snapshot(&self, vmstate: &str, mem: &str) -> Result<(), Error> {
         self.put(
             "/snapshot/create",
             serde_json::json!({
@@ -215,7 +215,7 @@ impl Client {
     /// it. The memory file is mapped private, so the guest's writes never
     /// reach it. Every device the snapshot names must be where it was: the
     /// drive's file, the tap, the vsock socket's directory.
-    pub async fn load_snapshot(&self, vmstate: &str, mem: &str) -> Result<(), Error> {
+    pub(crate) async fn load_snapshot(&self, vmstate: &str, mem: &str) -> Result<(), Error> {
         self.put(
             "/snapshot/load",
             serde_json::json!({
@@ -231,7 +231,7 @@ impl Client {
     /// then `InstanceStart`. Other static device config (network, vsock)
     /// is pre-boot only too, so callers attach it ([`Client::attach_tap`],
     /// [`Client::attach_vsock`]) before calling this.
-    pub async fn boot(&self, config: &BootConfig) -> Result<(), Error> {
+    pub(crate) async fn boot(&self, config: &BootConfig) -> Result<(), Error> {
         self.put(
             "/machine-config",
             serde_json::json!({
@@ -276,6 +276,28 @@ fn path_str(p: &Path) -> &str {
         .unwrap_or_else(|| panic!("path is not valid UTF-8: {}", p.display()))
 }
 
+/// Connects to the Unix socket at `socket` beneath `dir`, through no link
+/// and no `..`. `dir` is a jail's root, which its VMM owns: a connect by
+/// path, as root, would follow a link the VMM left there to another VM's
+/// socket or any on the host, and checking the path first leaves a race.
+pub(crate) async fn connect_beneath(dir: &Path, socket: &str) -> std::io::Result<UnixStream> {
+    let dir = nix::fcntl::open(
+        dir,
+        OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    let found = nix::fcntl::openat2(
+        &dir,
+        socket,
+        OpenHow::new()
+            .flags(OFlag::O_PATH | OFlag::O_CLOEXEC)
+            .resolve(ResolveFlag::RESOLVE_BENEATH | ResolveFlag::RESOLVE_NO_SYMLINKS),
+    )?;
+    // Linux has no connectat, but the fd's link in /proc names the inode
+    // opened above, whatever the VMM has put at the path since.
+    UnixStream::connect(format!("/proc/self/fd/{}", found.as_raw_fd())).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,15 +315,68 @@ mod tests {
             std::future::pending::<()>().await
         });
 
-        let client = Client::new(&socket);
+        let client = Client::new(&dir, "api.sock");
         let asked = client.send_ctrl_alt_del();
         let answer = tokio::time::timeout(Duration::from_secs(3600), asked).await;
 
         assert!(
-            matches!(answer, Ok(Err(Error::Connect(_)))),
+            matches!(answer, Ok(Err(_))),
             "a request Firecracker never answers should fail on its own: {answer:?}"
         );
         silent.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Connecting through the socket's `O_PATH` fd reaches the socket.
+    #[tokio::test]
+    async fn a_socket_beneath_the_jail_root_is_reached() {
+        let jail = crate::test_util::tempdir("cirro-fc-beneath");
+        std::fs::create_dir(jail.join("run")).unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind(jail.join("run/firecracker.socket")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        connect_beneath(&jail, "run/firecracker.socket")
+            .await
+            .unwrap();
+
+        listener.accept().unwrap();
+        std::fs::remove_dir_all(jail).unwrap();
+    }
+
+    /// A taken-over VMM owns its jail's root, so it can put a link to
+    /// another VM's socket, or the directory it's in, where its own `run`
+    /// or `v.sock` should be. Nothing sent through either may reach it.
+    #[tokio::test]
+    async fn a_link_under_the_jail_root_is_refused_and_reaches_nothing() {
+        let dir = crate::test_util::tempdir("cirro-fc-link");
+        let neighbour_run = dir.join("neighbour/run");
+        std::fs::create_dir_all(&neighbour_run).unwrap();
+        let neighbour = neighbour_run.join("firecracker.socket");
+        let listener = std::os::unix::net::UnixListener::bind(&neighbour).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let jail = dir.join("jail");
+        std::fs::create_dir(&jail).unwrap();
+        std::os::unix::fs::symlink(&neighbour_run, jail.join("run")).unwrap();
+        std::os::unix::fs::symlink(&neighbour, jail.join("v.sock")).unwrap();
+
+        let api = Client::new(&jail, "run/firecracker.socket")
+            .send_ctrl_alt_del()
+            .await;
+        assert!(
+            api.is_err(),
+            "a link in place of `run` should be refused: {api:?}"
+        );
+        for socket in ["v.sock", "../neighbour/run/firecracker.socket"] {
+            let found = connect_beneath(&jail, socket).await;
+            assert!(found.is_err(), "{socket} should be refused: {found:?}");
+        }
+
+        let reached = listener.accept();
+        assert!(
+            matches!(&reached, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "nothing should reach the neighbour's socket: {reached:?}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

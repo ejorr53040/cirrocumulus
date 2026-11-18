@@ -45,6 +45,26 @@ impl Layer {
         self
     }
 
+    /// Gives the next entry the extended attribute `name` = `value`, in a
+    /// PAX record as `docker build` writes one.
+    fn xattr(mut self, name: &str, value: &[u8]) -> Self {
+        let key = format!("SCHILY.xattr.{name}");
+        let mut header = Header::new_gnu();
+        header.set_entry_type(EntryType::XHeader);
+        let mut record = Vec::new();
+        // The length counts itself, so fix it up until it's stable.
+        let mut len = key.len() + value.len() + 3;
+        while (len.to_string().len() + key.len() + value.len() + 3) != len {
+            len = len.to_string().len() + key.len() + value.len() + 3;
+        }
+        record.extend_from_slice(format!("{len} {key}=").as_bytes());
+        record.extend_from_slice(value);
+        record.push(b'\n');
+        header.set_size(record.len() as u64);
+        self.entries.push((header, "PaxHeader".into(), record));
+        self
+    }
+
     /// Writes the layer into `dir`, gzipped or not, and returns its path.
     fn write(&self, dir: &Path, name: &str, gzip: bool) -> PathBuf {
         let path = dir.join(name);
@@ -270,6 +290,31 @@ fn the_image_keeps_owners_modes_and_links() {
     );
 }
 
+/// A link entry may claim a size, and carry that many bytes, which a tar
+/// reader skips. The image's tar must give it none, or `mke2fs` reads the
+/// entries after it from the wrong place.
+#[test]
+fn a_link_entry_that_claims_a_size_shifts_nothing_after_it() {
+    let mut layer = Layer::default()
+        .link(EntryType::Symlink, "a", "b")
+        .file("b", "after")
+        .link(EntryType::Link, "c", "b")
+        .link(EntryType::Link, "d", "b");
+    for i in [0, 2] {
+        layer.entries[i].0.set_size(1024);
+        layer.entries[i].2 = vec![b'x'; 1024];
+    }
+    let Some(image) = build(&[layer]) else {
+        return;
+    };
+
+    assert_eq!(debugfs(&image, "cat /b"), "after");
+    assert!(
+        debugfs(&image, "stat /b").contains("Links: 3"),
+        "both hard links should be in the image"
+    );
+}
+
 #[test]
 fn every_guest_gets_init_mountpoints_and_dns() {
     let Some(image) = build(&[Layer::default()
@@ -308,6 +353,119 @@ fn a_hardlink_to_a_whited_out_file_fails_the_build() {
         .expect_err("a dangling hardlink should fail the build");
 
     assert!(e.0.contains("isn't a file in the image"), "{e}");
+}
+
+#[test]
+fn a_hardlink_to_a_directory_fails_the_build() {
+    if !have_mke2fs() {
+        return;
+    }
+    let flat = flatten(&[Layer::default()
+        .dir("etc")
+        .link(EntryType::Link, "x", "etc")])
+    .unwrap();
+    let dir = tempdir();
+
+    let e = flat
+        .build_ext4(b"", &dir, &dir.join("rootfs.ext4"))
+        .expect_err("a hardlink to a directory should fail the build");
+
+    assert!(e.0.contains("isn't a file in the image"), "{e}");
+}
+
+#[test]
+fn the_image_keeps_extended_attributes() {
+    let Some(image) = build(&[Layer::default()
+        .xattr("security.capability", b"kept")
+        .file("f", "data")
+        .file("g", "after")])
+    else {
+        return;
+    };
+
+    let attrs = debugfs(&image, "ea_list /f");
+    assert!(
+        attrs.contains("security.capability") && attrs.contains("kept"),
+        "{attrs}"
+    );
+    assert_eq!(debugfs(&image, "cat /f"), "data");
+    assert_eq!(debugfs(&image, "cat /g"), "after");
+}
+
+/// Above 512 MiB, `mke2fs` gives one inode per 16 KiB by default, fewer than
+/// an image of many small files has entries.
+#[test]
+fn an_image_of_many_small_files_has_an_inode_for_each() {
+    let mut layer = Layer::default();
+    for d in 0..110 {
+        layer = layer.dir(&format!("d{d}"));
+        for f in 0..1000 {
+            layer = layer.file(&format!("d{d}/{f}"), "");
+        }
+    }
+    let Some(image) = build(&[layer]) else {
+        return;
+    };
+
+    assert_eq!(debugfs(&image, "cat /d109/999"), "");
+    assert!(debugfs(&image, "stat /d109/999").contains("Type: regular"));
+}
+
+/// A gzip of 1 MiB of zeros is about 1 KiB: a bomb unless expansion is capped.
+#[test]
+fn a_layer_that_expands_past_its_limit_is_refused_and_stops_there() {
+    let dir = tempdir();
+    let layer = dir.join("zeros.tar.gz");
+    let mut gz = GzEncoder::new(File::create(&layer).unwrap(), Compression::fast());
+    gz.write_all(&[0u8; 1 << 20]).unwrap();
+    gz.finish().unwrap();
+    let limits = Limits {
+        layer: 64 << 10,
+        ..LIMITS
+    };
+
+    let e = Flattened::open_within(&[layer], &dir.join("scratch"), limits).unwrap_err();
+
+    assert!(
+        e.to_string().ends_with("expands to more than 64 KiB"),
+        "{e}"
+    );
+    let expanded = std::fs::metadata(dir.join("scratch/layer-0.tar"))
+        .unwrap()
+        .len();
+    assert!(expanded <= (64 << 10) + 1, "wrote {expanded} bytes");
+}
+
+/// Each file costs a 4 KiB block whatever its size, so a file costs 4097
+/// bytes here. Two layers of two files need 16388 bytes, past 12291.
+#[test]
+fn a_tree_bigger_than_its_limit_is_refused_across_layers() {
+    let dir = tempdir();
+    let first = Layer::default()
+        .file("a", "1")
+        .file("b", "2")
+        .write(&dir, "first.tar", false);
+    let second = Layer::default()
+        .file("c", "3")
+        .file("d", "4")
+        .write(&dir, "second.tar", false);
+    let limits = Limits {
+        rootfs: 3 * 4097,
+        ..LIMITS
+    };
+
+    let e = Flattened::open_within(&[first.clone(), second.clone()], &dir.join("s"), limits)
+        .unwrap_err();
+
+    assert_eq!(
+        e.to_string(),
+        "layer 2: the files need more than 12291 bytes of rootfs"
+    );
+    let fits = Limits {
+        rootfs: 4 * 4097,
+        ..LIMITS
+    };
+    Flattened::open_within(&[first, second], &dir.join("fits"), fits).unwrap();
 }
 
 mod pull;

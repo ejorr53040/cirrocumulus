@@ -50,11 +50,19 @@ fn cache(registry: &Registry) -> ImageCache {
 }
 
 fn pull(cache: &ImageCache, reference: &str) -> Result<crate::CachedImage, Error> {
+    pull_within(cache, reference, LIMITS)
+}
+
+fn pull_within(
+    cache: &ImageCache,
+    reference: &str,
+    limits: Limits,
+) -> Result<crate::CachedImage, Error> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(cache.pull(reference, INIT))
+        .block_on(cache.pull_within(reference, INIT, limits))
 }
 
 #[test]
@@ -287,6 +295,185 @@ fn zstd_layers_are_refused_before_any_download() {
         !registry.requests().contains(&layer_path),
         "the layer was downloaded"
     );
+}
+
+/// A layer over its limit is refused before any of it is downloaded: the
+/// manifest says how big it is.
+#[test]
+fn a_layer_bigger_than_its_limit_is_refused_before_download() {
+    let (registry, _) = registry_with_app();
+    let layer = app_layer();
+    let limits = Limits {
+        blob: layer.len() as u64 - 1,
+        ..LIMITS
+    };
+    let reference = format!("{}/app:v1", registry.host);
+
+    let e = pull_within(&cache(&registry), &reference, limits).unwrap_err();
+
+    assert!(
+        e.to_string()
+            .ends_with(&format!("is bigger than {} bytes", layer.len() - 1)),
+        "{e}"
+    );
+    let layer_path = format!("/v2/app/blobs/{}", super::registry::sha256(&layer));
+    assert!(
+        !registry.requests().contains(&layer_path),
+        "the layer was downloaded"
+    );
+}
+
+#[test]
+fn a_config_bigger_than_its_limit_is_refused() {
+    let (registry, _) = registry_with_app();
+    let limits = Limits {
+        config: 16,
+        ..LIMITS
+    };
+    let reference = format!("{}/app:v1", registry.host);
+
+    let e = pull_within(&cache(&registry), &reference, limits).unwrap_err();
+
+    assert!(
+        e.to_string().ends_with("'s config is bigger than 16 bytes"),
+        "{e}"
+    );
+}
+
+/// A registry that asks for a bearer token from its realm gets one, and its
+/// manifest and blob requests carry it.
+#[test]
+fn a_registry_challenge_is_answered_with_its_token() {
+    if !have_mke2fs() {
+        return;
+    }
+    let (registry, digest) = registry_with_app();
+    registry.challenge(&format!("http://{}/token", registry.host));
+
+    let image = pull(&cache(&registry), &format!("{}/app:v1", registry.host)).unwrap();
+
+    assert_eq!(image.digest, digest);
+    assert!(
+        registry
+            .requests()
+            .iter()
+            .any(|p| p.starts_with("/token?") && p.contains("repository%3Aapp%3Apull")),
+        "{:?}",
+        registry.requests()
+    );
+}
+
+/// A realm is asked only when it is on the registry's own domain: `localhost`
+/// is not `127.0.0.1`'s, so the refusal comes before any request to it.
+#[test]
+fn a_realm_on_another_host_is_refused_without_a_request() {
+    let (registry, _) = registry_with_app();
+    let port = registry.host.rsplit(':').next().unwrap();
+    let realm = format!("http://localhost:{port}/token");
+    registry.challenge(&realm);
+
+    let e = pull(&cache(&registry), &format!("{}/app:v1", registry.host)).unwrap_err();
+
+    assert!(e.to_string().contains(&realm), "{e}");
+    assert!(
+        !registry.requests().iter().any(|p| p.starts_with("/token")),
+        "the token service was asked: {:?}",
+        registry.requests()
+    );
+}
+
+/// A registry that lets cirro's own probe through unchallenged and then
+/// challenges the pull itself still gets no token fetched from its realm:
+/// cirro alone decides where a token comes from.
+#[test]
+fn a_challenge_held_back_from_the_probe_fetches_no_token() {
+    let (registry, _) = registry_with_app();
+    let port = registry.host.rsplit(':').next().unwrap();
+    registry.challenge_after_the_probe(&format!("http://localhost:{port}/token"));
+
+    assert!(pull(&cache(&registry), &format!("{}/app:v1", registry.host)).is_err());
+
+    assert!(
+        !registry.requests().iter().any(|p| p.starts_with("/token")),
+        "a token was fetched from the held-back realm: {:?}",
+        registry.requests()
+    );
+}
+
+/// A layer's `urls` (a "foreign" layer's other homes) are never fetched: a
+/// registry could otherwise make the pull request any URL it likes.
+#[test]
+fn a_foreign_layers_urls_are_never_fetched() {
+    let registry = Registry::start();
+    let foreign = format!(
+        "http://localhost:{}/foreign",
+        registry.host.rsplit(':').next().unwrap()
+    );
+    let image = Image::new("amd64", vec![app_layer()], app_config()).foreign(vec![foreign]);
+    let digest = registry.put_image("app", &image);
+    registry.tag("app", "v1", &digest);
+
+    assert!(pull(&cache(&registry), &format!("{}/app:v1", registry.host)).is_err());
+
+    assert!(
+        !registry
+            .requests()
+            .iter()
+            .any(|p| p.starts_with("/foreign")),
+        "a layer's url was fetched: {:?}",
+        registry.requests()
+    );
+}
+
+/// A redirect from the realm is not followed to wherever it points.
+#[test]
+fn a_realm_that_redirects_is_not_followed() {
+    let (registry, _) = registry_with_app();
+    let realm = format!("http://{}/redirect", registry.host);
+    registry.challenge(&realm);
+
+    let e = pull(&cache(&registry), &format!("{}/app:v1", registry.host)).unwrap_err();
+
+    assert!(
+        registry
+            .requests()
+            .iter()
+            .any(|p| p.starts_with("/redirect")),
+        "the realm was never asked: {:?}",
+        registry.requests()
+    );
+    assert!(e.to_string().contains(&realm), "{e}");
+    assert!(
+        !registry.requests().iter().any(|p| p.starts_with("/token")),
+        "the redirect was followed: {:?}",
+        registry.requests()
+    );
+}
+
+#[test]
+fn a_token_bigger_than_its_limit_is_refused() {
+    let (registry, _) = registry_with_app();
+    let realm = format!("http://{}/huge", registry.host);
+    registry.challenge(&realm);
+
+    let e = pull(&cache(&registry), &format!("{}/app:v1", registry.host)).unwrap_err();
+
+    assert!(
+        e.to_string()
+            .ends_with(&format!("{realm} is bigger than 65536 bytes")),
+        "{e}"
+    );
+}
+
+#[test]
+fn a_refused_token_request_does_not_echo_its_body() {
+    let (registry, _) = registry_with_app();
+    registry.challenge(&format!("http://{}/denied", registry.host));
+
+    let e = pull(&cache(&registry), &format!("{}/app:v1", registry.host)).unwrap_err();
+
+    assert!(e.to_string().contains("403"), "{e}");
+    assert!(!e.to_string().contains("leaked-body-text"), "{e}");
 }
 
 /// A second image of `app`, with no user to resolve.

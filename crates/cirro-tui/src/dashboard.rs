@@ -2,7 +2,7 @@
 //! VMs, a table of Machine-backed Apps, and a detail pane for the selected
 //! VM.
 
-use crate::{duration, machine_port, mem, node_summary, rate_cells};
+use crate::{duration, escape_control_str, machine_port, mem, node_summary, rate_cells};
 use cirro_proto::{MachineAppInfo, Stats, VmStats};
 use ratatui::Frame;
 use ratatui::crossterm::event::KeyCode;
@@ -102,8 +102,8 @@ impl Dashboard {
     }
 
     /// Shows the end of `log` for VM `name` in the detail pane.
-    pub fn set_log(&mut self, name: &str, log: &str) {
-        self.log = Some((name.to_string(), log.to_string()));
+    pub fn set_log(&mut self, name: &str, log: String) {
+        self.log = Some((name.to_string(), log));
     }
 
     /// Shows `message` in place of the key help until the next key.
@@ -319,12 +319,15 @@ impl Dashboard {
         let lines: Vec<Line> = match &self.log {
             // The end of the log: as many lines as fit.
             Some((name, log)) if *name == vm.info.name => {
-                let lines: Vec<&str> = log.lines().collect();
                 let fit = usize::from(text.height);
-                lines[lines.len().saturating_sub(fit)..]
-                    .iter()
-                    .map(|l| Line::from(l.to_string()))
-                    .collect()
+                let mut tail: Vec<Line> = log
+                    .lines()
+                    .rev()
+                    .take(fit)
+                    .map(|l| Line::from(escape_control_str(l)))
+                    .collect();
+                tail.reverse();
+                tail
             }
             _ => vec![
                 Line::from(vm.info.name.clone()),

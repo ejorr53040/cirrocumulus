@@ -25,6 +25,17 @@ fn unimplemented_subcommand_says_not_yet_and_fails() {
         .stderr(predicate::str::contains("cirro ssh: not yet implemented"));
 }
 
+/// A name with a space must be refused by clap, not reach the socket or panic.
+#[test]
+fn logs_refuses_a_name_that_is_not_a_vm_name() {
+    cirro()
+        .args(["logs", "my vm"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid VM name"))
+        .stderr(predicate::str::contains("panicked").not());
+}
+
 /// A path that isn't there is a typo, not an image to look for in a
 /// registry; nor is a directory, which can't be a rootfs.
 #[test]

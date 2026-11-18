@@ -89,6 +89,15 @@ pub(crate) fn test_agent() -> Option<&'static Path> {
         .as_deref()
 }
 
+/// A `sudo -n` command that runs the test `cirro` binary as root. Callers
+/// check for it with [`test_agent`] first.
+pub(crate) fn sudo_cirro() -> std::process::Command {
+    let mut cmd = std::process::Command::new("sudo");
+    cmd.arg("-n")
+        .arg(test_agent().expect("checked by the caller"));
+    cmd
+}
+
 /// The rootfs images the tests boot, built once per test run without root
 /// (`mkfs.ext4 -d`). Every image carries the fixture commands under `/app`.
 #[allow(dead_code, reason = "node_install.rs only boots guest_init")]

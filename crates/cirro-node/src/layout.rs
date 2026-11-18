@@ -40,6 +40,12 @@ pub(crate) fn known_hosts(state_dir: &Path) -> PathBuf {
     state_dir.join("known_hosts")
 }
 
+/// A directory for each running Machine `ssh`: its config file and its
+/// forward sockets. Root-only, so no other local user can reach a forward.
+pub(crate) fn ssh_runs(state_dir: &Path) -> PathBuf {
+    state_dir.join("ssh")
+}
+
 /// What install resolved, for uninstall.
 pub(crate) fn node_config(state_dir: &Path) -> PathBuf {
     state_dir.join("node.json")
@@ -48,4 +54,10 @@ pub(crate) fn node_config(state_dir: &Path) -> PathBuf {
 /// The pinned Firecracker release install fetched.
 pub(crate) fn release(state_dir: &Path) -> PathBuf {
     state_dir.join("release")
+}
+
+/// The copy of `cirro` the systemd unit runs. Root-only, unlike wherever
+/// install was run from.
+pub(crate) fn bin(state_dir: &Path) -> PathBuf {
+    state_dir.join("bin")
 }

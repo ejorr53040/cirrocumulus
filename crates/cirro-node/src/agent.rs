@@ -30,9 +30,10 @@ use cirro_edge::tls::NodeCa;
 use cirro_edge::{Lease, Resolution, Router};
 use cirro_guest_init::config::{self as guest, Config as GuestConfig};
 use cirro_proto::{
-    AddMachine, DEFAULT_STOP_TIMEOUT_SECS, EndReason, Ended, ErrorBody, LOG_CHUNK, MAX_MEM_MIB,
-    MAX_VCPUS, MIN_MEM_MIB, MIN_VCPUS, MachineAppInfo, MachineAppRequest, MachineHostKey,
-    MachineScan, Route, RunRequest, Stats, StopRequest, VM_STATE_HEADER, VmInfo, VmStats,
+    AddMachine, DEFAULT_STOP_TIMEOUT_SECS, EndReason, Ended, ErrorBody, LOG_CHUNK,
+    LOG_OFFSET_HEADER, MAX_MEM_MIB, MAX_VCPUS, MIN_MEM_MIB, MIN_VCPUS, MachineAppInfo,
+    MachineAppRequest, MachineHostKey, MachineScan, Route, RunRequest, Stats, StopRequest,
+    VM_STATE_HEADER, VmInfo, VmStats,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -42,9 +43,9 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use nix::sys::stat::{Mode, umask};
 use std::collections::BTreeMap;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -218,12 +219,52 @@ struct Replaced {
     log: PathBuf,
 }
 
+/// A name [`Agent::reserve`]d as [`Entry::Starting`] for a start or a wake.
+/// Dropped while the name is still Starting, after a failure or a panic
+/// alike, it puts back the Ended VM the new one would have replaced, or else
+/// frees the name, so no App is left Starting for good.
+struct Reservation {
+    agent: Arc<Agent>,
+    name: String,
+    replaced: Option<Replaced>,
+    /// A start's own console log, which goes with the reservation. A wake
+    /// writes to the parked VM's, which stays.
+    own_log: Option<PathBuf>,
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        // A lock poisoned by the panic being unwound: panicking again here
+        // would abort the whole agent.
+        let Ok(mut vms) = self.agent.vms.lock() else {
+            return;
+        };
+        if !matches!(vms.get(&self.name), Some(Entry::Starting { .. })) {
+            return;
+        }
+        match self.replaced.take() {
+            Some(Replaced { info, log }) => {
+                vms.insert(std::mem::take(&mut self.name), Entry::Ended { info, log });
+            }
+            None => {
+                vms.remove(&self.name);
+            }
+        }
+        drop(vms);
+        if let Some(log) = &self.own_log {
+            let _ = std::fs::remove_file(log);
+        }
+    }
+}
+
 struct Agent {
     node: vm::NodeConfig,
     subnet: Subnet,
     /// Console logs, one per start, kept with the Ended VM record.
     logs_dir: PathBuf,
     parked_dir: PathBuf,
+    /// Snapshots `rm` is still deleting; `shutdown` waits for them.
+    deleting: Mutex<tokio::task::JoinSet<()>>,
     vms: Mutex<BTreeMap<String, Entry>>,
     store: Arc<Mutex<Store>>,
     /// Numbers each VM start's console log file.
@@ -260,10 +301,13 @@ impl Drop for Settled {
 /// parked dir and the parent cgroup go only if nothing is left in them. The
 /// Node's egress policy is ensured first, and outlives the agent.
 pub async fn run(config: Config) -> io::Result<()> {
-    // Both refusals below run before the agent changes anything on the
+    exit_on_panic();
+    // The refusals below run before the agent changes anything on the
     // Node: a live socket is checked first (the fastest way to tell this
-    // start is a mistake), then the state dir's subnet.
+    // start is a mistake), then the other Node subnets on this host, then
+    // the state dir's subnet.
     refuse_if_already_running(&config.socket)?;
+    refuse_if_host_ids_shared(config.subnet)?;
 
     let logs_dir = layout::logs(&config.state_dir);
     std::fs::create_dir_all(&logs_dir)?;
@@ -274,8 +318,10 @@ pub async fn run(config: Config) -> io::Result<()> {
     }
     // Also when an earlier agent made it: it holds guests' memory.
     std::fs::set_permissions(&parked_dir, std::fs::Permissions::from_mode(0o700))?;
+    let state_db = layout::state_db(&config.state_dir);
+    restrict_state_db(&state_db)?;
     let store = Arc::new(Mutex::new(Store::open(
-        &layout::state_db(&config.state_dir),
+        &state_db,
         &config.subnet.to_string(),
     )?));
 
@@ -313,6 +359,7 @@ pub async fn run(config: Config) -> io::Result<()> {
         subnet: config.subnet,
         logs_dir: logs_dir.clone(),
         parked_dir,
+        deleting: Mutex::new(tokio::task::JoinSet::new()),
         vms: Mutex::new(BTreeMap::new()),
         store: store.clone(),
         next_log: AtomicU64::new(next_log_number(&logs_dir)),
@@ -374,6 +421,10 @@ pub async fn run(config: Config) -> io::Result<()> {
         loop {
             every_second.tick().await;
             sampling.sample(&sampler);
+            sampling.cap_console_logs();
+            if let Err(e) = ensure_policy_in_place(&sampling) {
+                warn!(%e, "check the Node's egress policy");
+            }
         }
     });
 
@@ -453,6 +504,32 @@ pub async fn run(config: Config) -> io::Result<()> {
     Ok(())
 }
 
+/// Reapplies the egress policy when it's gone from the kernel, checked
+/// every second: a flushed ruleset would otherwise leave VMs unfiltered
+/// until the next restart.
+fn ensure_policy_in_place(agent: &Agent) -> io::Result<()> {
+    if egress::policy_in_place()? {
+        return Ok(());
+    }
+    warn!("the Node's egress policy was gone, so reapplying it");
+    let iface = egress::default_route_iface();
+    egress::ensure_node_policy(&agent.subnet.to_string(), iface.as_deref())
+}
+
+/// Makes any panic end the agent's process, after the default hook has
+/// logged it. A panic can leave shared state half-updated (a VM's map entry
+/// without its store row, say), and a poisoned lock would then fail every
+/// later request until restart. systemd restarts the agent
+/// (`Restart=on-failure`); the VMs keep running (ADR 0002). `abort` would
+/// also dump the root process's memory, which holds the agent's SSH private key.
+fn exit_on_panic() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default(info);
+        std::process::exit(1);
+    }));
+}
+
 /// Refuses to start if `socket` already has a live listener, telling that
 /// apart from a socket file merely left behind by a crash (connecting to it
 /// finds no one home). Any other error connecting -- wrong file type at
@@ -476,17 +553,43 @@ fn refuse_if_already_running(socket: &Path) -> io::Result<()> {
     }
 }
 
+/// Refuses a Node subnet whose VMs could share a host id with those of
+/// another Node subnet an agent has run on here: each agent's unwinds and
+/// startup sweep would tear down the other's VMs. Two agents that start at
+/// the same moment can both pass; this is for the operator who picks a
+/// second subnet, not for a race.
+fn refuse_if_host_ids_shared(subnet: Subnet) -> io::Result<()> {
+    let others = egress::node_subnets()
+        .map_err(|e| io::Error::other(format!("read the Node subnets on this host: {e}")))?;
+    match others
+        .into_iter()
+        .find(|&other| subnet.shares_host_ids_with(other))
+    {
+        Some(other) => Err(io::Error::other(format!(
+            "Node subnet {subnet} gives its VMs the same host ids as Node subnet {other}, \
+             which an agent has run on here; host objects are named by the low 16 bits of \
+             the VM address, so the two agents would tear down each other's VMs. Pick a \
+             subnet whose last two octets don't overlap {other}'s, or, if no agent uses \
+             {other} any more, `nft delete element ip cirro node_subnets {{ {other} }}`"
+        ))),
+        None => Ok(()),
+    }
+}
+
 impl Agent {
     /// Samples the Node and every running VM, for [`Agent::stats`].
     fn sample(&self, sampler: &Sampler) {
         let running: Vec<RunningVm> = self
-            .list(false)
-            .into_iter()
-            .filter_map(|info| {
-                Some(RunningVm {
+            .vms
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|entry| match entry {
+                Entry::Running { info, .. } => Some(RunningVm {
                     id: vm::host_id(info.vm_address?),
-                    name: info.name,
-                })
+                    name: info.name.clone(),
+                }),
+                _ => None,
             })
             .collect();
         // The kernel's files are read under neither the VM table's lock
@@ -494,6 +597,29 @@ impl Agent {
         let at = Instant::now();
         let readings = sampler.read(&running);
         self.metrics.lock().unwrap().record(at, readings);
+    }
+
+    /// Trims every console log still being written that has outgrown
+    /// [`cirro_proto::CONSOLE_LOG_CAP`]. Firecracker writes it directly, so
+    /// this tick is the only cap there is, and none while the agent is down.
+    fn cap_console_logs(&self) {
+        // One `stat` per VM, under the lock to spare copying every path each
+        // second; only the rare trim runs outside it.
+        let over: Vec<PathBuf> = self
+            .vms
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|entry| !matches!(entry, Entry::Ended { .. }))
+            .map(Entry::log)
+            .filter(|log| vm::console_log_over_cap(log))
+            .cloned()
+            .collect();
+        for log in over {
+            if let Err(e) = vm::trim_console_log(&log) {
+                warn!(log = %log.display(), "trim the console log: {e}");
+            }
+        }
     }
 
     fn stats(&self) -> Stats {
@@ -598,6 +724,12 @@ impl Agent {
             (vm_address, replaced)
         };
 
+        let reservation = Reservation {
+            agent: self.clone(),
+            name: run.name,
+            replaced,
+            own_log: Some(log.clone()),
+        };
         let spec = VmSpec {
             vm_address,
             rootfs: run.rootfs,
@@ -607,9 +739,8 @@ impl Agent {
             guest,
             console_log: log,
         };
-        let (name, route) = (run.name, run.route);
         let agent = self.clone();
-        self.detached("starting", agent.start_vm(name, spec, route, replaced))
+        self.detached("starting", agent.start_vm(reservation, spec, run.route))
             .await
     }
 
@@ -644,9 +775,8 @@ impl Agent {
         Ok(())
     }
 
-    /// Reserves `name` and the lowest VM address no entry in `vms` holds as
-    /// [`Entry::Starting`], for a start or a wake, and gives back the entry
-    /// it replaced.
+    /// Reserves `name` and the lowest VM address no entry in `vms` holds,
+    /// for a start or a wake, and gives back the entry it replaced.
     fn reserve(
         &self,
         vms: &mut BTreeMap<String, Entry>,
@@ -793,9 +923,15 @@ impl Agent {
             };
             (spec, parked)
         };
+        let reservation = Reservation {
+            agent: self.clone(),
+            name: name.clone(),
+            replaced: Some(parked),
+            own_log: None,
+        };
         let agent = self.clone();
         self.detached("waking", async move {
-            let woken = agent.clone().finish_wake(name.clone(), spec, parked).await;
+            let woken = agent.clone().finish_wake(reservation, spec).await;
             let mut failures = agent.wake_failures.lock().unwrap();
             match &woken {
                 Ok(_) => failures.remove(&name),
@@ -808,19 +944,10 @@ impl Agent {
 
     async fn finish_wake(
         self: Arc<Self>,
-        name: String,
+        mut reservation: Reservation,
         spec: WakeSpec,
-        parked: Replaced,
     ) -> Result<VmInfo, ApiError> {
-        let put_back = |agent: &Agent, parked: Replaced| {
-            agent.vms.lock().unwrap().insert(
-                name.clone(),
-                Entry::Ended {
-                    info: parked.info,
-                    log: parked.log,
-                },
-            );
-        };
+        let name = &reservation.name;
         let vm = match Vm::wake(&self.node, &spec)
             .instrument(info_span!("wake", vm = name, address = %spec.vm_address))
             .await
@@ -828,20 +955,17 @@ impl Agent {
             Ok(vm) => vm,
             Err(e) => {
                 warn!(vm = name, "failed to wake: {e}");
-                put_back(&self, parked);
                 return Err(ApiError(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     format!("VM {name:?} failed to wake, and is still parked: {e}"),
                 ));
             }
         };
-        let started = started_info(
-            &name,
-            spec.vm_address,
-            spec.mem_mib,
-            spec.vcpus,
-            parked.info.route.clone(),
-        );
+        let route = reservation
+            .replaced
+            .as_ref()
+            .and_then(|parked| parked.info.route.clone());
+        let started = started_info(name, spec.vm_address, spec.mem_mib, spec.vcpus, route);
         // Emptied by the wake, and gone before a park of the new VM can make
         // it again.
         let _ = std::fs::remove_dir(&spec.snapshot);
@@ -855,16 +979,19 @@ impl Agent {
                     at: now(),
                     reason: EndReason::Forced,
                 };
-                if let Err(e) = self.store.lock().unwrap().mark_ended(&name, &ended) {
+                if let Err(e) = self.store.lock().unwrap().mark_ended(name, &ended) {
                     error!(vm = name, "record the end: {e}");
                 }
-                self.vms.lock().unwrap().insert(
-                    name.clone(),
-                    Entry::Ended {
-                        info: ended_info(parked.info, ended),
-                        log: parked.log,
-                    },
-                );
+                // Taken from the reservation, which would put it back parked.
+                if let Some(parked) = reservation.replaced.take() {
+                    self.vms.lock().unwrap().insert(
+                        name.clone(),
+                        Entry::Ended {
+                            info: ended_info(parked.info, ended),
+                            log: parked.log,
+                        },
+                    );
+                }
                 return Err(internal(format!(
                     "VM {name:?} woke, but recording it failed, so it was stopped and its \
                      snapshot is lost: {e}"
@@ -881,11 +1008,11 @@ impl Agent {
     /// puts back the Ended VM it would have replaced.
     async fn start_vm(
         self: Arc<Self>,
-        name: String,
+        mut reservation: Reservation,
         spec: VmSpec,
         route: Option<Route>,
-        replaced: Option<Replaced>,
     ) -> Result<VmInfo, ApiError> {
+        let name = &reservation.name;
         let vm = match Vm::start(&self.node, &spec)
             .instrument(info_span!("start", vm = name, address = %spec.vm_address))
             .await
@@ -893,24 +1020,22 @@ impl Agent {
             Ok(vm) => vm,
             Err(e) => {
                 warn!(vm = name, "failed to start: {e}");
-                self.forget_start(&name, replaced, &spec.console_log);
                 return Err(ApiError(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     format!("VM {name:?} failed to start: {e}"),
                 ));
             }
         };
-        let started = started_info(&name, spec.vm_address, spec.mem_mib, spec.vcpus, route);
-        let info = match self.keep(started, &spec.console_log, vm).await {
-            Ok(info) => info,
-            Err(e) => {
-                self.forget_start(&name, replaced, &spec.console_log);
-                return Err(internal(format!(
+        let started = started_info(name, spec.vm_address, spec.mem_mib, spec.vcpus, route);
+        let info = self
+            .keep(started, &spec.console_log, vm)
+            .await
+            .map_err(|e| {
+                internal(format!(
                     "VM {name:?} started, but recording it failed, so it was stopped: {e}"
-                )));
-            }
-        };
-        if let Some(old) = replaced {
+                ))
+            })?;
+        if let Some(old) = reservation.replaced.take() {
             let _ = std::fs::remove_file(old.log);
         }
         info!(vm = name, address = %spec.vm_address, "VM started");
@@ -938,8 +1063,8 @@ impl Agent {
         Ok(info)
     }
 
-    /// Records `vm` as running and spawns its supervisor task, which records
-    /// it as ended once its host state is gone.
+    /// Puts `vm` in the VM table as running and spawns its supervisor task,
+    /// which records it as ended once its host state is gone.
     fn start_supervising(self: &Arc<Self>, info: VmInfo, log: PathBuf, vm: Vm) {
         let name = info.name.clone();
         let (stops_tx, stops_rx) = mpsc::channel(4);
@@ -1076,25 +1201,12 @@ impl Agent {
         }
     }
 
-    /// Undoes the reservation of a start that failed: puts back the Ended VM
-    /// it would have replaced, and removes the log of its own.
-    fn forget_start(&self, name: &str, replaced: Option<Replaced>, log: &Path) {
-        {
-            let mut vms = self.vms.lock().unwrap();
-            vms.remove(name);
-            if let Some(Replaced { info, log }) = replaced {
-                vms.insert(name.to_string(), Entry::Ended { info, log });
-            }
-        }
-        let _ = std::fs::remove_file(log);
-    }
-
     /// Turns a running VM's record into an Ended VM's, once its host state
     /// is gone.
     fn record_end(&self, name: &str, reason: EndReason) {
         let mut vms = self.vms.lock().unwrap();
         if let Some(Entry::Running { info, log, .. }) = vms.remove(name) {
-            info!(vm = name, reason = reason.as_str(), "VM ended");
+            info!(vm = name, reason = reason.describe(), "VM ended");
             let ended = Ended { at: now(), reason };
             if let Err(e) = self.store.lock().unwrap().mark_ended(name, &ended) {
                 error!(vm = name, "record the end: {e}");
@@ -1237,12 +1349,13 @@ impl Agent {
             Some(entry @ Entry::Ended { .. }) => ("ended", entry.log().clone()),
             Some(entry) => ("running", entry.log().clone()),
         };
-        let bytes =
+        let (start, bytes) =
             read_log(&log, offset).map_err(|e| internal(format!("read the console log: {e}")))?;
         Ok(Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/plain; charset=utf-8")
             .header(VM_STATE_HEADER, state)
+            .header(LOG_OFFSET_HEADER, start)
             .body(Full::new(Bytes::from(bytes)))
             .expect("build logs response"))
     }
@@ -1290,22 +1403,48 @@ impl Agent {
         match vms.get(name) {
             None => Err(no_such_vm(name)),
             Some(Entry::Ended { info, log }) => {
-                if is_parked(info) {
-                    let snapshot = self.parked_dir.join(name);
-                    match std::fs::remove_dir_all(&snapshot) {
+                // The snapshot leaves `parked/` before its record does, so a
+                // wake never finds one half removed. It's deleted once the VM
+                // table is released, under a name of its own: an earlier
+                // snapshot of the same name may still be going.
+                let parked = is_parked(info);
+                let snapshot = self.parked_dir.join(name);
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos());
+                let trash = self.parked_dir.join(format!(".rm-{name}-{stamp}"));
+                if parked {
+                    match std::fs::rename(&snapshot, &trash) {
                         Err(e) if e.kind() != io::ErrorKind::NotFound => {
                             return Err(internal(format!("remove the snapshot of {name:?}: {e}")));
                         }
                         _ => {}
                     }
                 }
-                self.store
-                    .lock()
-                    .unwrap()
-                    .delete(name)
-                    .map_err(|e| internal(format!("remove the record of {name:?}: {e}")))?;
+                let deleted = self.store.lock().unwrap().delete(name);
+                if let Err(e) = deleted {
+                    if parked {
+                        let _ = std::fs::rename(&trash, &snapshot);
+                    }
+                    return Err(internal(format!("remove the record of {name:?}: {e}")));
+                }
                 let _ = std::fs::remove_file(log);
                 vms.remove(name);
+                drop(vms);
+                // Up to a whole guest's memory: off the runtime, and not
+                // waited for here. `shutdown` waits; an agent that dies first
+                // leaves the `.rm-*` dir for the startup sweep.
+                if parked {
+                    let mut deleting = self.deleting.lock().unwrap();
+                    while deleting.try_join_next().is_some() {}
+                    deleting.spawn_blocking(move || {
+                        if let Err(e) = std::fs::remove_dir_all(&trash)
+                            && e.kind() != io::ErrorKind::NotFound
+                        {
+                            warn!(path = %trash.display(), "remove the snapshot: {e}");
+                        }
+                    });
+                }
                 Ok(())
             }
             Some(_) => Err(ApiError(
@@ -1335,6 +1474,8 @@ impl Agent {
             }
             settled.await;
         }
+        let mut deleting = std::mem::take(&mut *self.deleting.lock().unwrap());
+        while deleting.join_next().await.is_some() {}
         // Only succeed once empty, so a jail still in use is never removed.
         let _ = std::fs::remove_dir(self.node.jails());
         let _ = std::fs::remove_dir(&self.node.jail_base);
@@ -1355,14 +1496,14 @@ fn app_with_host<'a>(
 /// The App a hostname belongs to. VMs and Machine-backed Apps share one
 /// namespace of names and hostnames.
 enum Owner {
-    Vm(String),
+    Vm { name: String, running: bool },
     Machine(String),
 }
 
 impl Owner {
     fn name(&self) -> &str {
         match self {
-            Owner::Vm(name) | Owner::Machine(name) => name,
+            Owner::Vm { name, .. } | Owner::Machine(name) => name,
         }
     }
 
@@ -1370,7 +1511,7 @@ impl Owner {
     /// it's VM-backed.
     fn taken(&self, host: &str) -> ApiError {
         let (owner, stop) = match self {
-            Owner::Vm(name) => (name, "stop and "),
+            Owner::Vm { name, running } => (name, if *running { "stop and " } else { "" }),
             Owner::Machine(name) => (name, ""),
         };
         ApiError(
@@ -1386,8 +1527,12 @@ impl Agent {
     /// The App whose Route has `host`, of either kind. `vms` is the VM
     /// table, held by the caller so no VM takes the hostname meanwhile.
     fn host_owner(&self, vms: &BTreeMap<String, Entry>, host: &str) -> Option<Owner> {
-        if let Some((name, _)) = app_with_host(vms, host) {
-            return Some(Owner::Vm(name.clone()));
+        if let Some((name, entry)) = app_with_host(vms, host) {
+            let running = matches!(entry, Entry::Starting { .. } | Entry::Running { .. });
+            return Some(Owner::Vm {
+                name: name.clone(),
+                running,
+            });
         }
         self.machines.app_with_host(host).map(Owner::Machine)
     }
@@ -1398,7 +1543,7 @@ impl Agent {
 fn validate_route(route: &Route) -> Result<(), ApiError> {
     let host = &route.host;
     if !cirro_edge::is_hostname(host) {
-        return Err(bad_request(&format!(
+        return Err(bad_request(format!(
             "{host:?} isn't a hostname: use lowercase letters, digits, hyphens and dots, \
              like web.example.com"
         )));
@@ -1439,19 +1584,37 @@ fn next_log_number(logs_dir: &Path) -> u64 {
         .map_or(0, |highest| highest + 1)
 }
 
-/// Up to [`LOG_CHUNK`] bytes of a console log from `offset`: empty past its
-/// end, or when it doesn't exist yet. A long-running App's log has no
-/// bound, so it is never read whole.
-fn read_log(log: &Path, offset: u64) -> io::Result<Vec<u8>> {
+/// Up to [`LOG_CHUNK`] bytes of a console log from `offset`, and the offset
+/// they start at: past `offset` when a trim ([`vm::trim_console_log`]) has
+/// freed the log there. Empty past its end, or when it doesn't exist yet.
+fn read_log(log: &Path, offset: u64) -> io::Result<(u64, Vec<u8>)> {
     let mut file = match std::fs::File::open(log) {
         Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((offset, Vec::new())),
         Err(e) => return Err(e),
     };
+    let Some(start) = next_data(&file, offset)? else {
+        return Ok((offset, Vec::new()));
+    };
     let mut bytes = Vec::new();
-    file.seek(SeekFrom::Start(offset))?;
-    file.take(LOG_CHUNK).read_to_end(&mut bytes)?;
-    Ok(bytes)
+    (&mut file).take(LOG_CHUNK).read_to_end(&mut bytes)?;
+    // A trim during the read frees bytes it may have read as zeros; they
+    // are dropped as if the trim had come first.
+    let kept = next_data(&file, start)?.unwrap_or(start);
+    let freed = kept.saturating_sub(start).min(bytes.len() as u64);
+    bytes.drain(..freed as usize);
+    Ok((start + freed, bytes))
+}
+
+/// The first offset from `offset` on that holds data, skipping a trimmed
+/// log's freed head, or `None` at or past its end.
+fn next_data(file: &std::fs::File, offset: u64) -> io::Result<Option<u64>> {
+    let offset = nix::libc::off_t::try_from(offset).map_err(io::Error::other)?;
+    match nix::unistd::lseek(file, offset, nix::unistd::Whence::SeekData) {
+        Ok(at) => Ok(Some(at as u64)),
+        Err(nix::errno::Errno::ENXIO) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// A VM that has just started (or woken) at `vm_address`.
@@ -1484,7 +1647,7 @@ fn in_bounds<T: PartialOrd + std::fmt::Display>(
     if value >= min && value <= max {
         Ok(())
     } else {
-        Err(bad_request(&format!(
+        Err(bad_request(format!(
             "{field} must be between {min} and {max}, got {value}"
         )))
     }
@@ -1508,7 +1671,7 @@ fn guest_config(run: &RunRequest) -> Result<GuestConfig, ApiError> {
             .is_some_and(|(key, _)| !key.is_empty())
             && !entry.contains('\0');
         if !valid {
-            return Err(bad_request(&format!(
+            return Err(bad_request(format!(
                 "env entry {entry:?} must be KEY=VALUE with a non-empty KEY and no NUL bytes"
             )));
         }
@@ -1516,7 +1679,7 @@ fn guest_config(run: &RunRequest) -> Result<GuestConfig, ApiError> {
     if let Some(dir) = &run.workdir
         && (!dir.starts_with('/') || dir.contains('\0'))
     {
-        return Err(bad_request(&format!(
+        return Err(bad_request(format!(
             "workdir {dir:?} must be an absolute path with no NUL bytes"
         )));
     }
@@ -1532,22 +1695,9 @@ fn guest_config(run: &RunRequest) -> Result<GuestConfig, ApiError> {
     })
 }
 
-/// VM, Machine and App names are 1-32 characters of lowercase letters, digits and hyphens,
-/// so they're safe in file names, URLs and log lines.
 /// `kind` names what the name is for, in the error: VM, Machine or App.
 fn validate_name(kind: &str, name: &str) -> Result<(), ApiError> {
-    let valid = (1..=32).contains(&name.len())
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    if valid {
-        Ok(())
-    } else {
-        Err(bad_request(&format!(
-            "invalid {kind} name {name:?}: a name is 1-32 characters of lowercase letters, \
-             digits and hyphens"
-        )))
-    }
+    cirro_proto::check_name(kind, name).map_err(|e| bad_request(&e))
 }
 
 fn resolve_group(group: &str) -> io::Result<u32> {
@@ -1561,6 +1711,32 @@ fn resolve_group(group: &str) -> io::Result<u32> {
             format!("no group named {group:?} for the agent socket"),
         )),
     }
+}
+
+/// Makes the state database root-only, from the moment it exists: it names
+/// every App's route and every Machine's address and host key, which are no
+/// business of other local users. SQLite gives the WAL files it makes the
+/// database's owner and mode; ones an earlier agent left are set here too,
+/// as is a database an earlier agent made 0644.
+fn restrict_state_db(db: &Path) -> io::Result<()> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(db)?;
+    let beside = |suffix: &str| {
+        let mut path = db.as_os_str().to_owned();
+        path.push(suffix);
+        PathBuf::from(path)
+    };
+    for path in [db.to_path_buf(), beside("-wal"), beside("-shm")] {
+        match std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            other => other?,
+        }
+    }
+    Ok(())
 }
 
 /// Seconds since the Unix epoch.
@@ -1589,6 +1765,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_panic_ends_the_agent_process() {
+        // The hook exits the process, so the panic runs in a child: the test
+        // re-runs itself with the variable set.
+        if std::env::var_os("CIRRO_PANIC_CHILD").is_some() {
+            exit_on_panic();
+            panic!("boom");
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "agent::tests::a_panic_ends_the_agent_process",
+                "--nocapture",
+            ])
+            .env("CIRRO_PANIC_CHILD", "1")
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(1));
+    }
+
+    #[test]
     fn a_log_is_read_a_chunk_at_a_time_from_the_offset() {
         let dir = crate::test_util::tempdir("cirro-agent-logs");
         let log = dir.join("web.0.log");
@@ -1596,10 +1792,47 @@ mod tests {
         contents.extend_from_slice(b"tail");
         std::fs::write(&log, &contents).unwrap();
 
-        assert_eq!(read_log(&log, 0).unwrap().len(), LOG_CHUNK as usize);
-        assert_eq!(read_log(&log, LOG_CHUNK).unwrap(), b"tail");
-        assert!(read_log(&log, LOG_CHUNK + 4).unwrap().is_empty());
-        assert!(read_log(&dir.join("missing.log"), 0).unwrap().is_empty());
+        assert_eq!(read_log(&log, 0).unwrap().1.len(), LOG_CHUNK as usize);
+        assert_eq!(
+            read_log(&log, LOG_CHUNK).unwrap(),
+            (LOG_CHUNK, b"tail".to_vec())
+        );
+        assert_eq!(
+            read_log(&log, LOG_CHUNK + 4).unwrap(),
+            (LOG_CHUNK + 4, Vec::new())
+        );
+        assert_eq!(
+            read_log(&dir.join("missing.log"), 0).unwrap(),
+            (0, Vec::new())
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_trimmed_log_is_read_from_its_oldest_kept_byte_at_its_own_offset() {
+        let dir = crate::test_util::tempdir("cirro-agent-trimmed-log");
+        let log = dir.join("web.0.log");
+        let mut contents = vec![b'a'; cirro_proto::CONSOLE_LOG_CAP as usize];
+        contents.extend_from_slice(b"newest\n");
+        std::fs::write(&log, &contents).unwrap();
+        vm::trim_console_log(&log).unwrap();
+
+        let (start, bytes) = read_log(&log, 0).unwrap();
+        assert_eq!(
+            start,
+            cirro_proto::CONSOLE_LOG_CAP / 2,
+            "not read from the oldest kept byte"
+        );
+        assert_eq!(bytes.len(), LOG_CHUNK as usize);
+        assert!(
+            bytes.iter().all(|&b| b == b'a'),
+            "read the freed head as zeros"
+        );
+        // An offset inside the kept part is served as it was.
+        assert_eq!(
+            read_log(&log, contents.len() as u64 - 7).unwrap(),
+            (contents.len() as u64 - 7, b"newest\n".to_vec())
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

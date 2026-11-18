@@ -17,7 +17,9 @@ BUILD_DIR="$HERE/.build"
 BASE_TREE="$BUILD_DIR/base"
 TARGET="x86_64-unknown-linux-musl"
 ALPINE_BRANCH="v3.20"
-APK_TOOLS_STATIC_PKG="apk-tools-static-2.14.4-r1.apk"
+# Pinned by SHA-256 like scripts/apps/uvm-career-quiz/build_rootfs.sh.
+APK_TOOLS_STATIC_PKG="apk-tools-static-2.14.13-r0.apk"
+APK_TOOLS_STATIC_SHA256="50f4967b2809c4eb4377b3717dc3c662d2137a530b94cebda91dfdc15f37b05a"
 
 apps=("$@")
 if [ ${#apps[@]} -eq 0 ]; then
@@ -35,6 +37,7 @@ APK="$APK_DIR/sbin/apk.static"
 if [ ! -x "$APK" ]; then
     curl -sSfL -o "$BUILD_DIR/apk-tools-static.apk" \
         "https://dl-cdn.alpinelinux.org/alpine/$ALPINE_BRANCH/main/x86_64/$APK_TOOLS_STATIC_PKG"
+    echo "$APK_TOOLS_STATIC_SHA256  $BUILD_DIR/apk-tools-static.apk" | sha256sum -c -
     mkdir -p "$APK_DIR"
     tar -xzf "$BUILD_DIR/apk-tools-static.apk" -C "$APK_DIR" 2>/dev/null
 fi

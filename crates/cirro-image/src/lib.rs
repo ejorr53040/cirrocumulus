@@ -3,14 +3,15 @@
 //! [`Flattened::open`] reads an image's layers, bottom first, and works out
 //! the final tree: later layers replace earlier entries, and `.wh.<name>`
 //! whiteouts and `.wh..wh..opq` opaque directories remove them, as the OCI
-//! image spec's layer rules say. [`Flattened::build_ext4`] writes that tree,
+//! image spec's layer rules say. `Flattened::build_ext4` writes that tree,
 //! plus what every guest needs (guest-init as `/init`, its mountpoints, DNS),
 //! as one tar in path order and has `mke2fs -d` turn it into ext4.
 //!
 //! Nothing here needs root. `mke2fs` (e2fsprogs 1.47.1 or later) takes each
-//! file's owner and mode from the tar, so a build run as any user keeps the
-//! image's ownership and setuid bits. Image layers are untrusted input, which
-//! is why this runs in the unprivileged CLI and never in the Node agent.
+//! file's owner, mode and extended attributes from the tar, so a build run as
+//! any user keeps the image's ownership, setuid bits and file capabilities.
+//! Image layers are untrusted input, which is why this runs in the
+//! unprivileged CLI and never in the Node agent.
 
 mod cache;
 pub mod run_config;
@@ -32,6 +33,56 @@ pub(crate) const MIN_MKE2FS: (u32, u32, u32) = (1, 47, 1);
 /// from the kernel command line, which carries no DNS server.
 const RESOLV_CONF: &[u8] = b"nameserver 1.1.1.1\nnameserver 8.8.8.8\n";
 const HOSTS: &[u8] = b"127.0.0.1\tlocalhost\n::1\tlocalhost\n";
+
+/// What an image may cost. Each is chosen to sit well above real images,
+/// and small enough that a hostile one can't fill the cache disk or exhaust
+/// memory.
+#[derive(Clone, Copy)]
+pub(crate) struct Limits {
+    /// A config blob, which is held in memory whole.
+    pub(crate) config: u64,
+    /// A layer blob as downloaded.
+    pub(crate) blob: u64,
+    /// A layer once decompressed.
+    pub(crate) layer: u64,
+    /// The rootfs the files may take, as [`cost`] counts it.
+    pub(crate) rootfs: u64,
+}
+
+pub(crate) const LIMITS: Limits = Limits {
+    config: 16 << 20,
+    blob: 4 << 30,
+    layer: 4 << 30,
+    rootfs: 4 << 30,
+};
+
+/// `total` plus `add`, or `None` if that passes `max`.
+fn within(total: u64, add: u64, max: u64) -> Option<u64> {
+    total.checked_add(add).filter(|t| *t <= max)
+}
+
+/// What an entry costs in the rootfs: a block for its inode, and the data of
+/// a file.
+fn cost(source: &Source) -> u64 {
+    match source.header.entry_type() {
+        EntryType::Regular | EntryType::Continuous => 4096 + source.size,
+        _ => 4096,
+    }
+}
+
+fn rootfs_too_big(max: u64) -> Error {
+    Error(format!("the files need more than {} of rootfs", human(max)))
+}
+
+/// `bytes` as a person would say it: `4 GiB`, `64 KiB`, `12291 bytes`.
+pub(crate) fn human(bytes: u64) -> String {
+    for (unit, name) in [(1 << 30, "GiB"), (1 << 20, "MiB"), (1 << 10, "KiB")] {
+        if bytes >= unit && bytes.is_multiple_of(unit) {
+            return format!("{} {name}", bytes / unit);
+        }
+    }
+    format!("{bytes} bytes")
+}
 
 /// Something that went wrong, said for a person.
 #[derive(Debug)]
@@ -56,7 +107,12 @@ struct Source {
     header: Header,
     /// Offset of the entry's data in its uncompressed layer.
     data: u64,
+    /// The data's length, which a PAX record may override from `header`.
+    size: u64,
     link_name: Option<PathBuf>,
+    /// The entry's `SCHILY.xattr.*` PAX records, file capabilities among
+    /// them, to write back for `mke2fs`.
+    xattrs: Vec<(String, Vec<u8>)>,
 }
 
 /// An image's layers merged into its final tree.
@@ -72,8 +128,17 @@ pub struct Flattened {
 impl Flattened {
     /// Merges `layers` (bottom first; each a tar, plain or gzip-compressed).
     /// Their uncompressed copies go in `scratch`, which the caller owns and
-    /// removes after [`Flattened::build_ext4`].
+    /// removes when it's done with the result.
     pub fn open(layers: &[PathBuf], scratch: &Path) -> Result<Flattened, Error> {
+        Self::open_within(layers, scratch, LIMITS)
+    }
+
+    /// [`Flattened::open`], with `limits` in place of [`LIMITS`].
+    pub(crate) fn open_within(
+        layers: &[PathBuf],
+        scratch: &Path,
+        limits: Limits,
+    ) -> Result<Flattened, Error> {
         std::fs::create_dir_all(scratch).map_err(|e| err("create the scratch dir", e))?;
         let mut flat = Flattened {
             layers: Vec::new(),
@@ -81,36 +146,51 @@ impl Flattened {
         };
         for (i, layer) in layers.iter().enumerate() {
             let plain = scratch.join(format!("layer-{i}.tar"));
-            decompress(layer, &plain)?;
+            decompress(layer, &plain, limits.layer)?;
             flat.layers.push(plain);
-            flat.apply(i)
+            flat.apply(i, limits.rootfs)
                 .map_err(|e| Error(format!("layer {}: {e}", i + 1)))?;
         }
         Ok(flat)
     }
 
     /// Applies layer `i` on top of the tree built from the layers below it.
-    fn apply(&mut self, i: usize) -> Result<(), Error> {
+    fn apply(&mut self, i: usize, max: u64) -> Result<(), Error> {
         let file = File::open(&self.layers[i]).map_err(|e| err("open", e))?;
         let mut archive = tar::Archive::new(BufReader::new(file));
         let mut entries = Vec::new();
+        let mut layer_cost = 0u64;
         for entry in archive.entries_with_seek().map_err(|e| err("read", e))? {
-            let entry = entry.map_err(|e| err("read an entry", e))?;
+            let mut entry = entry.map_err(|e| err("read an entry", e))?;
+            let mut xattrs = Vec::new();
+            let pax = entry
+                .pax_extensions()
+                .map_err(|e| err("read PAX records", e))?;
+            for ext in pax.into_iter().flatten() {
+                let ext = ext.map_err(|e| err("read a PAX record", e))?;
+                if let Ok(key) = ext.key()
+                    && key.starts_with("SCHILY.xattr.")
+                {
+                    xattrs.push((key.to_owned(), ext.value_bytes().to_vec()));
+                }
+            }
             let path = entry.path().map_err(|e| err("read a path", e))?;
             let path = normalise(&path)?;
             let link_name = entry
                 .link_name()
                 .map_err(|e| err(&format!("read {path}'s link"), e))?
                 .map(|l| l.into_owned());
-            entries.push((
-                path,
-                Source {
-                    layer: i,
-                    header: entry.header().clone(),
-                    data: entry.raw_file_position(),
-                    link_name,
-                },
-            ));
+            let source = Source {
+                layer: i,
+                header: entry.header().clone(),
+                data: entry.raw_file_position(),
+                size: entry.size(),
+                link_name,
+                xattrs,
+            };
+            layer_cost =
+                within(layer_cost, cost(&source), max).ok_or_else(|| rootfs_too_big(max))?;
+            entries.push((path, source));
         }
         // A layer's whiteouts hide only what's below it, so they go first.
         for (path, _) in &entries {
@@ -161,6 +241,11 @@ impl Flattened {
             }
             self.tree.insert(path, source);
         }
+        // Each layer fit on its own; the layers together may not.
+        self.tree
+            .values()
+            .try_fold(0, |total, s| within(total, cost(s), max))
+            .ok_or_else(|| rootfs_too_big(max))?;
         Ok(())
     }
 
@@ -193,7 +278,7 @@ impl Flattened {
 
     /// The contents of the regular file at `path` in the final tree, if
     /// there is one. `path` may start with `/`.
-    pub fn read(&self, path: &str) -> Result<Option<Vec<u8>>, Error> {
+    pub(crate) fn read(&self, path: &str) -> Result<Option<Vec<u8>>, Error> {
         let Some(source) = self.tree.get(path.trim_start_matches('/')) else {
             return Ok(None);
         };
@@ -213,18 +298,18 @@ impl Flattened {
     fn data(&self, source: &Source) -> io::Result<impl Read> {
         let mut file = File::open(&self.layers[source.layer])?;
         file.seek(SeekFrom::Start(source.data))?;
-        Ok(file.take(source.header.entry_size()?))
+        Ok(file.take(source.size))
     }
 
     /// Writes the final tree, with guest-init as `/init` and the rest of
     /// what a guest needs, as an ext4 image at `dest`. `scratch` holds the
     /// intermediate tar.
-    pub fn build_ext4(&self, init: &[u8], scratch: &Path, dest: &Path) -> Result<(), Error> {
+    pub(crate) fn build_ext4(&self, init: &[u8], scratch: &Path, dest: &Path) -> Result<(), Error> {
         check_mke2fs()?;
         let tree = self.with_guest_files(init);
         let tar_path = scratch.join("rootfs.tar");
         let bytes = self
-            .write_tar(&tree, &tar_path)
+            .write_tar(&tree, &tar_path, LIMITS.rootfs)
             .map_err(|e| err("write the rootfs tar", e))?;
 
         // Room for ext4's own metadata and for the app to write a little.
@@ -234,8 +319,10 @@ impl Flattened {
         image
             .set_len(size)
             .map_err(|e| err(&format!("size {}", dest.display()), e))?;
+        // One inode per 4 KiB, as `size` assumes: above 512 MiB `mke2fs`
+        // would otherwise give one per 16 KiB, too few for small files.
         let output = Command::new("mke2fs")
-            .args(["-q", "-F", "-t", "ext4", "-d"])
+            .args(["-q", "-F", "-t", "ext4", "-i", "4096", "-d"])
             .arg(&tar_path)
             .arg(dest)
             .output()
@@ -254,28 +341,23 @@ impl Flattened {
     /// The tree to write: the image's own, the files every guest gets
     /// (replacing the image's), and a directory entry for every parent the
     /// layers didn't list.
-    fn with_guest_files(&self, init: &[u8]) -> BTreeMap<String, Entry<'_>> {
+    fn with_guest_files<'a>(&'a self, init: &'a [u8]) -> BTreeMap<String, Entry<'a>> {
         let mut tree: BTreeMap<String, Entry<'_>> = self
             .tree
             .iter()
             .map(|(path, source)| (path.clone(), Entry::Layer(source)))
             .collect();
-        tree.insert("init".into(), Entry::Guest(init.to_vec(), 0o755));
-        tree.insert(
-            "etc/resolv.conf".into(),
-            Entry::Guest(RESOLV_CONF.to_vec(), 0o644),
-        );
-        tree.insert("etc/hosts".into(), Entry::Guest(HOSTS.to_vec(), 0o644));
+        tree.insert("init".into(), Entry::Guest(init, 0o755));
+        tree.insert("etc/resolv.conf".into(), Entry::Guest(RESOLV_CONF, 0o644));
+        tree.insert("etc/hosts".into(), Entry::Guest(HOSTS, 0o644));
         for dir in ["proc", "sys", "dev"] {
             tree.entry(dir.into()).or_insert(Entry::Dir);
         }
         let parents: Vec<String> = tree
             .keys()
-            .flat_map(|path| {
-                path.match_indices('/')
-                    .map(|(i, _)| path[..i].to_string())
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(|path| path.match_indices('/').map(|(i, _)| &path[..i]))
+            .filter(|parent| !tree.contains_key(*parent))
+            .map(str::to_owned)
             .collect();
         for parent in parents {
             tree.entry(parent).or_insert(Entry::Dir);
@@ -285,13 +367,21 @@ impl Flattened {
 
     /// Writes `tree` as a tar in path order, hardlinks last so each one's
     /// target already exists. Returns the space the files need, roughly.
-    fn write_tar(&self, tree: &BTreeMap<String, Entry<'_>>, dest: &Path) -> io::Result<u64> {
+    fn write_tar(
+        &self,
+        tree: &BTreeMap<String, Entry<'_>>,
+        dest: &Path,
+        max: u64,
+    ) -> io::Result<u64> {
         let mut builder = tar::Builder::new(BufWriter::new(File::create(dest)?));
         let mut bytes = 0u64;
+        let grow = |total: u64, add: u64| {
+            within(total, add, max).ok_or_else(|| io::Error::other(rootfs_too_big(max)))
+        };
         let mut hardlinks = Vec::new();
         for (path, entry) in tree {
             // Every inode costs at least a block.
-            bytes += 4096;
+            bytes = grow(bytes, 4096)?;
             match entry {
                 Entry::Dir => {
                     let mut header = Header::new_gnu();
@@ -305,19 +395,33 @@ impl Flattened {
                     header.set_entry_type(EntryType::Regular);
                     header.set_mode(*mode);
                     header.set_size(contents.len() as u64);
-                    bytes += contents.len() as u64;
-                    builder.append_data(&mut header, path, contents.as_slice())?;
+                    bytes = grow(bytes, contents.len() as u64)?;
+                    builder.append_data(&mut header, path, *contents)?;
                 }
                 Entry::Layer(source) => {
                     let mut header = source.header.clone();
+                    if header.entry_type() != EntryType::Link && !source.xattrs.is_empty() {
+                        builder.append_pax_extensions(
+                            source
+                                .xattrs
+                                .iter()
+                                .map(|(k, v)| (k.as_str(), v.as_slice())),
+                        )?;
+                    }
                     match header.entry_type() {
                         EntryType::Link => hardlinks.push((path, source)),
                         EntryType::Symlink => {
                             let target = source.link_name.clone().unwrap_or_default();
+                            // A link carries no data, whatever size the
+                            // layer's header claimed. `append_link` writes
+                            // none, so a size left here would shift every
+                            // entry after it.
+                            header.set_size(0);
                             builder.append_link(&mut header, path, target)?;
                         }
                         EntryType::Regular | EntryType::Continuous => {
-                            bytes += header.entry_size()?;
+                            header.set_size(source.size);
+                            bytes = grow(bytes, source.size)?;
                             builder.append_data(&mut header, path, self.data(source)?)?;
                         }
                         _ => {
@@ -335,7 +439,12 @@ impl Flattened {
             // `mke2fs` gives the shared inode the link entry's metadata, so
             // it must match the target's.
             match tree.get(&target) {
-                Some(Entry::Layer(t)) => {
+                Some(Entry::Layer(t))
+                    if matches!(
+                        t.header.entry_type(),
+                        EntryType::Regular | EntryType::Continuous
+                    ) =>
+                {
                     header.set_mode(t.header.mode()?);
                     header.set_uid(t.header.uid()?);
                     header.set_gid(t.header.gid()?);
@@ -346,12 +455,14 @@ impl Flattened {
                     header.set_uid(0);
                     header.set_gid(0);
                 }
-                Some(Entry::Dir) | None => {
+                Some(Entry::Layer(_) | Entry::Dir) | None => {
                     return Err(io::Error::other(format!(
                         "{path} is a hard link to {target}, which isn't a file in the image"
                     )));
                 }
             }
+            // As for a symlink above.
+            header.set_size(0);
             builder.append_link(&mut header, path, &target)?;
         }
         builder.into_inner()?.flush()?;
@@ -362,7 +473,7 @@ impl Flattened {
 enum Entry<'a> {
     Layer(&'a Source),
     /// A file every guest gets, owned by root, with this mode.
-    Guest(Vec<u8>, u32),
+    Guest(&'a [u8], u32),
     /// A directory the image doesn't list: root-owned, `0755`.
     Dir,
 }
@@ -399,27 +510,40 @@ fn join(dir: &str, name: &str) -> String {
     }
 }
 
-/// Copies `layer` to `dest` as a plain tar, gunzipping it if needed.
-fn decompress(layer: &Path, dest: &Path) -> Result<(), Error> {
+/// Copies `layer` to `dest` as a plain tar, gunzipping it if needed. A layer
+/// that expands past `max` is refused, and copying stops at `max` + 1 bytes:
+/// a gzip of zeros is about a thousandth of what it expands to.
+fn decompress(layer: &Path, dest: &Path, max: u64) -> Result<(), Error> {
     let context = || format!("layer {}", layer.display());
     let mut file = File::open(layer).map_err(|e| err(&context(), e))?;
     let mut magic = [0u8; 4];
     let n = file.read(&mut magic).map_err(|e| err(&context(), e))?;
     file.rewind().map_err(|e| err(&context(), e))?;
     let mut out = BufWriter::new(File::create(dest).map_err(|e| err("create scratch layer", e))?);
+    // One byte past the cap is enough to tell that the layer is too big.
+    let room = max.saturating_add(1);
     let copied = match &magic[..n] {
-        [0x1f, 0x8b, ..] => io::copy(&mut GzDecoder::new(BufReader::new(file)), &mut out),
+        [0x1f, 0x8b, ..] => io::copy(
+            &mut GzDecoder::new(BufReader::new(file)).take(room),
+            &mut out,
+        ),
         [0x28, 0xb5, 0x2f, 0xfd] => {
             return Err(Error(format!(
                 "{}: zstd-compressed layers aren't supported yet",
                 context()
             )));
         }
-        _ => io::copy(&mut BufReader::new(file), &mut out),
-    };
-    copied
-        .and_then(|_| out.flush())
-        .map_err(|e| err(&context(), e))
+        _ => io::copy(&mut BufReader::new(file).take(room), &mut out),
+    }
+    .map_err(|e| err(&context(), e))?;
+    if copied > max {
+        return Err(Error(format!(
+            "{}: expands to more than {}",
+            context(),
+            human(max)
+        )));
+    }
+    out.flush().map_err(|e| err(&context(), e))
 }
 
 /// Fails unless `mke2fs` is new enough to build from a tarball.

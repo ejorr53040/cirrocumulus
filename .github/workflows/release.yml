@@ -1,6 +1,8 @@
 # Builds `cirro` for a version tag (v0.1.0, ...) and publishes it, with its
-# SHA-256, as a GitHub release whose notes are that version's CHANGELOG.md
-# section. Pushing the tag is the only step a person takes.
+# SHA-256 and a build-provenance attestation, as a GitHub release whose notes
+# are that version's CHANGELOG.md section. Pushing the tag is the only step a
+# person takes. The `gate` job refuses a tag whose commit isn't on main or
+# whose CI didn't pass.
 
 name: Release
 
@@ -19,13 +21,44 @@ defaults:
     shell: bash
 
 jobs:
+  gate:
+    name: Tag is on main and passed CI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      SHA: ${{ github.sha }}
+    steps:
+      - name: The tag's commit is on main
+        run: |
+          # "behind" or "identical" means SHA is an ancestor of main.
+          status=$(gh api "repos/$REPO/compare/main...$SHA" --jq .status)
+          case "$status" in
+            behind | identical) ;;
+            *) echo "::error::$SHA isn't on main (compare status: $status)"; exit 1 ;;
+          esac
+      - name: CI passed on that commit
+        run: |
+          passed=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&event=push&status=success" --jq .total_count)
+          if [ "$passed" -lt 1 ]; then
+            echo "::error::no successful CI run on main for $SHA"
+            exit 1
+          fi
+
   release:
     name: Build and publish
+    needs: gate
     # The oldest supported runner, so the binary needs only glibc 2.35+.
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -53,6 +86,10 @@ jobs:
           cp target/release/cirro LICENSE README.md CHANGELOG.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
       - name: Release notes from CHANGELOG.md
         env:
           TAG: ${{ github.ref_name }}

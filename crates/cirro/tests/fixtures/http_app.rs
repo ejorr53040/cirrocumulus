@@ -1,4 +1,4 @@
-// M3 fixture: the smallest command worth `curl`ing at a VM address. Answers
+// Fixture: the smallest command worth `curl`ing at a VM address. Answers
 // every connection on port 8080 with a fixed body, then closes it, after
 // printing a marker to the console once it is listening. Built
 // static for musl by `tests/node_agent.rs` (not part of the cargo

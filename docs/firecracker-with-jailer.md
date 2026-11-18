@@ -43,12 +43,16 @@ jailer --id cirro-e202 \
   `/dev/net/tun` inside the chroot, and device nodes are inert on a `nodev`
   mount. The symptom is a "Permission denied" from Firecracker's KVM setup,
   not a mount error. `/tmp` is often `nodev`; `/var/lib` usually isn't.
-- **Socket paths are short.** Firecracker's API socket lives under
-  `<chroot-base>/firecracker/<id>/root/`, and a Unix socket path must fit in
-  108 bytes. Keep the base directory and ids short.
 - **Only the leaf is the VM's.** jailer chowns `<chroot-base>/firecracker/<id>/root`
   to the VM's uid; the directories above it stay root's. Clean up the whole
   `<id>` directory as root when the VM ends.
+- **Connect to the jail's sockets beneath its root, never by path.** The
+  root is the VM's, so a VMM can leave a link where `run` or `v.sock` should
+  be, and a connect by path, as root, follows it to another VM's socket or
+  any on the host. The agent opens each socket `O_PATH` with `openat2`
+  (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`) from the jail root and connects
+  through `/proc/self/fd/<n>`. That path is short, so the 108-byte limit on a
+  Unix socket path doesn't bind the jail's location either.
 - **Files go into the jail, not paths.** Firecracker sees only the chroot, so
   the kernel, rootfs and snapshot files are hard-linked or copied in, owned by
   the VM's uid, and named by their path inside it.

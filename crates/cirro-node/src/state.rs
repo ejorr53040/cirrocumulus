@@ -89,7 +89,6 @@ impl Store {
              )",
         )
         .map_err(io_error)?;
-        add_missing_columns(&conn)?;
         let stored: Option<String> = conn
             .query_row("SELECT subnet FROM node", [], |row| row.get(0))
             .optional()
@@ -296,34 +295,6 @@ impl Store {
             .map(drop)
             .map_err(io_error)
     }
-}
-
-/// Adds the columns a database made by an older agent lacks, in one
-/// transaction, so a crash can't leave some added and others not.
-fn add_missing_columns(conn: &Connection) -> io::Result<()> {
-    // Added after the table's first release, in the order they came.
-    const ADDED: [(&str, &str); 3] = [
-        ("route_host", "TEXT"),
-        ("route_port", "INTEGER"),
-        ("route_idle_park", "INTEGER"),
-    ];
-    let mut statement = conn
-        .prepare("SELECT name FROM pragma_table_info('vms')")
-        .map_err(io_error)?;
-    let present: Vec<String> = statement
-        .query_map([], |row| row.get(0))
-        .and_then(|rows| rows.collect())
-        .map_err(io_error)?;
-    let alters: String = ADDED
-        .iter()
-        .filter(|(name, _)| !present.iter().any(|p| p == name))
-        .map(|(name, kind)| format!("ALTER TABLE vms ADD COLUMN {name} {kind};"))
-        .collect();
-    if alters.is_empty() {
-        return Ok(());
-    }
-    conn.execute_batch(&format!("BEGIN; {alters} COMMIT;"))
-        .map_err(io_error)
 }
 
 /// SQLite integers are signed; every number stored here (times, ticks) is

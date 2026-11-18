@@ -9,7 +9,7 @@
 # configured app exits, rather than needing this script's own cleanup trap
 # to kill it: prints synthetic FIRECRACKER_EXITED_CLEANLY / NO_KERNEL_PANIC
 # status lines onto its own stdout (alongside the guest's console, which it
-# cats below), the same trick run_jailer.sh uses for its own uid check.
+# cats below).
 # "Firecracker's process exited" alone isn't enough evidence of a *clean*
 # shutdown -- slice 1 found that a kernel panic + `reboot=k` also makes
 # Firecracker exit with exit_code=0, so NO_KERNEL_PANIC is what actually

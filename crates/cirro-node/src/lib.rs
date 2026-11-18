@@ -5,7 +5,7 @@
 pub mod agent;
 mod cmd;
 mod egress;
-pub mod firecracker;
+mod firecracker;
 pub mod install;
 mod layout;
 mod metrics;

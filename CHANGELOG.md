@@ -28,9 +28,11 @@ HTTP(S) to Apps by hostname.
   agent, which takes them back when it starts again.
 - **Images.** `cirro image pull | ls | rm`: public `linux/amd64` images,
   built into a rootfs as the calling user, not root (ADR 0004).
-- **Egress policy.** One Node-wide nftables table masquerades VMs' traffic
-  and drops SMTP port 25, VM-to-VM and private-range LAN destinations, and anything a VM sends
-  from an address that isn't its own.
+- **Egress policy.** Two Node-wide nftables tables: `ip cirro` masquerades
+  VMs' traffic and drops SMTP port 25, VM-to-VM and private-range LAN
+  destinations, and anything a VM sends from an address that isn't its own;
+  `ip6 cirro` drops all IPv6 from VMs. An agent refuses a Node subnet whose
+  VMs' host objects would be named like another Node's on the same host.
 - **Dashboard.** `cirro top`: live CPU, memory, disk and network use of the
   Node and each VM, at 1 s.
 - **Park and wake.** `cirro park` snapshots a VM and frees its RAM;
@@ -53,11 +55,14 @@ HTTP(S) to Apps by hostname.
   same certificates as a VM-backed App, and a 503 while the Machine is
   unreachable. The agent reconnects a Machine that comes back, never one
   whose host key changed. `cirro ps` and `cirro top` show Machine-backed
-  Apps.
+  Apps. Each App is forwarded from a root-only Unix socket on the Node, so
+  no other local user can reach it past the edge or keep it down.
 - **Docs.** [Threat model](docs/threat-model.md), [security
   policy](SECURITY.md), ADRs 0001–0009, and a docs site (mdBook, `docs/`).
 - **Releases.** Tagging `vX.Y.Z` builds `cirro` and publishes it with its
-  SHA-256; every crate is ready for `cargo publish --workspace`.
+  SHA-256 and a build-provenance attestation (`gh attestation verify`). The
+  tag's commit has to be on `main` and have passed CI, or the release is
+  refused; every crate is ready for `cargo publish --workspace`.
 - **Fuzzing.** cargo-fuzz targets for the OCI layer parser and guest-init's
   config ([fuzz/README.md](fuzz/README.md)).
 

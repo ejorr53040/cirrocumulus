@@ -29,20 +29,19 @@
 //! given the VM address and the VMM's [`ProcessId`], and removes the host
 //! state of one that is gone or was never recorded with [`clean_up`].
 
-use crate::firecracker::{BootConfig, Client};
-pub(crate) use crate::process::ProcessId;
+use crate::firecracker::{BootConfig, Client, connect_beneath};
+use crate::process::ProcessId;
 use crate::subnet::Subnet;
 use cirro_guest_init::config::{CONFIG_PORT, Config as GuestConfig};
-use cirro_proto::EndReason;
+use cirro_proto::{CONSOLE_LOG_CAP, EndReason};
 use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::net::Ipv4Addr;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
 
@@ -110,8 +109,7 @@ pub(crate) struct NodeConfig {
     pub(crate) firecracker: PathBuf,
     pub(crate) jailer: PathBuf,
     pub(crate) kernel: PathBuf,
-    /// jailer's `--chroot-base-dir`. Must not be on a `nodev` mount, and must
-    /// be short enough that jail socket paths fit in a `sockaddr_un`.
+    /// jailer's `--chroot-base-dir`. Must not be on a `nodev` mount.
     pub(crate) jail_base: PathBuf,
     /// The Node's own address in the Node subnet (`.1`).
     pub(crate) node_address: Ipv4Addr,
@@ -199,7 +197,6 @@ pub(crate) struct Vm {
     /// links, NAT) are pushed after it starts.
     vmm: Option<Vmm>,
     undo: Vec<Undo>,
-    api_socket: PathBuf,
     /// The jail's root, where Firecracker's own `/` is.
     jail_root: PathBuf,
     console_log: PathBuf,
@@ -299,6 +296,25 @@ pub(crate) fn parent_cgroup_under(root: &Path) -> PathBuf {
     root.join("sys/fs/cgroup").join(PARENT_CGROUP)
 }
 
+/// The most threads a VM's Firecracker may run: its API thread, its VMM
+/// thread and one per vCPU (at most 32, see cirro-proto). Caps what an
+/// escaped VMM can fork inside its own cgroup.
+const PIDS_MAX: u32 = 64;
+
+/// The `--cgroup` settings for a VM's own cgroup: jailer's memory and cpu
+/// limits, a cap on its threads, and no swap. Without `memory.swap.max=0`,
+/// the guest memory that doesn't fit in RAM would spill to host swap with no
+/// bound.
+fn cgroup_settings(mem_mib: u32, vcpus: u8) -> Vec<String> {
+    let memory_max = (u64::from(mem_mib) + VMM_OVERHEAD_MIB) * 1024 * 1024;
+    vec![
+        format!("memory.max={memory_max}"),
+        "memory.swap.max=0".to_string(),
+        format!("cpu.max={} 100000", u32::from(vcpus) * 100_000),
+        format!("pids.max={PIDS_MAX}"),
+    ]
+}
+
 impl Vm {
     /// Brings up the VM described by `spec`, returning once guest-init has
     /// its config and the VM has stayed up for a 2 s grace period. On failure,
@@ -328,8 +344,13 @@ impl Vm {
         match vm.wake_steps(node, spec).await {
             Ok(()) => Ok(vm),
             Err(e) => {
-                if let Err(back) =
-                    move_files(&vm.jail_root, WAKE_FILES, &spec.snapshot, SNAPSHOT_FILES)
+                // A wake that failed before its jail was made moved nothing
+                // into it, and an empty `jail_root` would have this move
+                // files named like the snapshot's out of the agent's working
+                // directory and over the snapshot.
+                if !vm.jail_root.as_os_str().is_empty()
+                    && let Err(back) =
+                        move_files(&vm.jail_root, WAKE_FILES, &spec.snapshot, SNAPSHOT_FILES)
                 {
                     tracing::warn!("put the snapshot back after a failed wake: {back}");
                 }
@@ -343,7 +364,6 @@ impl Vm {
         Vm {
             vmm: None,
             undo: Vec::new(),
-            api_socket: PathBuf::new(),
             jail_root: PathBuf::new(),
             console_log,
             process: None,
@@ -366,7 +386,6 @@ impl Vm {
                 cgroup: parent_cgroup().join(&id),
             }),
             undo: undo_steps(&node.jails(), &id),
-            api_socket: jail_root.join(API_SOCKET_IN_JAIL),
             jail_root,
             console_log,
             process: Some(process),
@@ -376,7 +395,7 @@ impl Vm {
     /// Lets the guest's vCPUs run again, for a VM taken back with `adopt`: an
     /// agent that died part-way through a park can leave its VM paused.
     pub(crate) async fn resume(&self) -> Result<(), Error> {
-        Client::new(&self.api_socket)
+        Client::new(&self.jail_root, API_SOCKET_IN_JAIL)
             .resume()
             .await
             .map_err(|e| err("resume the VM", e))
@@ -403,7 +422,7 @@ impl Vm {
     }
 
     async fn run_until_ended(&mut self, stops: &mut mpsc::Receiver<Stop>) -> EndReason {
-        let client = Client::new(&self.api_socket);
+        let client = Client::new(&self.jail_root, API_SOCKET_IN_JAIL);
         let console_log = self.console_log.clone();
         let jail_root = self.jail_root.clone();
         let vmm = self.vmm.as_mut().expect("a started VM has a VMM");
@@ -462,31 +481,48 @@ impl Vm {
             .host_steps(node, spec.vm_address, spec.mem_mib, spec.vcpus, false)
             .await?;
         let root = self.jail_root.clone();
-        let api_socket = self.api_socket.clone();
 
-        // 5. Kernel and rootfs into the jail, then the devices.
+        // 5. Kernel and rootfs into the jail, then the devices. The copies
+        //    move real bytes, so they run off the runtime's workers.
+        let kernel = node.kernel.clone();
+        // Copies from a dup of the fd the agent already opened as the caller
+        // (#14), never the path again. The dup shares its offset, still 0.
+        let rootfs = spec
+            .rootfs_file
+            .try_clone()
+            .map_err(|e| err("copy rootfs into jail", e))?;
+        let rootfs_path = spec.rootfs.clone();
         let kernel_in_jail = root.join("vmlinux");
-        if std::fs::hard_link(&node.kernel, &kernel_in_jail).is_err() {
-            std::fs::copy(&node.kernel, &kernel_in_jail)
-                .map_err(|e| err("copy kernel into jail", e))?;
-        }
         let rootfs_in_jail = root.join("rootfs.ext4");
-        let mut rootfs_dest =
-            std::fs::File::create(&rootfs_in_jail).map_err(|e| err("create rootfs in jail", e))?;
-        // Copies from the fd the agent already opened as the caller (#14),
-        // never the path again: `&File` reads from its current offset (0,
-        // since nothing has read it yet), and `io::copy` specializes
-        // File-to-File on Linux via `copy_file_range`.
-        std::io::copy(&mut &spec.rootfs_file, &mut rootfs_dest).map_err(|e| {
-            err(
-                &format!("copy rootfs {} into jail", spec.rootfs.display()),
-                e,
-            )
-        })?;
+        let (kernel_dest, rootfs_dest) = (kernel_in_jail.clone(), rootfs_in_jail.clone());
+        tokio::task::spawn_blocking(move || -> Result<(), Error> {
+            if std::fs::hard_link(&kernel, &kernel_dest).is_err() {
+                std::fs::copy(&kernel, &kernel_dest)
+                    .map_err(|e| err("copy kernel into jail", e))?;
+            }
+            // 0600 from the moment it exists: it's the guest's disk, and the
+            // chown below gives it only an owner, not a mode.
+            let mut dest = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&rootfs_dest)
+                .map_err(|e| err("create rootfs in jail", e))?;
+            std::io::copy(&mut &rootfs, &mut dest).map_err(|e| {
+                err(
+                    &format!("copy rootfs {} into jail", rootfs_path.display()),
+                    e,
+                )
+            })?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| err("copy into jail", e))??;
         std::os::unix::fs::chown(&rootfs_in_jail, Some(uid), Some(uid))
             .map_err(|e| err("chown rootfs in jail", e))?;
 
-        let client = Client::new(&api_socket);
+        let client = Client::new(&root, API_SOCKET_IN_JAIL);
         client
             .attach_tap("eth0", "tap0")
             .await
@@ -510,8 +546,7 @@ impl Vm {
             .map_err(|e| err("boot", e))?;
 
         // 6. guest-init's config over vsock, then the grace period.
-        self.deliver_config(&root.join(VSOCK_SOCKET_IN_JAIL), &spec.guest)
-            .await?;
+        self.deliver_config(&spec.guest).await?;
         let vmm = self.vmm.as_mut().expect("the VMM was just spawned");
         match tokio::time::timeout(START_GRACE, vmm.wait()).await {
             Err(_) => Ok(()),
@@ -536,7 +571,7 @@ impl Vm {
         // 6. Load and resume. The snapshot names the tap, the drive and the
         //    vsock socket by the same paths the first VM had.
         let [vmstate, mem, _] = WAKE_FILES;
-        Client::new(&self.api_socket)
+        Client::new(&self.jail_root, API_SOCKET_IN_JAIL)
             .load_snapshot(&format!("/{vmstate}"), &format!("/{mem}"))
             .await
             .map_err(|e| {
@@ -580,7 +615,16 @@ impl Vm {
         enable_io_accounting();
         let root = jail_dir(&node.jails(), &id).join("root");
         self.jail_root = root.clone();
-        std::fs::create_dir_all(&node.jail_base).map_err(|e| err("create jail base dir", e))?;
+        // Root-only: jails hold guests' disks and snapshot memory, which
+        // Firecracker writes at whatever mode it likes. Set on every start,
+        // since an earlier agent may have made it wider.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&node.jail_base)
+            .map_err(|e| err("create jail base dir", e))?;
+        std::fs::set_permissions(&node.jail_base, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| err("make the jail base dir root-only", e))?;
         // 0640 from the moment it exists (never briefly at the create-call's
         // default mode) and root:cirro: console logs hold whatever the VM's
         // command printed, so a group member can read their own VM's log,
@@ -595,8 +639,7 @@ impl Vm {
             .map_err(|e| err("create console log", e))?;
         std::os::unix::fs::chown(&self.console_log, Some(0), Some(node.cirro_gid))
             .map_err(|e| err("chown console log", e))?;
-        let memory_max = (u64::from(mem_mib) + VMM_OVERHEAD_MIB) * 1024 * 1024;
-        let cpu_max = format!("cpu.max={} 100000", u32::from(vcpus) * 100_000);
+        let cgroup = cgroup_settings(mem_mib, vcpus);
         let child = Command::new(&node.jailer)
             .arg("--id")
             .arg(&id)
@@ -608,10 +651,11 @@ impl Vm {
             .arg("--netns")
             .arg(Path::new(NETNS_DIR).join(&id))
             .args(["--cgroup-version", "2", "--parent-cgroup", PARENT_CGROUP])
-            .arg("--cgroup")
-            .arg(format!("memory.max={memory_max}"))
-            .arg("--cgroup")
-            .arg(cpu_max)
+            .args(
+                cgroup
+                    .iter()
+                    .flat_map(|setting| ["--cgroup", setting.as_str()]),
+            )
             // No `kill_on_drop`: the VMM outlives the agent (ADR 0002).
             .stdin(Stdio::null())
             .stdout(
@@ -676,9 +720,9 @@ impl Vm {
         in_netns(&id, &["sysctl", "-qw", "net.ipv4.ip_forward=1"]).await?;
         nft_in(&id, &namespace_ruleset(vm_address)).await?;
 
-        // 4. Firecracker's API socket.
+        // 4. Firecracker's API socket. Only waited for here: every connect
+        //    to it goes through `connect_beneath`.
         let api_socket = root.join(API_SOCKET_IN_JAIL);
-        self.api_socket = api_socket.clone();
         let deadline = Instant::now() + API_SOCKET_TIMEOUT;
         while !api_socket.exists() {
             if let Some(status) = self.vmm_exit_status() {
@@ -705,7 +749,7 @@ impl Vm {
     /// listening, Firecracker drops the connection instead of answering
     /// `OK`, so this retries from scratch until [`CONFIG_TIMEOUT`], giving up
     /// early if the VM ends first.
-    async fn deliver_config(&mut self, vsock: &Path, guest: &GuestConfig) -> Result<(), Error> {
+    async fn deliver_config(&mut self, guest: &GuestConfig) -> Result<(), Error> {
         let config = serde_json::to_string(guest).expect("serialize guest-init's config");
         let deadline = Instant::now() + CONFIG_TIMEOUT;
         let mut last_error = String::from("never tried");
@@ -713,7 +757,7 @@ impl Vm {
             if let Some(status) = self.vmm_exit_status() {
                 return Err(self.ended_during_start(Some(status)));
             }
-            match try_deliver_config(vsock, &config).await {
+            match try_deliver_config(&self.jail_root, &config).await {
                 Ok(()) => return Ok(()),
                 Err(e) => last_error = e,
             }
@@ -957,6 +1001,40 @@ fn console_tail_bytes(path: &Path) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+/// Whether `log` takes more disk than [`CONSOLE_LOG_CAP`]: one `stat`, made
+/// for every running VM each second.
+pub(crate) fn console_log_over_cap(log: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(log).is_ok_and(|m| m.blocks() * 512 > CONSOLE_LOG_CAP)
+}
+
+/// Frees the disk under all of `log` but its newest half
+/// [`CONSOLE_LOG_CAP`], by punching a hole over its head. Firecracker holds
+/// the log as its stdout for as long as the VM runs, so it can't be
+/// rotated, and rewriting it would race the guest's writes. A hole keeps the
+/// length and every offset as they were, so Firecracker's writes, a
+/// following `cirro logs` and anything the guest writes meanwhile carry on
+/// untouched. It ends on a block boundary, so it frees whole blocks and
+/// zeroes nothing that is kept.
+pub(crate) fn trim_console_log(log: &Path) -> std::io::Result<()> {
+    use nix::fcntl::{FallocateFlags, fallocate};
+    use std::os::unix::fs::MetadataExt;
+    let file = std::fs::OpenOptions::new().write(true).open(log)?;
+    let on_disk = file.metadata()?;
+    let block = on_disk.blksize().max(1);
+    let hole = on_disk.len().saturating_sub(CONSOLE_LOG_CAP / 2) / block * block;
+    if hole == 0 {
+        return Ok(());
+    }
+    let hole = nix::libc::off_t::try_from(hole).map_err(std::io::Error::other)?;
+    Ok(fallocate(
+        &file,
+        FallocateFlags::FALLOC_FL_PUNCH_HOLE | FallocateFlags::FALLOC_FL_KEEP_SIZE,
+        0,
+        hole,
+    )?)
+}
+
 /// One step of teardown, registered as the matching start step succeeds.
 enum Undo {
     DeleteNetns(String),
@@ -1093,10 +1171,10 @@ fn namespace_ruleset(vm_address: Ipv4Addr) -> String {
     )
 }
 
-async fn try_deliver_config(vsock: &Path, config: &str) -> Result<(), String> {
-    let stream = UnixStream::connect(vsock)
+async fn try_deliver_config(jail_root: &Path, config: &str) -> Result<(), String> {
+    let stream = connect_beneath(jail_root, VSOCK_SOCKET_IN_JAIL)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("{VSOCK_SOCKET_IN_JAIL}: {e}"))?;
     let mut stream = BufReader::new(stream);
     stream
         .get_mut()
@@ -1210,6 +1288,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_vms_cgroup_caps_its_threads_and_swap() {
+        let settings = cgroup_settings(512, 2);
+        assert!(
+            settings.contains(&format!("pids.max={PIDS_MAX}")),
+            "{settings:?}"
+        );
+        assert!(
+            settings.contains(&"memory.swap.max=0".to_string()),
+            "{settings:?}"
+        );
+    }
+
+    #[test]
     fn a_failed_ip_batch_names_the_command_that_failed() {
         let commands = ["link set lo up".to_string(), "link set tap0 up".to_string()];
         let failed = Error(
@@ -1232,5 +1323,53 @@ mod tests {
             name_failed_batch_command(failed, &commands).to_string(),
             "spawn ip: No such file or directory"
         );
+    }
+
+    #[test]
+    fn trimming_a_console_log_frees_its_head_and_keeps_its_offsets_and_newest_bytes() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = crate::test_util::tempdir("cirro-vm-console-cap");
+        let log = dir.join("web.0.log");
+        let mut contents = vec![b'a'; CONSOLE_LOG_CAP as usize];
+        contents.extend_from_slice(b"newest\n");
+        std::fs::write(&log, &contents).unwrap();
+        assert!(console_log_over_cap(&log));
+
+        trim_console_log(&log).unwrap();
+
+        assert!(!console_log_over_cap(&log));
+        let trimmed = std::fs::metadata(&log).unwrap();
+        assert!(
+            trimmed.blocks() * 512 <= CONSOLE_LOG_CAP / 2 + trimmed.blksize(),
+            "{} bytes still on disk",
+            trimmed.blocks() * 512
+        );
+        assert_eq!(trimmed.len(), contents.len() as u64, "offsets moved");
+        assert!(console_tail_bytes(&log).ends_with("newest\n"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_host_id_maps_back_only_to_a_vm_address_in_its_own_subnet() {
+        let subnet: Subnet = "10.77.180.0/24".parse().unwrap();
+        let low16 = |a: &str| {
+            let [_, _, c, d] = a.parse::<Ipv4Addr>().unwrap().octets();
+            u16::from_be_bytes([c, d])
+        };
+        // The first and last VM addresses round-trip through their host ids.
+        for vm in ["10.77.180.2", "10.77.180.254"] {
+            let address: Ipv4Addr = vm.parse().unwrap();
+            assert_eq!(parse_host_id(&host_id(address)), Some(low16(vm)));
+            assert_eq!(subnet.vm_address_with_low16(low16(vm)), Some(address));
+        }
+        // `.0`, `.1` and the broadcast address are no VM's.
+        for not_a_vm in ["10.77.180.0", "10.77.180.1", "10.77.180.255"] {
+            assert_eq!(subnet.vm_address_with_low16(low16(not_a_vm)), None);
+        }
+        // The same low 16 bits under another third octet are another subnet's VM.
+        let other = parse_host_id(&host_id("10.77.181.2".parse().unwrap())).unwrap();
+        assert_eq!(subnet.vm_address_with_low16(other), None);
+        assert_eq!(parse_host_id("cirro-12345"), None);
+        assert_eq!(parse_host_id("cirro-zz00"), None);
     }
 }

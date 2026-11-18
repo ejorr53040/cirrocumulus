@@ -70,6 +70,13 @@ cargo build --release -p cirrocumulus
 sudo install -m 755 target/release/cirro /usr/local/bin/cirro
 ```
 
+Release tarballs carry a build-provenance attestation. To check one came from
+this repository's release workflow:
+
+```sh
+gh attestation verify cirro-vX.Y.Z-x86_64-linux-gnu.tar.gz --repo ejorr53040/cirrocumulus
+```
+
 ## Run
 
 Set up the host once, as root. This checks prereqs, fetches and verifies the
@@ -160,7 +167,7 @@ cirro image ls                    # cached images
 cirro image rm <image|digest>
 cirro ps [--all]                  # list VMs (--all includes Ended VMs)
 cirro top [--once]                # live CPU, memory, disk and network use
-cirro logs [--follow] <name>      # a VM's console log
+cirro logs [--follow] <name>      # a VM's console log (its newest 2-4 MiB)
 cirro stop [--force] [--timeout <secs>] <name>
 cirro rm <name>                   # delete an Ended VM's record and log, or a parked VM's snapshot
 cirro park <name>                 # snapshot a VM to disk and free its RAM
@@ -262,8 +269,10 @@ scripts/ci/local.sh           # the same gates CI runs (--quick skips docs + tes
 
 All gates in `.github/workflows/ci.yml` block merging, including commit-message
 rules and a check that every commit builds. GitHub's runners have no KVM,
-so the real-Firecracker tests only compile there; run them locally, or on a
-self-hosted runner with `.github/workflows/vm-tests.yml`. `crates/cirro/tests/node_agent.rs` explains the
+so the real-Firecracker tests only compile there; run them locally, or on the
+self-hosted runner with `gh workflow run vm-tests.yml --ref <branch>`. Pull
+requests don't run that job, because its runner is a persistent host.
+`crates/cirro/tests/node_agent.rs` explains the
 one `sudoers` rule they need, and `scripts/step0/README.md` covers fetching the
 kernel.
 

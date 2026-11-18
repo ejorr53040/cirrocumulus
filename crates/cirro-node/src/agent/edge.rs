@@ -2,6 +2,7 @@
 //! request for it waits on first.
 
 use super::*;
+use cirro_edge::Upstream;
 
 /// What the edge does next for a hostname, decided under the VM table's
 /// lock and acted on after it is released. Each carries the App's name.
@@ -127,7 +128,7 @@ impl Agent {
                     // Counted under the VM table's lock, so the idle parker
                     // never picks a VM a request is about to reach.
                     (Some(address), Some(route)) => Resolution::Upstream(
-                        SocketAddr::new(address.into(), route.port),
+                        Upstream::Tcp(SocketAddr::new(address.into(), route.port)),
                         Lease::new(InFlight::start(traffic)),
                     ),
                     _ => Resolution::Unavailable(format!("App {name:?} has no VM address")),
@@ -137,7 +138,9 @@ impl Agent {
             Entry::Ended { info, .. } if is_parked(info) => Step::Wake(name),
             Entry::Ended { info, .. } => Step::Answer(Resolution::Unavailable(format!(
                 "App {name:?} has ended ({})",
-                info.ended.as_ref().map_or("unknown", |e| e.reason.as_str())
+                info.ended
+                    .as_ref()
+                    .map_or("unknown", |e| e.reason.describe())
             ))),
         }
     }

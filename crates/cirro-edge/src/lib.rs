@@ -10,19 +10,24 @@ use acme::Acme;
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use hyper::body::{Frame, Incoming, SizeHint};
 use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode, Uri, Version};
+use hyper::{Method, Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 use tls::NodeCa;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UnixStream};
+use tokio::sync::Notify;
+use tokio::time::{Instant, Sleep};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, warn};
 
@@ -33,19 +38,38 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// and each one after on a kept-alive connection.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long the edge waits to connect to an App's VM before answering 502.
+/// How long the edge waits to connect to an App before answering 502.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a client may pause between request body frames: a stalled upload pins an App awake.
+const CLIENT_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long an App may go silent (no request body frame, no response head): a hung App pins its lease.
+const UPSTREAM_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long an App's response may pause between body frames: a stopped App pins the client's connection.
+const UPSTREAM_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Where requests for a hostname go.
 #[derive(Debug)]
 pub enum Resolution {
-    /// Proxy to the App's VM at this address, holding the lease until the
+    /// Proxy to the App at this upstream, holding the lease until the
     /// response has been sent.
-    Upstream(SocketAddr, Lease),
+    Upstream(Upstream, Lease),
     /// No App has this hostname: 404.
     NotFound,
     /// The App exists but can't take requests now: 503, saying why.
     Unavailable(String),
+}
+
+/// Where an App takes the requests the edge proxies to it.
+#[derive(Debug)]
+pub enum Upstream {
+    /// A VM's address.
+    Tcp(SocketAddr),
+    /// A Unix socket, such as a Machine-backed App's forward, which only
+    /// the agent can reach.
+    Unix(PathBuf),
 }
 
 /// Whatever a [`Router`] wants held while a request it routed is in flight:
@@ -78,7 +102,10 @@ pub trait Router: Send + Sync + 'static {
     fn routes(&self, host: &str) -> bool;
 }
 
-type Body = BoxBody<Bytes, hyper::Error>;
+/// What a body or the edge's own timeouts can fail with.
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+type Body = BoxBody<Bytes, BoxError>;
 
 /// Serves HTTP on `listener` until the task is dropped, sending each
 /// request where `router` says. With `acme`, it also answers the ACME CA's
@@ -171,7 +198,6 @@ async fn accept<R: Router>(
 }
 
 /// What a client connection arrived over.
-#[derive(Clone)]
 enum Scheme {
     /// With the ACME CA whose challenges it answers, when there is one.
     Http { acme: Option<Arc<Acme>> },
@@ -195,6 +221,7 @@ where
     R: Router,
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let scheme = Arc::new(scheme);
     let service = service_fn(move |req| {
         let (router, scheme) = (router.clone(), scheme.clone());
         async move { Ok::<_, hyper::Error>(handle(req, router.as_ref(), peer, &scheme).await) }
@@ -217,6 +244,13 @@ async fn handle<R: Router>(
     peer: SocketAddr,
     scheme: &Scheme,
 ) -> Response<Body> {
+    // The edge proxies requests and never tunnels one (ADR 0007).
+    if req.method() == Method::CONNECT {
+        return text(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "the edge doesn't tunnel CONNECT\n".into(),
+        );
+    }
     let Some(host) = host_of(&req) else {
         return text(
             StatusCode::BAD_REQUEST,
@@ -249,10 +283,10 @@ async fn handle<R: Router>(
         ),
         Resolution::Unavailable(why) => text(StatusCode::SERVICE_UNAVAILABLE, format!("{why}\n")),
         Resolution::Upstream(upstream, lease) => {
-            match proxy(req, &host, upstream, peer, scheme.proto(), lease).await {
+            match proxy(req, &host, &upstream, peer, scheme.proto(), lease).await {
                 Ok(response) => response,
                 Err(e) => {
-                    warn!(host, %upstream, "proxy: {e}");
+                    warn!(host, ?upstream, "proxy: {e}");
                     text(
                         StatusCode::BAD_GATEWAY,
                         format!("the App at {host} didn't answer: {e}\n"),
@@ -266,15 +300,14 @@ async fn handle<R: Router>(
 /// The request's hostname, from `Host` (or the absolute-form URI's
 /// authority), in lowercase and without a port or a trailing dot.
 fn host_of(req: &Request<Incoming>) -> Option<String> {
-    let raw = match req.uri().authority() {
-        Some(authority) => authority.host().to_string(),
+    let host = match req.uri().authority() {
+        Some(authority) => normalize(authority.host()),
         None => {
             let value = req.headers().get(header::HOST)?.to_str().ok()?;
             let authority: hyper::http::uri::Authority = value.parse().ok()?;
-            authority.host().to_string()
+            normalize(authority.host())
         }
     };
-    let host = normalize(&raw);
     (!host.is_empty()).then_some(host)
 }
 
@@ -283,15 +316,34 @@ fn host_of(req: &Request<Incoming>) -> Option<String> {
 async fn proxy(
     req: Request<Incoming>,
     host: &str,
-    upstream: SocketAddr,
+    upstream: &Upstream,
     peer: SocketAddr,
     proto: &'static str,
     lease: Lease,
 ) -> Result<Response<Body>, String> {
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, connect(upstream))
-        .await
-        .map_err(|_| format!("connecting to it timed out after {CONNECT_TIMEOUT:?}"))?
-        .map_err(|e| format!("connect: {e}"))?;
+    match upstream {
+        Upstream::Tcp(addr) => {
+            let stream = connect(upstream, || TcpStream::connect(*addr)).await?;
+            forward(stream, req, host, peer, proto, lease).await
+        }
+        Upstream::Unix(path) => {
+            let stream = connect(upstream, || UnixStream::connect(path)).await?;
+            forward(stream, req, host, peer, proto, lease).await
+        }
+    }
+}
+
+async fn forward<S>(
+    stream: S,
+    req: Request<Incoming>,
+    host: &str,
+    peer: SocketAddr,
+    proto: &'static str,
+    lease: Lease,
+) -> Result<Response<Body>, String>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
     let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .map_err(|e| format!("handshake: {e}"))?;
@@ -303,6 +355,7 @@ async fn proxy(
 
     let (mut parts, body) = req.into_parts();
     remove_hop_by_hop(&mut parts.headers);
+    remove_client_ip_headers(&mut parts.headers);
     parts.version = Version::HTTP_11;
     parts.uri = parts
         .uri
@@ -325,12 +378,13 @@ async fn proxy(
         HeaderValue::from_static(proto),
     );
 
-    let response = sender
-        .send_request(Request::from_parts(parts, body))
-        .await
-        .map_err(|e| format!("send the request: {e}"))?;
+    let progress = Arc::new(Notify::new());
+    let body = IdleTimeout::new(body, CLIENT_BODY_IDLE_TIMEOUT, Some(progress.clone()));
+    let request = Request::from_parts(parts, body);
+    let response = await_head(sender.send_request(request), &progress).await?;
     let (mut parts, body) = response.into_parts();
     remove_hop_by_hop(&mut parts.headers);
+    let body = IdleTimeout::new(body, UPSTREAM_BODY_IDLE_TIMEOUT, None);
     // The body owns the lease, so it lasts until the body is sent or
     // dropped.
     let body = body.map_frame(move |frame| {
@@ -341,17 +395,36 @@ async fn proxy(
     Ok(Response::from_parts(parts, body.boxed()))
 }
 
-/// Connects to `upstream`, trying again while it refuses: an App that has
-/// just started or woken may be a moment from accepting.
-async fn connect(upstream: SocketAddr) -> std::io::Result<TcpStream> {
-    loop {
-        match TcpStream::connect(upstream).await {
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+/// Connects to `upstream` with `open`, trying again while it refuses: an
+/// App that has just started or woken may be a moment from accepting.
+async fn connect<S, F>(upstream: &Upstream, open: impl Fn() -> F) -> Result<S, String>
+where
+    F: Future<Output = std::io::Result<S>>,
+{
+    let refused_meanwhile = async {
+        loop {
+            match open().await {
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                result => return result,
             }
-            result => return result,
         }
-    }
+    };
+    tokio::time::timeout(CONNECT_TIMEOUT, refused_meanwhile)
+        .await
+        .map_err(|_| match upstream {
+            Upstream::Tcp(addr) => format!(
+                "nothing accepted a connection on port {} within {CONNECT_TIMEOUT:?}",
+                addr.port()
+            ),
+            // The socket's path is the Node's own business, not the edge's
+            // clients'.
+            Upstream::Unix(_) => {
+                format!("nothing accepted a connection within {CONNECT_TIMEOUT:?}")
+            }
+        })?
+        .map_err(|e| format!("connect: {e}"))
 }
 
 /// Headers that describe one connection, not the message, so never pass a
@@ -380,6 +453,118 @@ fn remove_hop_by_hop(headers: &mut HeaderMap) {
     }
     headers.remove("keep-alive");
     headers.remove("proxy-connection");
+}
+
+/// Headers that name the client's own address or the proxies it came through,
+/// which only the edge may set: the App gets the edge's word for them (SA-12).
+fn remove_client_ip_headers(headers: &mut HeaderMap) {
+    let claimed: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| {
+            let name = name.as_str();
+            name.starts_with("x-forwarded-")
+                || matches!(
+                    name,
+                    "forwarded"
+                        | "x-real-ip"
+                        | "true-client-ip"
+                        | "cf-connecting-ip"
+                        | "x-client-ip"
+                )
+        })
+        .cloned()
+        .collect();
+    for name in claimed {
+        headers.remove(name);
+    }
+}
+
+/// Waits for the App's response head. The App may take as long as the request
+/// body takes to arrive, so the deadline restarts with each body frame sent: it
+/// gives up only on an App that has gone silent.
+async fn await_head<F, T, E>(send: F, progress: &Notify) -> Result<T, String>
+where
+    F: Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    tokio::pin!(send);
+    let deadline = tokio::time::sleep(UPSTREAM_RESPONSE_TIMEOUT);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            head = &mut send => return head.map_err(|e| format!("send the request: {e}")),
+            () = progress.notified() => {
+                deadline.as_mut().reset(Instant::now() + UPSTREAM_RESPONSE_TIMEOUT);
+            }
+            () = &mut deadline => {
+                return Err(format!("no response within {UPSTREAM_RESPONSE_TIMEOUT:?}"));
+            }
+        }
+    }
+}
+
+/// A body that fails once `idle` passes without a frame, so a peer that stalls
+/// mid-body can't hold its connection; a steady body of any length passes.
+/// `progress`, when set, is notified of each frame.
+struct IdleTimeout<B> {
+    body: B,
+    idle: Duration,
+    timer: Pin<Box<Sleep>>,
+    progress: Option<Arc<Notify>>,
+}
+
+impl<B: hyper::body::Body + Unpin> IdleTimeout<B> {
+    fn new(body: B, idle: Duration, progress: Option<Arc<Notify>>) -> Self {
+        Self {
+            body,
+            idle,
+            timer: Box::pin(tokio::time::sleep(idle)),
+            progress,
+        }
+    }
+}
+
+impl<B> hyper::body::Body for IdleTimeout<B>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+    B::Error: Into<BoxError>,
+{
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = &mut *self;
+        match Pin::new(&mut this.body).poll_frame(cx) {
+            Poll::Ready(frame) => {
+                if frame.is_some() {
+                    this.timer.as_mut().reset(Instant::now() + this.idle);
+                    if let Some(progress) = &this.progress {
+                        progress.notify_one();
+                    }
+                }
+                Poll::Ready(frame.map(|result| result.map_err(Into::into)))
+            }
+            Poll::Pending => match this.timer.as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    Poll::Ready(Some(Err(
+                        format!("no body frame for {:?}", this.idle).into()
+                    )))
+                }
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
 }
 
 fn text(status: StatusCode, body: String) -> Response<Body> {

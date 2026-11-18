@@ -1,4 +1,4 @@
-//! Types and RPC definitions shared between server, nodes and CLI.
+//! Request and response bodies of the Node agent's API, shared by the CLI and the agent.
 //!
 //! The CLI and the Node agent speak HTTP+JSON over the agent's Unix socket
 //! (ADR 0002), so each type here is one request or response body:
@@ -19,6 +19,8 @@
 //! | `DELETE /machines/{name}`      |                 | `204`                    |
 //! | `POST /machine-apps`           | [`MachineAppRequest`] | `201` [`MachineAppInfo`] |
 //! | `GET /machine-apps`            |                 | `200` `[`[`MachineAppInfo`]`]` |
+//! | `GET /stats`                   |                 | `200` [`Stats`]          |
+//! | `GET /ca`                      |                 | `200` PEM text           |
 //!
 //! `GET /ssh-key` is the agent's own SSH public key, made on first use: a
 //! Machine lets the agent in by listing it in `authorized_keys`. A scan
@@ -34,7 +36,10 @@
 //! VM under its name from its snapshot. The logs
 //! response is the console log from byte `offset` on (default 0), at most
 //! [`LOG_CHUNK`] bytes of it, as `text/plain`, with a [`VM_STATE_HEADER`] saying whether the VM is still
-//! running, so a client can follow it by polling from its last offset.
+//! running and a [`LOG_OFFSET_HEADER`] saying where its bytes start, so a
+//! client can follow it by polling from that start plus what it got. The
+//! start is past `offset` when the agent has freed the log's head
+//! ([`CONSOLE_LOG_CAP`]).
 //!
 //! Every non-2xx response carries an [`ErrorBody`].
 
@@ -44,6 +49,17 @@ use std::path::PathBuf;
 
 /// Response header on the logs endpoint: `running` or `ended`.
 pub const VM_STATE_HEADER: &str = "cirro-vm-state";
+
+/// Response header on the logs endpoint: the log offset of the body's first
+/// byte. Offsets never move, but the agent frees a long log's head, and an
+/// answer for an offset inside it starts at the oldest byte still kept.
+pub const LOG_OFFSET_HEADER: &str = "cirro-log-offset";
+
+/// The most disk one running VM's console log takes, give or take a
+/// second's output: tens of thousands of an App's log lines, while a full
+/// Node's logs stay a small part of its disk. Past it the agent frees all
+/// but the newest half. While the agent is down nothing enforces it.
+pub const CONSOLE_LOG_CAP: u64 = 4 << 20;
 
 /// The most of a console log one logs response holds. A full one means
 /// more was already there; ask again from where it ended.
@@ -79,14 +95,11 @@ pub struct RunRequest {
     #[serde(default)]
     pub env: Vec<String>,
     /// The absolute directory the command starts in; `/` when unset.
-    #[serde(default)]
     pub workdir: Option<String>,
     /// Who the command runs as inside the guest; root when unset.
-    #[serde(default)]
     pub user: Option<User>,
     /// Makes the VM an App: the Node's edge sends requests for the route's
     /// hostname to it.
-    #[serde(default)]
     pub route: Option<Route>,
 }
 
@@ -99,7 +112,6 @@ pub struct Route {
     pub port: u16,
     /// Park the App once no request has come through the edge for this
     /// many seconds; never when unset.
-    #[serde(default)]
     pub idle_park_secs: Option<u32>,
 }
 
@@ -122,7 +134,6 @@ pub struct VmInfo {
     pub started_at: u64,
     pub ended: Option<Ended>,
     /// Set for an App, and kept while it is parked or ended, until `rm`.
-    #[serde(default)]
     pub route: Option<Route>,
 }
 
@@ -154,7 +165,7 @@ pub enum EndReason {
 }
 
 impl EndReason {
-    pub fn as_str(self) -> &'static str {
+    pub fn describe(self) -> &'static str {
         match self {
             EndReason::Graceful => "graceful",
             EndReason::Forced => "forced",
@@ -172,7 +183,6 @@ pub struct StopRequest {
     pub force: bool,
     /// For a graceful stop: how long to wait before killing the VM
     /// anyway. The agent's default applies when unset.
-    #[serde(default)]
     pub timeout_secs: Option<u64>,
 }
 
@@ -198,7 +208,6 @@ pub struct MachineInfo {
     pub host_key: String,
     pub status: MachineStatus,
     /// Why the Machine is unreachable, as SSH said it.
-    #[serde(default)]
     pub last_error: Option<String>,
 }
 
@@ -301,4 +310,22 @@ pub struct VmRates {
     pub io_write_per_sec: u64,
     pub rx_per_sec: u64,
     pub tx_per_sec: u64,
+}
+
+/// Checks a VM, Machine or App name: 1-32 characters of lowercase letters,
+/// digits and hyphens, so it's safe in file names, URLs and log lines.
+/// `kind` names what the name is for, in the error.
+pub fn check_name(kind: &str, name: &str) -> Result<(), String> {
+    let valid = (1..=32).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid {kind} name {name:?}: a name is 1-32 characters of lowercase letters, \
+             digits and hyphens"
+        ))
+    }
 }

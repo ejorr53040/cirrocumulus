@@ -1,4 +1,4 @@
-//! M3's one seam: a throwaway Node agent under `sudo -n`, with its own
+//! The test seam: a throwaway Node agent under `sudo -n`, with its own
 //! state dir, socket and Node subnet, driven only through the `cirro` CLI.
 //! Every test ends by asserting the Node holds no Cirrocumulus state.
 //!
@@ -42,7 +42,7 @@ static LIVE_OCTETS: std::sync::Mutex<std::collections::BTreeSet<u8>> =
 
 mod common;
 use common::{
-    AGENT_OCTETS_FROM, edge_port, home, latest_kernel, repo_root, rootfs, test_agent,
+    AGENT_OCTETS_FROM, edge_port, home, latest_kernel, repo_root, rootfs, sudo_cirro, test_agent,
     test_agent_path, tls_edge_port,
 };
 
@@ -155,12 +155,9 @@ impl Agent {
     /// The command that starts an agent on this state dir, for Node subnet
     /// `10.77.<octet>.0/24`.
     fn agent_command(&self, octet: u8) -> std::process::Command {
-        let agent_bin = test_agent().expect("the harness checked for the test agent at start");
         let repo = repo_root();
-        let mut cmd = std::process::Command::new("sudo");
-        cmd.arg("-n")
-            .arg(agent_bin)
-            .args(["node", "agent", "--state-dir"])
+        let mut cmd = sudo_cirro();
+        cmd.args(["node", "agent", "--state-dir"])
             .arg(&self.state_dir)
             .arg("--socket")
             .arg(&self.socket)
@@ -235,9 +232,17 @@ impl Agent {
         format!("10.77.{}.", self.octet)
     }
 
-    /// Everything a VM could leave on the Node, as seen from outside the
-    /// agent. Host object names embed the Node subnet's third octet.
-    fn assert_no_cirro_state(&self) {
+    /// Ends the test: stops the agent, then checks everything a VM could
+    /// leave on the Node, as seen from outside the agent. Host object names
+    /// embed the Node subnet's third octet.
+    ///
+    /// The jail base and the parked dir are root-only (F-002, F-003), so
+    /// they can't be listed from here. The agent removes each on the way out
+    /// only when it's empty, so either one still there means a VM left a jail
+    /// or a snapshot behind. Dropping `self` afterwards removes what records
+    /// and logs the test left, through an agent.
+    fn assert_no_cirro_state(mut self) {
+        self.stop_agent();
         let id_prefix = format!("cirro-{:02x}", self.octet);
         let netns = stdout_of(&["ip", "netns", "list"]);
         assert!(
@@ -251,11 +256,14 @@ impl Agent {
             !routes.contains(&self.subnet_prefix()),
             "leftover routes into the Node subnet:\n{routes}"
         );
-        let jails: Vec<_> = std::fs::read_dir(self.state_dir.join("jail/firecracker"))
-            .into_iter()
-            .flatten()
-            .collect();
-        assert!(jails.is_empty(), "leftover jail dirs: {jails:?}");
+        for dir in ["jail", "parked"] {
+            let dir = self.state_dir.join(dir);
+            assert!(
+                !dir.exists(),
+                "{} is left after the agent stopped: a VM left a jail or snapshot in it",
+                dir.display()
+            );
+        }
         let cgroups: Vec<_> = std::fs::read_dir("/sys/fs/cgroup/cirro")
             .into_iter()
             .flatten()
@@ -267,17 +275,28 @@ impl Agent {
 }
 
 impl Agent {
-    /// Stops the agent and checks that no snapshot is left in its state
-    /// dir. The parked dir is root-only, so it can't be listed from here,
-    /// but the agent removes it on the way out only when it's empty.
-    fn assert_no_snapshots(&mut self) {
+    /// For a test that changes records while the agent is down: swaps the
+    /// still-empty state database the agent made at its first start, which
+    /// is root's and 0600, for an empty one of the test user's. The agent
+    /// keeps that 0600 too but doesn't take it over, so the test can read
+    /// it, as it can the rest of the state dir it made.
+    ///
+    /// The swap hides nothing the agent acts on: it runs as root, so it opens
+    /// a database of any owner, and it sets only the mode, never the owner
+    /// (`restrict_state_db`). The production owner and mode are pinned by
+    /// `the_state_database_is_root_only`, and every other restart test runs
+    /// on the root-owned database. No API or CLI edits records, and the
+    /// edits here (a damaged record, a forgotten one) are ones no request can
+    /// make. Were the agent ever to take the database over, the tests' copy
+    /// of it would fail with a permission error, not pass.
+    fn own_the_state_database(&mut self) {
         self.stop_agent();
-        let parked = self.state_dir.join("parked");
-        assert!(
-            !parked.exists(),
-            "a snapshot is left in {} after the agent stopped",
-            parked.display()
-        );
+        for file in ["state.db", "state.db-wal", "state.db-shm"] {
+            let _ = std::fs::remove_file(self.state_dir.join(file));
+        }
+        std::fs::File::create(self.state_dir.join("state.db"))
+            .expect("make a state database of our own");
+        self.spawn().expect("start the agent again");
     }
 }
 
@@ -334,20 +353,34 @@ fn http_get(address: &str, port: u16) -> std::io::Result<String> {
     Ok(response)
 }
 
+/// Calls `attempt` every `every` until it returns `Ok`, and panics with the
+/// last `Err` once `within` has passed.
+fn eventually<T>(
+    within: Duration,
+    every: Duration,
+    mut attempt: impl FnMut() -> Result<T, String>,
+) -> T {
+    let deadline = Instant::now() + within;
+    loop {
+        match attempt() {
+            Ok(value) => return value,
+            Err(why) => assert!(Instant::now() < deadline, "{why}"),
+        }
+        std::thread::sleep(every);
+    }
+}
+
 /// Retries until the fixture answers: `run` returns once guest-init has its
 /// config, a moment before the fixture itself is listening.
 fn wait_for_http(address: &str, port: u16) -> String {
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
+    eventually(TIMEOUT, Duration::from_millis(100), || {
         match http_get(address, port) {
-            Ok(response) if !response.is_empty() => return response,
-            result => assert!(
-                Instant::now() < deadline,
+            Ok(response) if !response.is_empty() => Ok(response),
+            result => Err(format!(
                 "nothing answered at http://{address}:{port} within {TIMEOUT:?}: {result:?}"
-            ),
+            )),
         }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    })
 }
 
 /// A raw `POST {path}` straight over the agent's Unix socket, bypassing
@@ -467,11 +500,13 @@ fn a_vm_outlives_a_restarted_agent_and_is_still_the_agents_to_stop() {
 /// removes it.
 fn wait_for_vmm_exit(octet: u8, host: u8) {
     let procs = format!("/sys/fs/cgroup/cirro/cirro-{octet:02x}{host:02x}/cgroup.procs");
-    let deadline = Instant::now() + TIMEOUT;
-    while !std::fs::read_to_string(&procs).is_ok_and(|p| p.trim().is_empty()) {
-        assert!(Instant::now() < deadline, "the VMM in {procs} never exited");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    eventually(TIMEOUT, Duration::from_millis(100), || {
+        if std::fs::read_to_string(&procs).is_ok_and(|p| p.trim().is_empty()) {
+            Ok(())
+        } else {
+            Err(format!("the VMM in {procs} never exited"))
+        }
+    });
 }
 
 #[test]
@@ -535,17 +570,67 @@ fn an_agent_refuses_a_state_dir_that_belongs_to_another_node_subnet() {
 }
 
 #[test]
-fn an_agent_refuses_to_start_on_a_running_record_it_cannot_make_sense_of() {
-    let Some(mut agent) = Agent::start(236) else {
+fn an_agent_refuses_a_subnet_whose_vms_would_share_host_ids_with_another_nodes() {
+    let Some(agent) = Agent::start(204) else {
         return;
     };
     agent
         .run("web", &rootfs().guest_init, &["/app/http_app"])
         .success();
+
+    // Another Node, with a state dir of its own, on 10.78.204.0/24: its
+    // first VM would be `cirro-cc02`, like web, and its startup sweep would
+    // take web's host objects for its own leftovers.
+    let state_dir = home().join(format!(".cache/cirro-t{}-204b", std::process::id()));
+    std::fs::create_dir_all(&state_dir).expect("create state dir");
+    let mut other = sudo_cirro();
+    other
+        .args(["node", "agent", "--state-dir"])
+        .arg(&state_dir)
+        .arg("--socket")
+        .arg(state_dir.join("agent.sock"))
+        .args(["--socket-group", &agent.socket_group])
+        .args(["--subnet", "10.78.204.0/24"])
+        .arg("--firecracker")
+        .arg(repo_root().join("firecracker"))
+        .arg("--jailer")
+        .arg(repo_root().join("jailer"))
+        .arg("--kernel")
+        .arg(latest_kernel());
+    let output = run_until_it_exits(other)
+        .expect("an agent whose VMs would share host ids should refuse to start, not run");
+    // The refusal comes before the agent writes to its state dir.
+    std::fs::remove_dir(&state_dir).expect("the refused agent left its state dir empty");
+    assert!(!output.status.success(), "it should fail: {output:?}");
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        err.contains("10.78.204.0/24") && err.contains("10.77.204.0/24"),
+        "the refusal should name both subnets, got: {err}"
+    );
+
+    let ps = agent.ps(false);
+    assert!(row(&ps, "web").is_some(), "web was lost:\n{ps}");
+    agent
+        .cirro()
+        .args(["stop", "--force", "web"])
+        .assert()
+        .success();
+    agent.assert_no_cirro_state();
+}
+
+#[test]
+fn an_agent_refuses_to_start_on_a_running_record_it_cannot_make_sense_of() {
+    let Some(mut agent) = Agent::start(236) else {
+        return;
+    };
+    agent.own_the_state_database();
+    agent
+        .run("web", &rootfs().guest_init, &["/app/http_app"])
+        .success();
     agent.stop_agent();
 
-    // Damage the record of the running VM: the state dir is ours, so a
-    // replacement database can be moved over the agent's.
+    // Damage the record of the running VM: the state dir and its database
+    // are ours, so a replacement database can be moved over the agent's.
     let db = agent.state_dir.join("state.db");
     let original = agent.state_dir.join("state.db.original");
     std::fs::copy(&db, &original).expect("keep the real database");
@@ -754,13 +839,15 @@ fn a_crashed_agent_leaves_vms_running_and_a_restart_removes_what_a_start_left_be
     stuck.arg(&rootfs().no_init).args(["--", "/app/http_app"]);
     let stuck = std::thread::spawn(move || stuck.output());
     let procs = "/sys/fs/cgroup/cirro/cirro-f003/cgroup.procs";
-    let deadline = Instant::now() + TIMEOUT;
-    while std::fs::read_to_string(procs).is_ok_and(|p| p.trim().is_empty())
-        || !Path::new(procs).exists()
-    {
-        assert!(Instant::now() < deadline, "stuck never got a Firecracker");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    eventually(TIMEOUT, Duration::from_millis(50), || {
+        if std::fs::read_to_string(procs).is_ok_and(|p| p.trim().is_empty())
+            || !Path::new(procs).exists()
+        {
+            Err("stuck never got a Firecracker".to_string())
+        } else {
+            Ok(())
+        }
+    });
 
     agent.crash_agent();
     assert!(
@@ -852,18 +939,16 @@ fn invalid_and_duplicate_names_are_refused() {
 
 /// Polls `cirro logs <name>` until it contains `marker`.
 fn wait_for_log(agent: &Agent, name: &str, marker: &str) -> String {
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
+    eventually(TIMEOUT, Duration::from_millis(100), || {
         let logs = stdout(agent.cirro().args(["logs", name]).assert().success());
         if logs.contains(marker) {
-            return logs;
+            Ok(logs)
+        } else {
+            Err(format!(
+                "`cirro logs {name}` never showed {marker:?}; got:\n{logs}"
+            ))
         }
-        assert!(
-            Instant::now() < deadline,
-            "`cirro logs {name}` never showed {marker:?}; got:\n{logs}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    })
 }
 
 #[test]
@@ -948,15 +1033,14 @@ fn logs_reads_a_long_console_log_whole_and_returns_while_it_still_grows() {
     // console writes ~100-170 KB/s, so the log keeps growing as `logs`
     // runs.
     let log = agent.state_dir.join("logs/chatty.0.log");
-    let deadline = Instant::now() + 3 * TIMEOUT;
-    while std::fs::metadata(&log).map_or(0, |m| m.len()) < LOG_CHUNK * 5 / 4 {
-        assert!(
-            Instant::now() < deadline,
-            "chatter wrote only {:?} bytes",
-            std::fs::metadata(&log).map(|m| m.len())
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    eventually(3 * TIMEOUT, Duration::from_millis(100), || {
+        let written = std::fs::metadata(&log).map(|m| m.len());
+        if written.as_ref().is_ok_and(|len| *len >= LOG_CHUNK * 5 / 4) {
+            Ok(())
+        } else {
+            Err(format!("chatter wrote only {written:?} bytes"))
+        }
+    });
 
     let logs = stdout(
         agent
@@ -989,6 +1073,96 @@ fn logs_reads_a_long_console_log_whole_and_returns_while_it_still_grows() {
         .success();
     agent.cirro().args(["rm", "chatty"]).assert().success();
     agent.assert_no_cirro_state();
+}
+
+#[test]
+fn a_console_log_past_its_cap_is_trimmed_to_its_newest_lines_while_logs_follows_it() {
+    let Some(agent) = Agent::start(197) else {
+        return;
+    };
+    agent
+        .run("chatty", &rootfs().guest_init, &["/app/chatter"])
+        .success();
+    // Reading from the first byte on, so it is mid-log when the agent trims.
+    let mut follow = std::process::Command::new(env!("CARGO_BIN_EXE_cirro"))
+        .env("CIRRO_SOCKET", &agent.socket)
+        .args(["logs", "-f", "chatty"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start cirro logs -f");
+    let mut piped = follow.stdout.take().unwrap();
+    // Drained as it comes, so a full pipe never holds the follower back.
+    let followed = std::thread::spawn(move || {
+        let mut output = String::new();
+        piped.read_to_string(&mut output).map(|_| output)
+    });
+
+    // Past the cap by a chunk, and back under it on disk. The console
+    // writes ~100-170 KB/s, so that takes half a minute.
+    let cap = cirro_proto::CONSOLE_LOG_CAP;
+    let log = agent.state_dir.join("logs/chatty.0.log");
+    eventually(15 * TIMEOUT, Duration::from_millis(100), || {
+        let (len, on_disk) =
+            std::fs::metadata(&log).map_or((0, 0), |m| (m.len(), m.blocks() * 512));
+        if len > cap + LOG_CHUNK && on_disk <= cap {
+            Ok(())
+        } else {
+            Err(format!(
+                "the log is {len} bytes long and takes {on_disk} bytes on disk, over the {cap} cap"
+            ))
+        }
+    });
+    agent
+        .cirro()
+        .args(["stop", "--force", "chatty"])
+        .assert()
+        .success();
+
+    let deadline = Instant::now() + TIMEOUT;
+    while follow.try_wait().expect("poll cirro logs -f").is_none() {
+        if Instant::now() >= deadline {
+            let _ = follow.kill();
+            panic!("`cirro logs -f` kept running after the VM ended");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // It kept up with the guest, so the trims freed only what it had read:
+    // every line, in order, through the guest's last.
+    let followed = chatter_numbers(&followed.join().unwrap().expect("read cirro logs -f"));
+    for (n, number) in followed.iter().enumerate() {
+        assert_eq!(*number, n as u64, "logs -f lost or doubled a line");
+    }
+
+    let logs = stdout(
+        agent
+            .cirro()
+            .args(["logs", "chatty"])
+            .timeout(TIMEOUT)
+            .assert()
+            .success(),
+    );
+    let kept = chatter_numbers(&logs);
+    assert!(
+        kept.first().is_some_and(|&first| first > 0),
+        "the log's head is still there"
+    );
+    assert_eq!(kept.last(), followed.last(), "the newest lines are gone");
+    for pair in kept.windows(2) {
+        assert_eq!(pair[1], pair[0] + 1, "a kept line is missing");
+    }
+
+    agent.cirro().args(["rm", "chatty"]).assert().success();
+    agent.assert_no_cirro_state();
+}
+
+/// The numbers of the whole `CHATTER` lines in `cirro logs` output. A
+/// trimmed log can start, and a killed guest's end, mid-line.
+fn chatter_numbers(output: &str) -> Vec<u64> {
+    output
+        .split_inclusive('\n')
+        .filter(|line| line.ends_with('\n'))
+        .filter_map(|line| line.strip_prefix("CHATTER ")?.trim_end().parse().ok())
+        .collect()
 }
 
 #[test]
@@ -1199,6 +1373,25 @@ fn stop_logs_and_rm_reject_invalid_names_up_front() {
     agent.assert_no_cirro_state();
 }
 
+/// The state database names every App's route and every Machine's address
+/// and host key, so it's root's alone, WAL files included.
+#[test]
+fn the_state_database_is_root_only() {
+    let Some(agent) = Agent::start_without_kvm(219) else {
+        return;
+    };
+
+    for file in ["state.db", "state.db-wal", "state.db-shm"] {
+        let meta = std::fs::metadata(agent.state_dir.join(file))
+            .unwrap_or_else(|e| panic!("stat {file}: {e}"));
+        assert_eq!(
+            (meta.uid(), meta.permissions().mode() & 0o777),
+            (0, 0o600),
+            "{file} should be root's, 0600"
+        );
+    }
+}
+
 /// Console logs hold whatever the VM's command printed, so they should be
 /// readable to the `cirro` group but not to everyone (#14).
 #[test]
@@ -1227,6 +1420,43 @@ fn console_logs_are_not_world_readable() {
         0o640,
         "console log {} should be 0640, was {mode:o}",
         log.display()
+    );
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "web"])
+        .assert()
+        .success();
+    agent.assert_no_cirro_state();
+}
+
+/// A VM's jail holds its disk, and after a wake its memory too, so the jails
+/// are root's alone: a local user can't reach into them.
+#[test]
+fn jails_are_root_only() {
+    let Some(agent) = Agent::start(208) else {
+        return;
+    };
+
+    agent
+        .run("web", &rootfs().guest_init, &["/app/http_app"])
+        .success();
+    let jails = agent.state_dir.join("jail");
+    let mode = std::fs::metadata(&jails)
+        .expect("stat the jail base dir")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "the jail base dir should be 0700, was {mode:o}"
+    );
+    let listed = std::fs::read_dir(jails.join("firecracker"));
+    assert!(
+        listed
+            .as_ref()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied),
+        "the test user could look into the jails: {listed:?}"
     );
 
     agent
@@ -1341,17 +1571,15 @@ fn a_vm_whose_command_exits_on_its_own_is_recorded_as_exited() {
         .run("brief", &rootfs().guest_init, &["/app/exit_later"])
         .success();
 
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
+    eventually(TIMEOUT, Duration::from_millis(200), || {
         let ps = agent.ps(true);
         let brief = row(&ps, "brief").unwrap_or_else(|| panic!("ps -a lacks brief:\n{ps}"));
-        if !brief.contains("running") {
-            assert!(brief.contains("exited"), "wrong end reason: {brief}");
-            break;
+        if brief.contains("running") {
+            return Err(format!("brief never ended: {brief}"));
         }
-        assert!(Instant::now() < deadline, "brief never ended: {brief}");
-        std::thread::sleep(Duration::from_millis(200));
-    }
+        assert!(brief.contains("exited"), "wrong end reason: {brief}");
+        Ok(())
+    });
     wait_for_log(&agent, "brief", "EXIT_LATER_DONE");
     agent.assert_no_cirro_state();
 }
@@ -1404,15 +1632,18 @@ fn probe_from_vm(agent: &Agent, name: &str, targets: &[String]) -> Vec<(String, 
     command.extend(targets.iter().map(String::as_str));
     agent.run(name, &rootfs().guest_init, &command).success();
     // Each blocked target takes the probe's full 3 s timeout.
-    let deadline = Instant::now() + TIMEOUT + Duration::from_secs(4 * targets.len() as u64);
-    let logs = loop {
-        let logs = stdout(agent.cirro().args(["logs", name]).assert().success());
-        if logs.contains("PROBE_DONE") {
-            break logs;
-        }
-        assert!(Instant::now() < deadline, "probe never finished:\n{logs}");
-        std::thread::sleep(Duration::from_millis(200));
-    };
+    let logs = eventually(
+        TIMEOUT + Duration::from_secs(4 * targets.len() as u64),
+        Duration::from_millis(200),
+        || {
+            let logs = stdout(agent.cirro().args(["logs", name]).assert().success());
+            if logs.contains("PROBE_DONE") {
+                Ok(logs)
+            } else {
+                Err(format!("probe never finished:\n{logs}"))
+            }
+        },
+    );
     agent
         .cirro()
         .args(["stop", "--force", name])
@@ -1670,7 +1901,7 @@ fn run_rejects_an_env_workdir_or_command_the_guest_cant_use() {
 const NGINX: &str =
     "nginx:alpine@sha256:df221db836e1754089190208cee7eeda94f233197056426eda74a43ab1abeac2";
 
-/// M4's exit: the CLI pulls an OCI image and builds its rootfs as the
+/// The CLI pulls an OCI image and builds its rootfs as the
 /// caller, and the VM runs the image's own entrypoint and command. Needs
 /// network on the first run; the image cache lives in the target dir, so
 /// later runs make one manifest request.
@@ -1705,7 +1936,7 @@ fn run_boots_an_image_from_a_registry_and_runs_its_command() {
     agent.assert_no_cirro_state();
 }
 
-/// M5: the agent samples every running VM once a second, and `top --once`
+/// The agent samples every running VM once a second, and `top --once`
 /// prints what each is using.
 #[test]
 fn top_once_shows_a_busy_vm_using_cpu_and_memory() {
@@ -1727,8 +1958,7 @@ fn top_once_shows_a_busy_vm_using_cpu_and_memory() {
     assert!(Path::new(&io_stat).exists(), "{io_stat} is missing");
 
     // A rate needs two samples, a second apart.
-    let deadline = Instant::now() + TIMEOUT;
-    let (cpu, row) = loop {
+    let row = eventually(TIMEOUT, Duration::from_millis(500), || {
         let top = stdout(agent.cirro().args(["top", "--once"]).assert().success());
         let row = row(&top, "busy")
             .unwrap_or_else(|| panic!("top doesn't list busy:\n{top}"))
@@ -1739,15 +1969,12 @@ fn top_once_shows_a_busy_vm_using_cpu_and_memory() {
             .nth(1)
             .and_then(|c| c.trim_end_matches('%').parse().ok())
             .unwrap_or(0.0);
-        if cpu >= 50.0 || Instant::now() > deadline {
-            break (cpu, row);
+        if cpu >= 50.0 {
+            Ok(row)
+        } else {
+            Err(format!("a VM spinning one vCPU shows {cpu}% CPU: {row}"))
         }
-        std::thread::sleep(Duration::from_millis(500));
-    };
-    assert!(
-        cpu >= 50.0,
-        "a VM spinning one vCPU shows {cpu}% CPU: {row}"
-    );
+    });
     let memory = row.split_whitespace().nth(2).unwrap_or("");
     assert!(
         memory.ends_with('M') && memory != "0M",
@@ -1780,12 +2007,12 @@ fn count(response: &str) -> u64 {
         .unwrap_or_else(|| panic!("not a counter answer: {response:?}"))
 }
 
-/// M6: parking snapshots a VM to disk and frees everything it held on the
+/// Parking snapshots a VM to disk and frees everything it held on the
 /// Node; waking starts a new VM from that snapshot, so the guest carries on
 /// where it was instead of booting again.
 #[test]
 fn a_parked_vm_wakes_where_it_left_off_and_rm_leaves_nothing() {
-    let Some(mut agent) = Agent::start(225) else {
+    let Some(agent) = Agent::start(225) else {
         return;
     };
     let (address, host) = vm_address(&stdout(
@@ -1833,10 +2060,9 @@ fn a_parked_vm_wakes_where_it_left_off_and_rm_leaves_nothing() {
         "rm left counter listed:\n{ps}"
     );
     agent.assert_no_cirro_state();
-    agent.assert_no_snapshots();
 }
 
-/// M6: parked VMs are records like any Ended VM, so they outlive the agent
+/// Parked VMs are records like any Ended VM, so they outlive the agent
 /// and wake afterwards. A snapshot no record owns, as a park interrupted by
 /// a dying agent could leave, is removed when the agent starts again.
 #[test]
@@ -1844,6 +2070,7 @@ fn parked_vms_survive_an_agent_restart_and_unowned_snapshots_are_removed() {
     let Some(mut agent) = Agent::start(224) else {
         return;
     };
+    agent.own_the_state_database();
     let mut kept_count = 0;
     for name in ["kept", "orphan"] {
         let (address, _) = vm_address(&stdout(
@@ -1859,8 +2086,9 @@ fn parked_vms_survive_an_agent_restart_and_unowned_snapshots_are_removed() {
         agent.cirro().args(["park", name]).assert().success();
     }
 
-    // Forget `orphan`'s record while the agent is down: the state dir is
-    // ours, so a changed copy of the database can be moved over the agent's.
+    // Forget `orphan`'s record while the agent is down: the state dir and
+    // its database are ours, so a changed copy of the database can be moved
+    // over the agent's.
     agent.stop_agent();
     let db = agent.state_dir.join("state.db");
     let changed = agent.state_dir.join("state.db.changed");
@@ -1892,10 +2120,9 @@ fn parked_vms_survive_an_agent_restart_and_unowned_snapshots_are_removed() {
         .success();
     agent.cirro().args(["rm", "kept"]).assert().success();
     agent.assert_no_cirro_state();
-    agent.assert_no_snapshots();
 }
 
-/// M6: a woken guest's own connections get out at once, before anything has
+/// A woken guest's own connections get out at once, before anything has
 /// connected in to it. Its network config, gateway MAC included, is the one
 /// it was parked with, while every link on the host side is new.
 #[test]
@@ -1950,7 +2177,7 @@ fn a_woken_vm_reaches_the_internet_before_anything_reaches_it() {
     agent.assert_no_cirro_state();
 }
 
-/// M6: park, wake, stop and run each refuse a VM in the wrong state, say
+/// Park, wake, stop and run each refuse a VM in the wrong state, say
 /// what to do instead, and leave the VM as it was.
 #[test]
 fn park_wake_stop_and_run_refuse_vms_in_the_wrong_state() {
@@ -2001,7 +2228,7 @@ fn park_wake_stop_and_run_refuse_vms_in_the_wrong_state() {
     agent.assert_no_cirro_state();
 }
 
-/// M6: a parked VM whose snapshot has gone can't be woken, and says so,
+/// A parked VM whose snapshot has gone can't be woken, and says so,
 /// pointing at `rm`.
 #[test]
 fn a_parked_vm_whose_snapshot_is_gone_says_so_and_can_be_removed() {
@@ -2034,7 +2261,6 @@ fn a_parked_vm_whose_snapshot_is_gone_says_so_and_can_be_removed() {
     std::fs::rename(&hidden, &parked).expect("put the parked dir back");
     agent.spawn().expect("start the agent again");
     agent.assert_no_cirro_state();
-    agent.assert_no_snapshots();
 }
 
 /// A jail's files are its VMM's, so an escaped VMM could leave a symlink or
@@ -2091,15 +2317,14 @@ fn wake_refuses_a_snapshot_file_that_is_a_link_and_chowns_nothing() {
     agent.spawn().expect("start the agent again");
     agent.cirro().args(["rm", "planted"]).assert().success();
     agent.assert_no_cirro_state();
-    agent.assert_no_snapshots();
 }
 
-/// M6's exit: `cirro bench` boots, parks, wakes and removes a throwaway VM
+/// `cirro bench` boots, parks, wakes and removes a throwaway VM
 /// over and over, and prints each operation's p50 and p99 as the CLI sees
 /// them, leaving nothing behind.
 #[test]
 fn bench_times_boot_park_and_wake_and_leaves_nothing() {
-    let Some(mut agent) = Agent::start(220) else {
+    let Some(agent) = Agent::start(220) else {
         return;
     };
     let output = stdout(
@@ -2128,7 +2353,6 @@ fn bench_times_boot_park_and_wake_and_leaves_nothing() {
     let ps = agent.ps(true);
     assert_eq!(ps.lines().count(), 1, "bench left VMs behind:\n{ps}");
     agent.assert_no_cirro_state();
-    agent.assert_no_snapshots();
 }
 
 /// Replacing the agent's binary on disk, as a rebuild or an upgrade does,
@@ -2203,7 +2427,7 @@ fn run_app(agent: &Agent, name: &str, host: &str, command: &[&str]) -> assert_cm
         .assert()
 }
 
-/// M7: an App is a VM with a route, and the Node's edge sends requests for
+/// An App is a VM with a route, and the Node's edge sends requests for
 /// the route's hostname to it. The route outlives an agent restart; one
 /// whose VM has ended answers 503 until `rm` removes it.
 #[test]
@@ -2258,12 +2482,12 @@ fn the_edge_routes_requests_by_hostname_to_the_apps_vm() {
     agent.assert_no_cirro_state();
 }
 
-/// M7: a request for a parked App is held while the App wakes, then
+/// A request for a parked App is held while the App wakes, then
 /// answered. Requests that arrive together share one wake: every answer
 /// comes from the same woken guest, which carries on counting.
 #[test]
 fn requests_for_a_parked_app_wake_it_once_and_are_all_answered() {
-    let Some(mut agent) = Agent::start(215) else {
+    let Some(agent) = Agent::start(215) else {
         return;
     };
     run_app(&agent, "tally", "parked.test", &["/app/counter"]).success();
@@ -2308,7 +2532,6 @@ fn requests_for_a_parked_app_wake_it_once_and_are_all_answered() {
         .success();
     agent.cirro().args(["rm", "tally"]).assert().success();
     agent.assert_no_cirro_state();
-    agent.assert_no_snapshots();
 }
 
 /// The edge's clients are anyone on the internet, so a 503 for a wake that
@@ -2358,7 +2581,6 @@ fn a_503_for_a_failed_wake_keeps_the_nodes_error_from_the_client() {
     agent.spawn().expect("start the agent again");
     agent.cirro().args(["rm", "broken"]).assert().success();
     agent.assert_no_cirro_state();
-    agent.assert_no_snapshots();
 }
 
 /// The agent holds a request's whole body in memory before reading it as
@@ -2378,7 +2600,7 @@ fn the_agent_refuses_a_request_body_too_big_to_be_a_request() {
     agent.cirro().arg("ps").assert().success();
 }
 
-/// M7: requests for an App that can't be woken are answered at once with a
+/// Requests for an App that can't be woken are answered at once with a
 /// 503 that says why, rather than held, and none of them tries again.
 #[test]
 fn requests_for_an_app_that_cant_wake_get_a_503_saying_why() {
@@ -2388,7 +2610,7 @@ fn requests_for_an_app_that_cant_wake_get_a_503_saying_why() {
     run_app(&agent, "lost", "lost.test", &["/app/counter"]).success();
     wait_for_edge(&agent, "lost.test");
     agent.cirro().args(["park", "lost"]).assert().success();
-    // As in the M6 test: the parked dir is root's, but renaming it within
+    // As in the parking test: the parked dir is root's, but renaming it within
     // the state dir, which is ours, hides the snapshot.
     agent.stop_agent();
     let parked = agent.state_dir.join("parked");
@@ -2427,16 +2649,15 @@ fn requests_for_an_app_that_cant_wake_get_a_503_saying_why() {
     std::fs::rename(&hidden, &parked).expect("put the parked dir back");
     agent.spawn().expect("start the agent again");
     agent.assert_no_cirro_state();
-    agent.assert_no_snapshots();
 }
 
-/// M7: an App run with `--idle-park` is parked once no request has come
+/// An App run with `--idle-park` is parked once no request has come
 /// for that long and none is in flight, freeing everything it held, and the
 /// next request wakes it. The woken guest's kernel reseeds its RNG (VMGenID), so wakes of one
 /// snapshot never share random numbers.
 #[test]
 fn an_idle_app_is_parked_and_the_next_request_wakes_it_reseeded() {
-    let Some(mut agent) = Agent::start(213) else {
+    let Some(agent) = Agent::start(213) else {
         return;
     };
     let printed = stdout(
@@ -2468,15 +2689,16 @@ fn an_idle_app_is_parked_and_the_next_request_wakes_it_reseeded() {
     });
     assert_eq!(count(&slow), before + 1, "the slow request wasn't answered");
 
-    let deadline = Instant::now() + TIMEOUT;
-    while !row(&agent.ps(true), "tally").is_some_and(|r| r.contains("parked")) {
-        assert!(
-            Instant::now() < deadline,
-            "the idle App wasn't parked within {TIMEOUT:?}:\n{}",
-            agent.ps(true)
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    eventually(TIMEOUT, Duration::from_millis(200), || {
+        let ps = agent.ps(true);
+        if row(&ps, "tally").is_some_and(|r| r.contains("parked")) {
+            Ok(())
+        } else {
+            Err(format!(
+                "the idle App wasn't parked within {TIMEOUT:?}:\n{ps}"
+            ))
+        }
+    });
     assert!(
         host_state_of(213, host).is_empty(),
         "an idle-parked App still holds host state: {:?}",
@@ -2498,7 +2720,6 @@ fn an_idle_app_is_parked_and_the_next_request_wakes_it_reseeded() {
         .success();
     agent.cirro().args(["rm", "tally"]).assert().success();
     agent.assert_no_cirro_state();
-    agent.assert_no_snapshots();
 }
 
 /// `curl` over HTTPS to the agent's TLS edge for `host`, trusting only the
@@ -2525,7 +2746,7 @@ fn tls_get_with(agent: &Agent, host: &str, ca: &Path, extra: &[&str]) -> Result<
     }
 }
 
-/// M7: the edge serves HTTPS with certificates from a CA of the Node's own,
+/// The edge serves HTTPS with certificates from a CA of the Node's own,
 /// which `cirro node ca` prints for clients to trust. Certificates are only
 /// issued for hostnames an App has, and the CA outlives agent restarts.
 #[test]
@@ -2664,14 +2885,13 @@ impl Pebble {
             management: format!("https://localhost:{}", port(20900)),
             config: config_path,
         };
-        let deadline = Instant::now() + TIMEOUT;
-        while TcpStream::connect(&listen).is_err() {
-            assert!(
-                Instant::now() < deadline,
-                "Pebble never listened on {listen}"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        eventually(TIMEOUT, Duration::from_millis(50), || {
+            if TcpStream::connect(&listen).is_ok() {
+                Ok(())
+            } else {
+                Err(format!("Pebble never listened on {listen}"))
+            }
+        });
         Some(pebble)
     }
 
@@ -2699,7 +2919,7 @@ impl Drop for Pebble {
     }
 }
 
-/// M7: with ACME on, an App whose hostname is public gets its certificate
+/// With ACME on, an App whose hostname is public gets its certificate
 /// from the ACME CA, which validates the hostname over HTTP-01 through the
 /// Node's own edge, and is served with it.
 #[test]
@@ -2728,17 +2948,7 @@ fn an_app_with_a_public_hostname_is_served_with_an_acme_certificate() {
     let root = agent.state_dir.join("pebble-root.pem");
     pebble.write_root(&root);
 
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let answer = loop {
-        match tls_get(&agent, "app.cirro-test.dev", &root) {
-            Ok(answer) => break answer,
-            Err(e) => assert!(
-                Instant::now() < deadline,
-                "the App was never served with a certificate from the ACME CA: {e}"
-            ),
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    };
+    let answer = wait_for_acme_app(&agent, "app.cirro-test.dev", &root);
     count(&answer);
 
     agent
@@ -2811,15 +3021,13 @@ impl Sshd {
             .spawn()
             .expect("start sshd");
         self.child = Some(child);
-        let deadline = Instant::now() + TIMEOUT;
-        while TcpStream::connect(("127.0.0.1", self.port)).is_err() {
-            assert!(
-                Instant::now() < deadline,
-                "sshd never listened on {}",
-                self.port
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        eventually(TIMEOUT, Duration::from_millis(50), || {
+            if TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
+                Ok(())
+            } else {
+                Err(format!("sshd never listened on {}", self.port))
+            }
+        });
     }
 
     /// Takes the Machine down: the listener and every login. Each login is
@@ -2912,7 +3120,13 @@ impl Drop for Sshd {
 
 /// `cirro machine ls`'s row for `name` once it shows `status`.
 fn wait_for_machine(agent: &Agent, name: &str, status: &str) -> String {
-    wait_for_machine_text(agent, name, &format!(" {status} "), TIMEOUT)
+    wait_for_row(
+        agent,
+        &["machine", "ls"],
+        name,
+        &format!(" {status} "),
+        TIMEOUT,
+    )
 }
 
 /// Lets the agent's SSH key log in to `sshd`.
@@ -2921,7 +3135,7 @@ fn authorize_agent(agent: &Agent, sshd: &Sshd) {
     sshd.authorize(&key);
 }
 
-/// M8: a Machine added with its host key given up front is pinned and
+/// A Machine added with its host key given up front is pinned and
 /// listed with its target and fingerprint, and comes up.
 #[test]
 fn a_machine_added_with_its_host_key_is_listed_up() {
@@ -2944,7 +3158,7 @@ fn a_machine_added_with_its_host_key_is_listed_up() {
     assert!(row.contains(&sshd.fingerprint()), "{row}");
 }
 
-/// M8: without `--host-key`, `machine add` shows the fingerprint of the
+/// Without `--host-key`, `machine add` shows the fingerprint of the
 /// host key the Machine presents and pins it only once that's confirmed.
 #[test]
 fn a_machine_added_without_its_host_key_is_pinned_only_once_confirmed() {
@@ -2972,7 +3186,7 @@ fn a_machine_added_without_its_host_key_is_pinned_only_once_confirmed() {
     assert!(row.contains(&sshd.fingerprint()), "{row}");
 }
 
-/// M8: a Machine that presents another host key, can't be reached, or
+/// A Machine that presents another host key, can't be reached, or
 /// won't let the agent's key in is refused, as are bad targets and names,
 /// and none of them is left registered.
 #[test]
@@ -3041,30 +3255,52 @@ fn a_machine_that_cant_be_trusted_or_reached_is_not_added() {
 }
 
 /// The agent's `ssh` processes for this test's state dir: their command
-/// lines name its known_hosts file.
+/// lines name a config file under it.
 fn machine_ssh_processes(agent: &Agent) -> String {
-    let known_hosts = agent.state_dir.join("known_hosts");
+    let runs = agent.state_dir.join("ssh");
     let out = std::process::Command::new("pgrep")
         .arg("-af")
-        .arg(format!("UserKnownHostsFile={}", known_hosts.display()))
+        .arg(format!("ssh -F {}/", runs.display()))
         .output()
         .expect("run pgrep");
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-fn wait_for_no_machine_ssh(agent: &Agent) {
-    let deadline = Instant::now() + TIMEOUT;
-    while !machine_ssh_processes(agent).is_empty() {
-        assert!(
-            Instant::now() < deadline,
-            "ssh still running:\n{}",
-            machine_ssh_processes(agent)
+/// The socket the agent's one `ssh` to `machine` forwards `app` from, next
+/// to its config file. Every local user can read `ssh`'s arguments, so
+/// they must name only that file and the Machine: not where the Machine
+/// is, who logs in, with which key, or what's forwarded.
+fn machine_forward(agent: &Agent, machine: &str, app: &str) -> PathBuf {
+    let ssh = machine_ssh_processes(agent);
+    let mut configs =
+        ssh.lines().map(
+            |line| match line.split_whitespace().skip(1).collect::<Vec<_>>()[..] {
+                ["ssh", "-F", config, "-N", "--", name] if name == machine => PathBuf::from(config),
+                _ => panic!("ssh's arguments say more than its config file and Machine: {line}"),
+            },
         );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    let config = configs
+        .next()
+        .unwrap_or_else(|| panic!("no ssh to {machine} running"));
+    assert!(
+        configs.next().is_none(),
+        "more than one ssh to {machine}:\n{ssh}"
+    );
+    config.with_file_name(format!("{app}.sock"))
 }
 
-/// M8: a Machine outlives an agent restart and comes back up; `rm` then
+fn wait_for_no_machine_ssh(agent: &Agent) {
+    eventually(TIMEOUT, Duration::from_millis(100), || {
+        let ssh = machine_ssh_processes(agent);
+        if ssh.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("ssh still running:\n{ssh}"))
+        }
+    });
+}
+
+/// A Machine outlives an agent restart and comes back up; `rm` then
 /// leaves no record, pinned key or `ssh` behind. The agent's private key
 /// is root's alone.
 #[test]
@@ -3163,9 +3399,11 @@ fn run_on_machine(
         .assert()
 }
 
-/// M8: a Machine-backed App is served through the edge, over HTTP and
+/// A Machine-backed App is served through the edge, over HTTP and
 /// HTTPS, from a port on its Machine's localhost, and `ps` lists it with
-/// its Machine.
+/// its Machine. It shows up only once its forward is listening, and the
+/// forward is a socket of root's that no other local user can reach or
+/// take first; `ssh`'s arguments, which they can read, say nothing of it.
 #[test]
 fn a_machine_backed_app_is_served_through_the_edge() {
     let Some(sshd) = Sshd::start(184) else {
@@ -3179,6 +3417,29 @@ fn a_machine_backed_app_is_served_through_the_edge() {
     serve_http(port, "hello from pi");
 
     run_on_machine(&agent, "web", "pi", "pi.test", port).success();
+    wait_for_row(&agent, &["top", "--once"], "web", " up", TIMEOUT);
+    let socket = machine_forward(&agent, "pi", "web");
+    let unix = std::fs::read_to_string("/proc/net/unix").expect("read /proc/net/unix");
+    assert!(
+        unix.lines()
+            .any(|l| l.ends_with(&format!(" {}", socket.display()))),
+        "up, but nothing listens on {}",
+        socket.display()
+    );
+    let runs = agent.state_dir.join("ssh");
+    assert!(socket.starts_with(&runs), "{}", socket.display());
+    let meta = std::fs::metadata(&runs).unwrap();
+    assert_eq!(
+        (meta.uid(), meta.mode() & 0o777),
+        (0, 0o700),
+        "{} isn't root's alone",
+        runs.display()
+    );
+    let reached = UnixStream::connect(&socket);
+    assert!(
+        reached.is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied),
+        "a local user reached the forward past the edge"
+    );
     let answer = wait_for_edge(&agent, "pi.test");
     assert!(answer.ends_with("hello from pi"), "{answer:?}");
 
@@ -3199,7 +3460,7 @@ fn a_machine_backed_app_is_served_through_the_edge() {
     assert!(web.contains("pi.test"), "{web}");
 }
 
-/// M8: a Machine-backed App can't be stopped, parked or woken, since
+/// A Machine-backed App can't be stopped, parked or woken, since
 /// nothing of it runs on the Node; its name and hostname are its own; it
 /// outlives an agent restart; its Machine can't be removed under it; and
 /// `rm` takes it off the edge.
@@ -3295,7 +3556,7 @@ fn a_machine_backed_app_is_only_routed_and_rm_takes_it_off_the_edge() {
         .success();
 }
 
-/// M8: VM-backed and Machine-backed Apps share one namespace of names and
+/// VM-backed and Machine-backed Apps share one namespace of names and
 /// hostnames, whichever comes first.
 #[test]
 fn vm_and_machine_backed_apps_share_names_and_hostnames() {
@@ -3330,7 +3591,7 @@ fn vm_and_machine_backed_apps_share_names_and_hostnames() {
     agent.assert_no_cirro_state();
 }
 
-/// M8: a Machine-backed App with a public hostname gets its certificate
+/// A Machine-backed App with a public hostname gets its certificate
 /// from the ACME CA, as a VM-backed App does.
 #[test]
 fn a_machine_backed_app_with_a_public_hostname_gets_an_acme_certificate() {
@@ -3364,17 +3625,7 @@ fn a_machine_backed_app_with_a_public_hostname_gets_an_acme_certificate() {
     let root = agent.state_dir.join("pebble-root.pem");
     pebble.write_root(&root);
 
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let answer = loop {
-        match tls_get(&agent, "pi.cirro-test.dev", &root) {
-            Ok(answer) => break answer,
-            Err(e) => assert!(
-                Instant::now() < deadline,
-                "the App was never served with a certificate from the ACME CA: {e}"
-            ),
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    };
+    let answer = wait_for_acme_app(&agent, "pi.cirro-test.dev", &root);
     assert_eq!(answer, "hello from pi");
 }
 
@@ -3382,42 +3633,46 @@ fn a_machine_backed_app_with_a_public_hostname_gets_an_acme_certificate() {
 /// backoff capped at 30 seconds.
 const RECONNECT: Duration = Duration::from_secs(40);
 
-/// `machine ls`'s row for `name` once it contains `text`, within `within`.
-fn wait_for_machine_text(agent: &Agent, name: &str, text: &str, within: Duration) -> String {
-    let deadline = Instant::now() + within;
-    loop {
-        let ls = stdout(agent.cirro().args(["machine", "ls"]).assert().success());
-        if let Some(row) = row(&ls, name)
-            && row.contains(text)
-        {
-            return row.to_string();
+/// `cirro <args>`'s row for `name` once it contains `text`, within `within`.
+fn wait_for_row(agent: &Agent, args: &[&str], name: &str, text: &str, within: Duration) -> String {
+    eventually(within, Duration::from_millis(200), || {
+        let out = stdout(agent.cirro().args(args).assert().success());
+        match row(&out, name) {
+            Some(line) if line.contains(text) => Ok(line.to_string()),
+            _ => Err(format!(
+                "`cirro {}` never showed {text:?} for {name} within {within:?}:\n{out}",
+                args.join(" ")
+            )),
         }
-        assert!(
-            Instant::now() < deadline,
-            "Machine {name} never showed {text:?} within {within:?}:\n{ls}"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    })
+}
+
+/// Retries until `host` is served over TLS with a certificate from the ACME
+/// CA, and returns the App's answer.
+fn wait_for_acme_app(agent: &Agent, host: &str, root: &Path) -> String {
+    eventually(Duration::from_secs(30), Duration::from_millis(250), || {
+        tls_get(agent, host, root).map_err(|e| {
+            format!("the App was never served with a certificate from the ACME CA: {e}")
+        })
+    })
 }
 
 /// `GET /` through the edge for `host` until the answer starts with
 /// `status`, within `within`.
 fn wait_for_edge_status(agent: &Agent, host: &str, status: &str, within: Duration) -> String {
-    let deadline = Instant::now() + within;
-    loop {
+    eventually(within, Duration::from_millis(200), || {
         let answer = edge_get(agent, host).unwrap_or_default();
         if answer.starts_with(status) {
-            return answer;
+            Ok(answer)
+        } else {
+            Err(format!(
+                "{host} never answered {status} within {within:?}: {answer:?}"
+            ))
         }
-        assert!(
-            Instant::now() < deadline,
-            "{host} never answered {status} within {within:?}: {answer:?}"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    })
 }
 
-/// M8: while its Machine is down a Machine-backed App answers 503 naming
+/// While its Machine is down a Machine-backed App answers 503 naming
 /// the Machine, and once the Machine is back the agent reconnects by
 /// itself.
 #[test]
@@ -3448,12 +3703,12 @@ fn a_machine_that_goes_down_is_reconnected_once_it_is_back() {
     wait_for_machine(&agent, "pi", "unreachable");
 
     sshd.start_again();
-    wait_for_machine_text(&agent, "pi", " up ", RECONNECT);
+    wait_for_row(&agent, &["machine", "ls"], "pi", " up ", RECONNECT);
     let back = wait_for_edge_status(&agent, "pi.test", "HTTP/1.1 200", TIMEOUT);
     assert!(back.ends_with("hello from pi"), "{back:?}");
 }
 
-/// M8: a Machine that comes back with another host key is never trusted:
+/// A Machine that comes back with another host key is never trusted:
 /// it stays down, saying why, and gets no traffic.
 #[test]
 fn a_machine_whose_host_key_changed_stays_down() {
@@ -3473,7 +3728,13 @@ fn a_machine_whose_host_key_changed_stays_down() {
     let pinned = sshd.save_host_key();
     sshd.new_host_key();
     sshd.start_again();
-    let row = wait_for_machine_text(&agent, "pi", "host key changed", RECONNECT);
+    let row = wait_for_row(
+        &agent,
+        &["machine", "ls"],
+        "pi",
+        "host key changed",
+        RECONNECT,
+    );
     assert!(row.contains("unreachable"), "{row}");
     let answer = edge_get(&agent, "pi.test").expect("ask the edge");
     assert!(answer.starts_with("HTTP/1.1 503"), "{answer:?}");
@@ -3486,11 +3747,17 @@ fn a_machine_whose_host_key_changed_stays_down() {
     sshd.start_again();
     run_on_machine(&agent, "api", "pi", "api.test", port).success();
     std::thread::sleep(Duration::from_secs(5));
-    let row = wait_for_machine_text(&agent, "pi", "host key changed", TIMEOUT);
+    let row = wait_for_row(
+        &agent,
+        &["machine", "ls"],
+        "pi",
+        "host key changed",
+        TIMEOUT,
+    );
     assert!(row.contains("unreachable"), "{row}");
 }
 
-/// M8: an agent that starts while a Machine is down starts anyway, lists
+/// An agent that starts while a Machine is down starts anyway, lists
 /// the Machine unreachable, and connects once it's back.
 #[test]
 fn an_agent_starts_while_a_machine_is_down() {
@@ -3509,29 +3776,10 @@ fn an_agent_starts_while_a_machine_is_down() {
         .expect("start the agent while the Machine is down");
     wait_for_machine(&agent, "pi", "unreachable");
     sshd.start_again();
-    wait_for_machine_text(&agent, "pi", " up ", RECONNECT);
+    wait_for_row(&agent, &["machine", "ls"], "pi", " up ", RECONNECT);
 }
 
-/// `cirro top --once`'s row for `name` once it contains `text`, within
-/// `within`.
-fn wait_for_top_text(agent: &Agent, name: &str, text: &str, within: Duration) -> String {
-    let deadline = Instant::now() + within;
-    loop {
-        let top = stdout(agent.cirro().args(["top", "--once"]).assert().success());
-        if let Some(row) = row(&top, name)
-            && row.contains(text)
-        {
-            return row.to_string();
-        }
-        assert!(
-            Instant::now() < deadline,
-            "top never showed {text:?} for {name} within {within:?}:\n{top}"
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
-}
-
-/// M8: `top` lists a Machine-backed App with its Machine, port and
+/// `top` lists a Machine-backed App with its Machine, port and
 /// status, and no CPU or memory, and follows its Machine down and back.
 #[test]
 fn top_shows_a_machine_backed_app_and_its_machines_status() {
@@ -3544,12 +3792,86 @@ fn top_shows_a_machine_backed_app_and_its_machines_status() {
     add_machine(&agent, &sshd, "pi");
     run_on_machine(&agent, "web", "pi", "pi.test", 23191).success();
 
-    let web = wait_for_top_text(&agent, "web", " up", TIMEOUT);
+    let web = wait_for_row(&agent, &["top", "--once"], "web", " up", TIMEOUT);
     assert!(web.contains("pi:23191"), "{web}");
     assert!(!web.contains('%') && !web.contains(" - "), "{web}");
 
     sshd.stop();
-    wait_for_top_text(&agent, "web", "unreachable", TIMEOUT);
+    wait_for_row(&agent, &["top", "--once"], "web", "unreachable", TIMEOUT);
     sshd.start_again();
-    wait_for_top_text(&agent, "web", " up", RECONNECT);
+    wait_for_row(&agent, &["top", "--once"], "web", " up", RECONNECT);
+}
+
+#[test]
+fn a_vms_cgroup_caps_its_threads_and_swap() {
+    let Some(agent) = Agent::start(201) else {
+        return;
+    };
+    let address = stdout(
+        agent
+            .run("web", &rootfs().guest_init, &["/app/http_app"])
+            .success(),
+    )
+    .trim()
+    .to_string();
+    let octets: Vec<u8> = address.split('.').map(|o| o.parse().unwrap()).collect();
+    let cgroup = format!(
+        "/sys/fs/cgroup/cirro/cirro-{:02x}{:02x}",
+        octets[2], octets[3]
+    );
+    let read = |file: &str| {
+        std::fs::read_to_string(format!("{cgroup}/{file}"))
+            .unwrap_or_else(|e| panic!("read {cgroup}/{file}: {e}"))
+            .trim()
+            .to_string()
+    };
+    assert_eq!(read("pids.max"), "64", "a VM's threads are capped");
+    assert_eq!(
+        read("memory.swap.max"),
+        "0",
+        "a VM's memory can't spill to swap"
+    );
+
+    agent
+        .cirro()
+        .args(["stop", "--force", "web"])
+        .assert()
+        .success();
+    agent.assert_no_cirro_state();
+}
+
+#[test]
+fn a_deleted_egress_policy_is_put_back_without_a_restart() {
+    let Some(agent) = Agent::start_without_kvm(202) else {
+        return;
+    };
+    // Reading and deleting the table needs root, and the module doc's sudoers
+    // rule names only the test `cirro`. Without a NOPASSWD rule for `nft`,
+    // skip as a missing rule does.
+    let nft = |args: &[&str]| {
+        std::process::Command::new("sudo")
+            .args(["-n", "nft"])
+            .args(args)
+            .output()
+    };
+    if !matches!(nft(&["list", "table", "ip", "cirro"]), Ok(out) if out.status.success()) {
+        eprintln!("skipping: `sudo -n nft` failed -- add a NOPASSWD sudoers rule for nft first");
+        return;
+    }
+    let deleted = nft(&["delete", "table", "ip", "cirro"]).expect("run sudo nft");
+    assert!(
+        deleted.status.success(),
+        "delete the policy table: {deleted:?}"
+    );
+
+    // The sampler checks once a second, so the table is back well within 3s.
+    eventually(
+        Duration::from_secs(3),
+        Duration::from_millis(200),
+        || match nft(&["list", "table", "ip", "cirro"]) {
+            Ok(out) if out.status.success() => Ok(()),
+            _ => Err("the egress policy table wasn't put back within 3s".to_string()),
+        },
+    );
+    agent.assert_no_cirro_state();
 }

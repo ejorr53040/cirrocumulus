@@ -9,11 +9,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$HERE/.build"
 APP_SRC="$BUILD_DIR/app-src"
 REPO_URL="https://github.com/VERSO-UVM/UVM-Career-Quiz.git"
-PINNED_COMMIT="1e9d686"
+# Full SHA: a 7-char prefix can name a different commit as the history grows.
+PINNED_COMMIT="1e9d686e69664c4812e0417cf38e9479811fda5b"
 
 mkdir -p "$BUILD_DIR"
 
-if [ -d "$APP_SRC/.git" ] && git -C "$APP_SRC" rev-parse --short HEAD 2>/dev/null | grep -q "^$PINNED_COMMIT"; then
+if [ -d "$APP_SRC/.git" ] && [ "$(git -C "$APP_SRC" rev-parse HEAD 2>/dev/null)" = "$PINNED_COMMIT" ]; then
     echo "app source already present at $PINNED_COMMIT: $APP_SRC"
     exit 0
 fi

@@ -1,4 +1,4 @@
-// M4 fixture: prints the identity guest-init started it with -- `WHOAMI uid=<uid> gid=<gid>`,
+// Fixture: prints the identity guest-init started it with -- `WHOAMI uid=<uid> gid=<gid>`,
 // `WHOAMI cwd=<dir>`, one `WHOAMI env <KEY=VALUE>` per variable -- then
 // `WHOAMI_DONE`, and stays running so `run`'s grace period never mistakes it
 // for a failed start. Built static for musl by `tests/node_agent.rs`.

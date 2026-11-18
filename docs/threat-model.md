@@ -28,9 +28,10 @@ it validates every request itself instead of trusting the CLI.
 | Firecracker | A minimal VMM: virtio block, net, vsock and a serial console | Most VMM-escape paths that affect QEMU-class VMMs |
 | Firecracker seccomp filters | Restrict the VMM process's syscalls | A VMM escape getting a useful host syscall surface |
 | jailer | chroot, a mount namespace, a per-VM unprivileged uid. No PID namespace: the agent tracks the VMM by the pid it spawned, which jailer's `--new-pid-ns` fork would hide | An escaped VMM seeing the host filesystem or other VMs' files. It shares the Node's pids, but has no `/proc` to list them and may signal only its own uid |
+| Root's copies of firecracker, jailer, kernel and `cirro` (under the state dir's `release/` and `bin/`, both 0700) | The unit and the agent run copies install made, so whoever owns the source binary can't change what root runs | A local user swapping a binary that root runs at boot or agent restart |
 | Per-VM network namespace (ADR 0001) | The tap lives in the VM's own namespace, joined to the Node by a veth | An escaped VMM sniffing or spoofing another VM's raw traffic |
-| cgroup v2 | CPU and memory limits per VM; I/O is counted, not limited | One VM's CPU or memory use crowding out the others. Nothing yet caps the total memory or snapshot disk of all VMs on a Node (M11) |
-| nftables egress policy (`ip cirro`) | Masquerade out; drop SMTP, VM-to-VM and LAN destinations | Spam, lateral movement to the LAN, the host, or other VMs |
+| cgroup v2 | CPU and memory limits per VM, a cap of 64 threads, and no swap; I/O is counted, not limited | One VM's CPU, memory, threads or swap use crowding out the others. Nothing yet caps the total memory or snapshot disk of all VMs on a Node (M11) |
+| nftables egress policy (`ip cirro`) | Masquerade out; drop SMTP, VM-to-VM and LAN or reserved destinations; reapplied within a second if flushed | Spam, lateral movement to the LAN, the host, or other VMs |
 | No IPv6 from VMs (`ip6 cirro`, and IPv6 off on each VM's veth) | The Node drops every IPv6 packet a VM's namespace sends it | Reaching the Node's own services around the IPv4-only egress policy |
 | VMGenID | The guest kernel reseeds its RNG when a snapshot is restored | Two wakes of one snapshot sharing RNG output |
 
@@ -68,6 +69,20 @@ directory (`0700`) under the state dir. Snapshots are not encrypted at rest:
 anyone with root or the raw disk reads guests' memory. Snapshots and the state
 database aren't fsynced (ADR 0006), so a power cut can lose a parked VM.
 
+Firecracker writes each VM's serial console straight into its console log in
+the state dir, on the disk that also holds the state database, the
+snapshots and every other VM's log. While the agent runs, it checks every
+running VM's log once a second and, past 4 MiB on disk (`CONSOLE_LOG_CAP`),
+frees all but the newest 2 MiB by punching a hole over the log's head, so a
+guest that prints forever costs the Node 4 MiB plus a second's output. The
+state dir's filesystem has to support hole punching (ext4, XFS, btrfs and
+tmpfs do); where it doesn't, the agent warns every second and nothing trims.
+Offsets in the log never move, so `cirro logs -f` carries on across a trim,
+and `cirro logs` starts at the oldest byte still kept. While the agent is
+down nothing trims: a guest writes as fast as its serial console goes
+(~150 KB/s, about half a gigabyte an hour) until the agent is back. The cap
+is per VM, so a Node's logs together grow with the number of VMs it runs.
+
 ## Machines
 
 A Machine is a computer the agent logs in to over SSH (ADR 0010); nothing on
@@ -83,16 +98,20 @@ it runs Cirrocumulus code.
   the network says at that moment, so check the fingerprint on the Machine.
 - **A `cirro` group member** can make the root agent open SSH connections to
   any host and port, as any user name, with its key, and learn whether the
-  key was accepted. Targets are checked so none becomes an `ssh` option, and
-  `ssh` runs with no config file of root's.
+  key was accepted. Targets are checked so none becomes an `ssh` option or
+  another line of its config, and `ssh` reads a root-only config file of
+  the agent's, none of root's own. Its arguments, which every local user can
+  read, name only that file and the Machine.
 - **Traffic to a Machine** crosses the network inside the agent's SSH
   connection: the edge's TLS ends at the Node, so the Machine sees plain
   HTTP from `ssh` on its own localhost, and only its localhost ports are
   reachable that way.
-- **Each Machine-backed App's forward** listens on the Node's 127.0.0.1, so
-  any local user or process on the Node can reach the App past the edge, as
-  it can a VM's address. VMs can't: nothing routes their traffic to the
-  Node's loopback (`route_localnet` stays off).
+- **Each Machine-backed App's forward** is a Unix socket in a root-only
+  directory under the state dir, new for each `ssh`, which only the agent
+  connects to. No other local user can reach the App past the edge, or
+  take or use up a port the forward needs and so keep the Machine's Apps
+  down. Its Machine shows as up only once `ssh` has bound every one. (A
+  VM's address, by contrast, is reachable from the Node's processes.)
 - **Adding or removing an App** restarts its Machine's `ssh` with the new set
   of forwards, so the Machine's other Apps answer 503 for the moment it takes
   to log in again.
@@ -115,12 +134,12 @@ it runs Cirrocumulus code.
 A manual source review on 2026-09-28 found one High (the agent would boot
 any host path as a rootfs; it now opens the rootfs as the caller, #14), three
 Mediums (resource bounds checked only in the CLI, an unverified guest kernel
-download, an unsigned demo package install), all fixed, though the demo's
-`apk.static`, the tool that checks those packages' signatures, is itself
-still fetched over TLS with no checksum. Two Lows are still open
-(the development sudoers rule's breadth, and `jailer::Jail`, which only
-the step 0 tests use, with its own `sudo` call; the other unused module is
-gone). The OCI layer parser and guest-init's config parser have
+download, an unsigned demo package install), all fixed. The demo's `apk.static`,
+the tool that checks those packages' signatures, is pinned by SHA-256 and
+checked before it runs. The two Lows, the development
+sudoers rule's breadth and an unused privileged `jailer` module with its own
+`sudo` call, are closed: the rule and the jailed step 0 boot that needed it
+are gone, and so are both unused modules. The OCI layer parser and guest-init's config parser have
 been fuzzed for minutes, not days ([fuzz/README.md](https://github.com/ejorr53040/cirrocumulus/blob/main/fuzz/README.md)),
 with nothing found.
 
@@ -129,10 +148,11 @@ A second review on 2026-11-11, of sandbox escapes and networking
 a wake chowned whatever a taken-over VMM had left in place of its snapshot
 files, that the Node took IPv6 from VMs' veths past the egress policy, and
 that the edge's 503s showed internet clients the agent's own errors; all
-three are fixed, with four Lows. Four more are open: console logs have no
-size limit, a taken-over VMM can point the agent's Firecracker API calls at
-another VM, two agents on one computer can collide, and turning on forwarding
-makes the Node a router for its other interfaces.
+three are fixed, with four Lows. Console logs had no size limit; they are
+capped now (see [Snapshots and state](#snapshots-and-state)). Three more are
+open: a taken-over VMM can point the agent's Firecracker API calls at
+another VM, two agents on one computer can collide, and turning on
+forwarding makes the Node a router for its other interfaces.
 
 No third party has audited Cirrocumulus. `cargo deny` checks every
 dependency against the RustSec advisory database in CI.

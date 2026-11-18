@@ -11,19 +11,32 @@
 //! The policy is IPv4's. Guests are given no IPv6 address, so a second
 //! table, `ip6 cirro`, drops all IPv6 from VMs' veths.
 //!
-//! It all lives in one nftables table, `ip cirro`, which the Node agent
-//! ensures at startup and never removes; only `cirro node uninstall` does
-//! (#11). Every rule matches only Cirrocumulus interfaces (`cirro-*`, the
-//! host ends of VM veths) and the Node subnets in the table's
-//! `node_subnets` set, so the table never touches other host traffic.
+//! It lives in two nftables tables, `ip cirro` and `ip6 cirro`, which the
+//! Node agent ensures at startup and never removes; only `cirro node
+//! uninstall` does (#11). Every rule matches only Cirrocumulus interfaces
+//! (`cirro-*`, the host ends of VM veths) and the Node subnets in the
+//! `ip cirro` table's `node_subnets` set, so the tables never touch other
+//! host traffic. That set keeps every Node subnet an agent has run on here,
+//! which is how a starting agent finds another Node's subnet whose VMs would
+//! share host ids with its own.
 //!
-//! The table only ever *drops*. A drop is final across nftables tables,
+//! The tables only ever *drop*. A drop is final across nftables tables,
 //! but an accept is not: it only ends the chain it's in, and a default-deny
 //! host firewall (ufw, firewalld) still drops the packet in its own chain.
 //! Letting VM traffic past such a firewall is therefore the firewall's own
 //! configuration, which `cirro node install` sets up (#11).
+//!
+//! Turning on `net.ipv4.ip_forward` makes the Node forward between all its
+//! interfaces, not just VMs' veths. The forward chain still doesn't drop
+//! forwarding that neither starts nor ends at a `cirro-*` interface: that
+//! drop would be final too, and would cut off every other router on the
+//! host (Docker's bridges, libvirt's, a VPN gateway), including ones the
+//! operator set up before Cirrocumulus. Keeping the Node from routing
+//! between its own LAN and VPN is the host firewall's job, as the
+//! networking docs say.
 
 use crate::cmd;
+use crate::subnet::Subnet;
 use crate::vm::HOST_ID_PREFIX;
 use std::io;
 use std::path::Path;
@@ -32,14 +45,14 @@ use std::process::Command;
 /// Where the kernel keeps its IPv6 settings, when it has IPv6 at all.
 pub(crate) const IPV6_SYSCTLS: &str = "/proc/sys/net/ipv6";
 
-/// The table's name, in the `ip` family, and in `ip6` for the one rule
+/// The table's name, in the `ip` family, and in `ip6` for its two drop rules
 /// there.
 const TABLE: &str = "cirro";
 
 /// Destinations VMs may not open connections to: private, carrier-grade
-/// NAT and link-local ranges, which covers the Node's LAN, other VMs and
-/// cloud metadata endpoints.
-const LAN_RANGES: &str = "10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16";
+/// NAT, link-local and reserved ranges, which covers the Node's LAN, other
+/// VMs, cloud metadata endpoints and the Azure host agent's address.
+const LAN_RANGES: &str = "0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 168.63.129.16/32, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/3";
 
 /// Makes the Node's egress policy cover `subnet` (a CIDR), masquerading it
 /// out of `egress_iface` when there is one. Safe to call again, from any
@@ -48,6 +61,15 @@ const LAN_RANGES: &str = "10.0.0.0/8, 100.64.0.0/10, 169.254.0.0/16, 172.16.0.0/
 /// scratch and adds to its sets, so it never duplicates a rule and never
 /// drops another agent's subnet.
 pub(crate) fn ensure_node_policy(subnet: &str, egress_iface: Option<&str>) -> io::Result<()> {
+    let ipv6 = Path::new(IPV6_SYSCTLS).exists();
+    nft(
+        &["-f", "-"],
+        Some(&policy_script(subnet, egress_iface, ipv6)),
+    )
+}
+
+/// The script [`ensure_node_policy`] applies. `ipv6` adds the `ip6` table.
+fn policy_script(subnet: &str, egress_iface: Option<&str>, ipv6: bool) -> String {
     let mut script = format!(
         "table ip {TABLE} {{\n\
          \tset node_subnets {{ type ipv4_addr; flags interval; }}\n\
@@ -77,7 +99,7 @@ pub(crate) fn ensure_node_policy(subnet: &str, egress_iface: Option<&str>) -> io
     // The policy above is IPv4's, and guests are given no IPv6, so the Node
     // takes none from a VM's veth. `vm` also turns IPv6 off on each veth,
     // which a later write to `net.ipv6.conf.all.disable_ipv6` would undo.
-    if Path::new(IPV6_SYSCTLS).exists() {
+    if ipv6 {
         script.push_str(&format!(
             "table ip6 {TABLE} {{\n\
              \tchain forward {{ type filter hook forward priority filter; policy accept; }}\n\
@@ -89,7 +111,28 @@ pub(crate) fn ensure_node_policy(subnet: &str, egress_iface: Option<&str>) -> io
              add rule ip6 {TABLE} input iifname \"{HOST_ID_PREFIX}*\" drop\n"
         ));
     }
-    nft(&["-f", "-"], Some(&script))
+    script
+}
+
+/// Whether both of the policy's tables are in the kernel (`ip6 cirro` only
+/// where the kernel has IPv6). The agent checks every second and reapplies
+/// the policy when either is gone, since a flushed ruleset would otherwise
+/// leave VMs unfiltered until the next restart. One `nft` run per check.
+pub(crate) fn policy_in_place() -> io::Result<bool> {
+    let tables = cmd::run(Command::new("nft").args(["list", "tables"]), None)?;
+    Ok(tables_in_place(
+        &String::from_utf8_lossy(&tables),
+        Path::new(IPV6_SYSCTLS).exists(),
+    ))
+}
+
+fn tables_in_place(listing: &str, ipv6: bool) -> bool {
+    let has = |family: &str| {
+        listing
+            .lines()
+            .any(|l| l.trim() == format!("table {family} {TABLE}"))
+    };
+    has("ip") && (!ipv6 || has("ip6"))
 }
 
 /// Removes the whole egress policy. For `cirro node uninstall`; the agent
@@ -102,6 +145,39 @@ pub(crate) fn remove_node_policy() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The Node subnets in the policy's `node_subnets` set: every one an agent
+/// has run on here, running now or not. None before the first agent.
+pub(crate) fn node_subnets() -> io::Result<Vec<Subnet>> {
+    let listing = match cmd::run(
+        Command::new("nft").args(["list", "set", "ip", TABLE, "node_subnets"]),
+        None,
+    ) {
+        Ok(listing) => listing,
+        Err(e) if e.to_string().contains("No such file or directory") => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    parse_node_subnets(&String::from_utf8_lossy(&listing))
+}
+
+/// The elements of an `nft list set` of `node_subnets`. Only agents add to
+/// the set, always a CIDR; anything else was added by hand, and is refused
+/// rather than skipped, since it may hold a Node's VMs.
+fn parse_node_subnets(listing: &str) -> io::Result<Vec<Subnet>> {
+    let Some((_, elements)) = listing.split_once("elements = {") else {
+        return Ok(Vec::new());
+    };
+    let elements = elements.split_once('}').map_or(elements, |(e, _)| e);
+    elements
+        .split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(|e| {
+            e.parse()
+                .map_err(|err| io::Error::other(format!("the node_subnets set holds {err}")))
+        })
+        .collect()
 }
 
 const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
@@ -147,4 +223,67 @@ pub(crate) fn default_route_iface() -> Option<String> {
 
 fn nft(args: &[&str], stdin: Option<&str>) -> io::Result<()> {
     cmd::run(Command::new("nft").args(args), stdin).map(drop)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_policy_is_in_place_only_with_both_its_tables() {
+        let both = "table ip filter\ntable ip cirro\ntable ip6 cirro\n";
+        assert!(tables_in_place(both, true));
+        // A flush of only the IPv6 rules leaves VMs' IPv6 unfiltered.
+        assert!(!tables_in_place("table ip cirro\ntable ip6 filter\n", true));
+        assert!(tables_in_place("table ip cirro\n", false));
+        assert!(!tables_in_place(
+            "table ip cirrocumulus\ntable ip6 cirro\n",
+            true
+        ));
+    }
+
+    #[test]
+    fn node_subnets_are_read_from_a_listing_that_wraps() {
+        let listing = "table ip cirro {\n\
+                       \tset node_subnets {\n\
+                       \t\ttype ipv4_addr\n\
+                       \t\tflags interval\n\
+                       \t\telements = { 10.77.0.0/24, 10.77.180.0/24,\n\
+                       \t\t\t     10.78.5.0/25 }\n\
+                       \t}\n\
+                       }\n";
+        let subnets: Vec<String> = parse_node_subnets(listing)
+            .unwrap()
+            .iter()
+            .map(Subnet::to_string)
+            .collect();
+        assert_eq!(subnets, ["10.77.0.0/24", "10.77.180.0/24", "10.78.5.0/25"]);
+    }
+
+    #[test]
+    fn an_empty_node_subnets_set_has_no_subnets() {
+        let listing = "table ip cirro {\n\tset node_subnets {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t}\n}\n";
+        assert!(parse_node_subnets(listing).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_node_subnets_element_that_is_no_node_subnet_is_refused() {
+        let listing = "\t\telements = { 10.77.0.0/24, 192.168.1.7 }\n";
+        let err = parse_node_subnets(listing).unwrap_err().to_string();
+        assert!(err.contains("192.168.1.7"), "{err}");
+    }
+
+    #[test]
+    fn the_policy_drops_reserved_ranges_too() {
+        let script = policy_script("10.77.0.0/24", Some("eth0"), false);
+        for range in [
+            "0.0.0.0/8",
+            "192.0.0.0/24",
+            "198.18.0.0/15",
+            "168.63.129.16/32",
+            "224.0.0.0/3",
+        ] {
+            assert!(script.contains(range), "{range} is not in the policy");
+        }
+    }
 }

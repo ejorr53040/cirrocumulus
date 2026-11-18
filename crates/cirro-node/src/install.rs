@@ -20,7 +20,8 @@ use crate::subnet::Subnet;
 use crate::vm;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -50,7 +51,7 @@ pub struct InstallConfig {
 
 /// Where the agent's edge listens, and whether it gets ACME certificates:
 /// `cirro node agent`'s `--http`, `--https` and `--acme-email`.
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct EdgeConfig {
     pub http: Option<std::net::SocketAddr>,
     pub https: Option<std::net::SocketAddr>,
@@ -68,10 +69,28 @@ impl EdgeConfig {
             args.push_str(&format!(" --https {https}"));
         }
         if let Some(email) = &self.acme_email {
-            args.push_str(&format!(" --acme-email {email}"));
+            args.push_str(&format!(" --acme-email {}", unit_arg(email)));
         }
         args
     }
+}
+
+/// `arg` as one word of a systemd `ExecStart=` line. systemd splits that on
+/// whitespace and expands `%` specifiers and `$` variables even inside
+/// quotes, so an argument with any of them is quoted and escaped.
+fn unit_arg(arg: &str) -> String {
+    if arg
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/._-:=,@+".contains(c))
+    {
+        return arg.to_string();
+    }
+    let escaped = arg
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%")
+        .replace('$', "$$");
+    format!("\"{escaped}\"")
 }
 
 /// Everything install resolved, persisted so uninstall can find it again
@@ -85,9 +104,12 @@ struct NodeConfig {
     unit_name: String,
     #[serde(flatten)]
     release: ReleaseBinaries,
-    /// Missing from a Node config written before the edge (M7).
-    #[serde(default)]
     edge: EdgeConfig,
+    /// Whether install created `group` (so uninstall may delete it), rather
+    /// than finding it already there. Absent from a `node.json` written
+    /// before this field existed, which reads as `false`: no group removed.
+    #[serde(default)]
+    group_created: bool,
 }
 
 /// Checks KVM and cgroup v2 -- the successor to `scripts/step0/prereqs.sh`'s
@@ -148,7 +170,7 @@ pub fn install(cfg: &InstallConfig) -> io::Result<()> {
     fs::create_dir_all(&cfg.state_dir)?;
 
     let release = match &cfg.release_override {
-        Some(r) => r.clone(),
+        Some(r) => installed_release(&cfg.state_dir, r)?,
         None => {
             let release_dir = layout::release(&cfg.state_dir);
             fs::create_dir_all(&release_dir)?;
@@ -156,7 +178,9 @@ pub fn install(cfg: &InstallConfig) -> io::Result<()> {
         }
     };
 
-    ensure_group(&cfg.group)?;
+    let previous = read_node_config(&cfg.state_dir).ok();
+    let group_created = ensure_group(&cfg.group)?
+        || previous.is_some_and(|p| p.group_created && p.group == cfg.group);
 
     let node_config = NodeConfig {
         socket: cfg.socket.clone(),
@@ -165,6 +189,7 @@ pub fn install(cfg: &InstallConfig) -> io::Result<()> {
         unit_name: cfg.unit_name.clone(),
         release,
         edge: cfg.edge.clone(),
+        group_created,
     };
     write_node_config(&cfg.state_dir, &node_config)?;
 
@@ -198,7 +223,10 @@ pub async fn uninstall(state_dir: &Path, force: bool) -> io::Result<()> {
     // egress policy goes: a VM left running would outlive it, free to reach
     // the LAN.
     clean_up_vms(state_dir, &node_config).await?;
-    let _ = remove_group(&node_config.group);
+    // Only a group install created: a pre-existing one may have other members.
+    if node_config.group_created {
+        let _ = remove_group(&node_config.group);
+    }
     remove_from_host_firewall(&node_config.subnet);
     let _ = egress::remove_node_policy();
     egress::restore_ip_forward(&layout::ip_forward_record(state_dir))?;
@@ -246,22 +274,22 @@ fn refuse_if_vms_running(state_dir: &Path, subnet: &str) -> io::Result<()> {
     }
 }
 
-fn set_group_existence(name: &str, want_exists: bool, verb: &str) -> io::Result<()> {
-    if nix::unistd::Group::from_name(name)?.is_some() == want_exists {
-        return Ok(());
+fn ensure_group(name: &str) -> io::Result<bool> {
+    if nix::unistd::Group::from_name(name)?.is_some() {
+        return Ok(false);
     }
-    cmd::run(Command::new(verb).arg(name), None).map(drop)
-}
-
-fn ensure_group(name: &str) -> io::Result<()> {
-    set_group_existence(name, true, "groupadd")
+    cmd::run(Command::new("groupadd").arg(name), None)?;
+    Ok(true)
 }
 
 /// Deletes the group with `groupdel`. A group that's already gone (or never
 /// created, e.g. an install that only ever used a numeric gid) is `Ok`;
 /// only a failing `groupdel` is an error.
 fn remove_group(name: &str) -> io::Result<()> {
-    set_group_existence(name, false, "groupdel")
+    if nix::unistd::Group::from_name(name)?.is_some() {
+        cmd::run(Command::new("groupdel").arg(name), None)?;
+    }
+    Ok(())
 }
 
 /// The comment ufw shows beside the rule, so `ufw status` says whose it is.
@@ -341,9 +369,20 @@ fn succeeds(program: &str, arg: &str) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// Root's alone, from the moment it exists: it names the Node's group,
+/// subnet and ACME email, which are no business of other local users.
 fn write_node_config(state_dir: &Path, config: &NodeConfig) -> io::Result<()> {
     let json = serde_json::to_string_pretty(config).map_err(io::Error::other)?;
-    fs::write(layout::node_config(state_dir), json)
+    let path = layout::node_config(state_dir);
+    fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?
+        .write_all(json.as_bytes())?;
+    // An earlier install wrote it 0644.
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
 }
 
 fn read_node_config(state_dir: &Path) -> io::Result<NodeConfig> {
@@ -356,7 +395,12 @@ fn read_node_config(state_dir: &Path) -> io::Result<NodeConfig> {
 /// with identical config writes the identical unit content and re-enables
 /// an already-enabled unit, both no-ops.
 fn install_unit(config: &NodeConfig, state_dir: &Path) -> io::Result<()> {
-    let cirro_bin = std::env::current_exe()?;
+    let cirro_bin = copy_root_owned(
+        &std::env::current_exe()?,
+        &layout::bin(state_dir),
+        "cirro",
+        0o755,
+    )?;
     let unit = format!(
         "[Unit]\n\
          Description=Cirrocumulus Node agent\n\
@@ -372,14 +416,14 @@ fn install_unit(config: &NodeConfig, state_dir: &Path) -> io::Result<()> {
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n",
-        bin = cirro_bin.display(),
-        socket = config.socket.display(),
-        group = config.group,
-        subnet = config.subnet,
-        state_dir = state_dir.display(),
-        firecracker = config.release.firecracker.display(),
-        jailer = config.release.jailer.display(),
-        kernel = config.release.kernel.display(),
+        bin = unit_arg(&cirro_bin.to_string_lossy()),
+        socket = unit_arg(&config.socket.to_string_lossy()),
+        group = unit_arg(&config.group),
+        subnet = unit_arg(&config.subnet),
+        state_dir = unit_arg(&state_dir.to_string_lossy()),
+        firecracker = unit_arg(&config.release.firecracker.to_string_lossy()),
+        jailer = unit_arg(&config.release.jailer.to_string_lossy()),
+        kernel = unit_arg(&config.release.kernel.to_string_lossy()),
         edge = config.edge.agent_args(),
     );
     let unit_path = unit_path(&config.unit_name);
@@ -392,6 +436,34 @@ fn install_unit(config: &NodeConfig, state_dir: &Path) -> io::Result<()> {
         None,
     )
     .map(drop)
+}
+
+/// Copies `src` to `dir/name` with `mode` and returns the copy's path. The
+/// copy is what root runs, so `dir` is 0700 and nothing another user can
+/// write. Staged and renamed into place: a running agent has the old copy
+/// open, and writing over it fails (ETXTBSY).
+fn copy_root_owned(src: &Path, dir: &Path, name: &str, mode: u32) -> io::Result<PathBuf> {
+    fs::create_dir_all(dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    let installed = dir.join(name);
+    let staged = dir.join(format!("{name}.new"));
+    fs::copy(src, &staged)?;
+    fs::set_permissions(&staged, fs::Permissions::from_mode(mode))?;
+    fs::rename(&staged, &installed)?;
+    Ok(installed)
+}
+
+/// Copies an override's firecracker, jailer and kernel into the state dir's
+/// release dir, where [`release::fetch`] puts the pinned ones, and returns
+/// the copies. The unit and the agent run these, so whoever owns the source
+/// file can't change what root runs.
+fn installed_release(state_dir: &Path, src: &ReleaseBinaries) -> io::Result<ReleaseBinaries> {
+    let dir = layout::release(state_dir);
+    Ok(ReleaseBinaries {
+        firecracker: copy_root_owned(&src.firecracker, &dir, "firecracker", 0o755)?,
+        jailer: copy_root_owned(&src.jailer, &dir, "jailer", 0o755)?,
+        kernel: copy_root_owned(&src.kernel, &dir, "kernel", 0o644)?,
+    })
 }
 
 /// Stops, disables and removes the unit. Missing/not-enabled is fine --
@@ -425,6 +497,49 @@ mod tests {
     use super::*;
     use crate::process::ProcessId;
     use cirro_proto::{EndReason, Ended, VmInfo};
+
+    #[test]
+    fn a_unit_argument_with_a_space_or_a_specifier_is_quoted() {
+        assert_eq!(unit_arg("/usr/bin/cirro"), "/usr/bin/cirro");
+        assert_eq!(
+            unit_arg("/srv/my dir/firecracker"),
+            "\"/srv/my dir/firecracker\""
+        );
+        assert_eq!(unit_arg("a%b$c\"d\\e"), "\"a%%b$$c\\\"d\\\\e\"");
+    }
+
+    #[test]
+    fn a_node_config_from_before_group_created_does_not_remove_the_group() {
+        let old = r#"{"socket":"/run/cirro/agent.sock","group":"cirro","subnet":"10.77.0.0/24","unit_name":"cirro-node","firecracker":"/a","jailer":"/b","kernel":"/c","edge":{"http":null,"https":null,"acme_email":null}}"#;
+        let config: NodeConfig = serde_json::from_str(old).unwrap();
+        assert!(!config.group_created);
+    }
+
+    #[test]
+    fn an_override_is_copied_under_the_state_dirs_release_dir() {
+        let dir = tempdir();
+        let state = dir.join("state");
+        let src = dir.join("src");
+        fs::create_dir_all(&src).unwrap();
+        let source = ReleaseBinaries {
+            firecracker: src.join("firecracker"),
+            jailer: src.join("jailer"),
+            kernel: src.join("kernel"),
+        };
+        for path in [&source.firecracker, &source.jailer, &source.kernel] {
+            fs::write(path, b"binary").unwrap();
+        }
+        let copied = installed_release(&state, &source).unwrap();
+        let release = layout::release(&state);
+        assert_eq!(copied.firecracker, release.join("firecracker"));
+        assert_eq!(copied.jailer, release.join("jailer"));
+        assert_eq!(copied.kernel, release.join("kernel"));
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&copied.firecracker), 0o755);
+        assert_eq!(mode(&copied.jailer), 0o755);
+        assert_eq!(mode(&copied.kernel), 0o644);
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn tempdir() -> PathBuf {
         crate::test_util::tempdir("cirro-install-test")
